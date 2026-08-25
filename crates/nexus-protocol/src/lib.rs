@@ -5,7 +5,8 @@ pub mod proto;
 pub mod video_packet;
 
 pub use proto::{
-    KeyEvent, MonitorInfo, MouseButton, MouseMove, MouseWheel, SessionHello, TextInput,
+    CursorPosition, CursorShape, KeyEvent, MonitorInfo, MouseButton, MouseMove, MouseWheel,
+    SessionHello, TextInput,
 };
 pub use video_packet::{VideoPacketError, VideoPacketHeader};
 
@@ -37,6 +38,35 @@ pub enum MonitorInfoError {
     InvalidDimensions,
     #[error("monitor scale must be finite and greater than zero")]
     InvalidScale,
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum CursorShapeError {
+    #[error("cursor dimensions must be non-zero")]
+    InvalidDimensions,
+    #[error("cursor hotspot is outside the cursor bounds")]
+    InvalidHotspot,
+    #[error("cursor payload exceeds {max} bytes")]
+    DataTooLarge { max: usize },
+}
+
+impl CursorShape {
+    pub const MAX_DATA_LEN: usize = 1024 * 1024;
+
+    pub fn validate(&self) -> Result<(), CursorShapeError> {
+        if self.width == 0 || self.height == 0 {
+            return Err(CursorShapeError::InvalidDimensions);
+        }
+        if self.hotspot_x >= self.width || self.hotspot_y >= self.height {
+            return Err(CursorShapeError::InvalidHotspot);
+        }
+        if self.data.len() > Self::MAX_DATA_LEN {
+            return Err(CursorShapeError::DataTooLarge {
+                max: Self::MAX_DATA_LEN,
+            });
+        }
+        Ok(())
+    }
 }
 
 impl MonitorInfo {

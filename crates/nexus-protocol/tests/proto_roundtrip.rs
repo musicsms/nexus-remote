@@ -128,3 +128,35 @@ fn monitor_info_round_trip_and_validation() {
         Err(nexus_protocol::MonitorInfoError::InvalidDimensions)
     ));
 }
+
+#[test]
+fn cursor_shape_and_position_round_trip() {
+    let shape = nexus_protocol::CursorShape {
+        id: 7,
+        width: 16,
+        height: 16,
+        hotspot_x: 1,
+        hotspot_y: 2,
+        pixel_format: 1,
+        data: vec![0; 64],
+    };
+    assert!(shape.validate().is_ok());
+    let position = nexus_protocol::CursorPosition {
+        x: -10,
+        y: 20,
+        visible: true,
+        shape_id: 7,
+    };
+    let mut bytes = Vec::new();
+    shape.encode(&mut bytes).unwrap();
+    assert_eq!(
+        nexus_protocol::CursorShape::decode(bytes.as_slice()).unwrap(),
+        shape
+    );
+    bytes.clear();
+    position.encode(&mut bytes).unwrap();
+    assert_eq!(
+        nexus_protocol::CursorPosition::decode(bytes.as_slice()).unwrap(),
+        position
+    );
+}
