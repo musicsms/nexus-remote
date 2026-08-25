@@ -82,7 +82,7 @@ nexus/
 ├── apps/             # Binaries: nexusd, nexus-relay, nexus-agent,
 │                      #   nexus-desktop-host, nexus-client, nexus-cli
 ├── platform/         # OS-specific bindings, behind narrow traits (Phase 0+/5)
-├── proto/            # Protobuf schemas (not yet created)
+├── proto/            # Protobuf schemas (compiled during nexus-protocol build)
 ├── migrations/       # SQL migrations (not yet created)
 ├── deployment/        # Deployment manifests (not yet created)
 ├── test/             # integration / network-sim / performance (not yet created)
