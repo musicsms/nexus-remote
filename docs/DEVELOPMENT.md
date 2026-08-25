@@ -25,15 +25,12 @@ Builds: `nexus-common`, `nexus-crypto`, `nexus-protocol`, `nexus-transport`,
    The workspace's `rust-toolchain.toml` pins `channel = "stable"` with
    `rustfmt` and `clippy` components — `rustup` installs these
    automatically the first time you run `cargo` inside the repo.
-3. Install the Protobuf compiler (`protoc`) — `nexus-protocol`'s `build.rs`
-   shells out to it via `prost-build` to regenerate the control-message
-   types from `proto/nexus.proto` on every build:
-   ```sh
-   brew install protobuf      # macOS
-   apt install protobuf-compiler   # Debian/Ubuntu
-   ```
-   Verify with `protoc --version`. CI installs it via
-   `arduino/setup-protoc` — see `.github/workflows/ci.yml`.
+3. No system Protobuf installation is required. `nexus-protocol` uses the
+   `protoc-bin-vendored` build dependency to select a pinned, platform-specific
+   `protoc` binary and regenerate Rust control-message types from
+   `proto/nexus.proto`. The binary is used only during compilation; it is not
+   included in runtime applications. Set `PROTOC` explicitly only when you
+   need to override the vendored compiler.
 4. From the repo root, verify the workspace builds:
    ```sh
    cargo build --workspace
