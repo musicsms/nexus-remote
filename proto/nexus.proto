@@ -15,3 +15,24 @@ message MouseMove {
   sint32 x = 1;
   sint32 y = 2;
 }
+
+message KeyEvent {
+  uint32 physical_code = 1;
+  uint32 logical_code = 2;
+  bool pressed = 3;
+  uint32 modifiers = 4;
+}
+
+message TextInput {
+  string text = 1;
+}
+
+message MouseButton {
+  uint32 button = 1;
+  bool pressed = 2;
+}
+
+message MouseWheel {
+  sint32 delta_x = 1;
+  sint32 delta_y = 2;
+}

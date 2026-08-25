@@ -4,7 +4,7 @@
 pub mod proto;
 pub mod video_packet;
 
-pub use proto::{MouseMove, SessionHello};
+pub use proto::{KeyEvent, MouseButton, MouseMove, MouseWheel, SessionHello, TextInput};
 pub use video_packet::{VideoPacketError, VideoPacketHeader};
 
 pub fn init() {

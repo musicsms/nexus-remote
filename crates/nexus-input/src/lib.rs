@@ -1,5 +1,8 @@
-//! nexus-input crate
-//! Part of Nexus Remote Desktop Platform
+//! OS-independent semantic keyboard and pointer input events.
+
+mod events;
+
+pub use events::{InputError, InputEvent, KeyAction, Modifiers, MouseButton};
 
 pub fn init() {
     // Initializer stub for nexus-input
