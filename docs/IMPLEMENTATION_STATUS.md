@@ -45,15 +45,15 @@ repo yet.
 |---|---|---|
 | `nexus-common` | IDs, shared errors, time, configuration primitives | Scaffolded — `Cargo.toml` + stub `lib.rs` (`pub fn init() {}`) only |
 | `nexus-crypto` | Device keys, capability verification, session key derivation | Scaffolded — stub only |
-| `nexus-protocol` | Versioned wire/control schema | In progress — Protobuf codegen (`SessionHello`, `MouseMove`) via prost-build from `proto/nexus.proto`; hand-rolled `VideoPacketHeader` encode/decode (Section 21) with malformed-input tests |
+| `nexus-protocol` | Versioned wire/control schema | **In progress** — Protobuf codegen for session and MVP input messages via `proto/nexus.proto`; hand-rolled `VideoPacketHeader` encode/decode (Section 21) with malformed-input tests |
 | `nexus-transport` | QUIC connections, streams, datagrams, metrics | In progress — self-signed-cert QUIC loopback endpoint helpers (`make_server_endpoint`/`make_client_endpoint`); Sprint 1 demo proves reliable-stream input + unreliable-datagram video both work end to end. No metrics, no relay integration yet |
-| `nexus-session` | Session state machine, reconnect semantics | Scaffolded — stub only |
+| `nexus-session` | Session state machine, reconnect semantics | **In progress** — explicit lifecycle transitions plus stable reconnect-window policy and deadline validation |
 | `nexus-auth` | User/device authentication logic | Scaffolded — stub only |
 | `nexus-policy` | RBAC/ABAC evaluation | Scaffolded — stub only |
 | `nexus-audit` | Audit event model and sinks | Scaffolded — stub only |
-| `nexus-codec` | Encoder/decoder abstractions | Scaffolded — stub only, no `VideoEncoder` trait yet (Section 20) |
-| `nexus-capture` | Platform-neutral capture traits | Scaffolded — stub only |
-| `nexus-input` | Semantic input model | Scaffolded — stub only |
+| `nexus-codec` | Encoder/decoder abstractions | **In progress** — OS-independent `VideoEncoder`, H.264 config, encoded-frame metadata, and keyframe/reconfigure contract; no native backend yet |
+| `nexus-capture` | Platform-neutral capture traits | **In progress** — `CaptureSource`/`CapturedFrame` contract plus ADR-022 depth-1 latest-frame queue with replacement/drop accounting; Windows Graphics Capture backend remains next |
+| `nexus-input` | Semantic input model | **In progress** — OS-independent keyboard, text, mouse and wheel events with bounded text validation; native Windows injection remains next |
 | `nexus-observability` | tracing, metrics, session quality telemetry | Scaffolded — stub only |
 
 ### `crates/` — Phase 3 members (not yet due)

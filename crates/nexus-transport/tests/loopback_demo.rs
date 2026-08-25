@@ -7,8 +7,9 @@
 use std::time::Duration;
 
 use nexus_protocol::{video_packet, MouseMove, VideoPacketHeader};
+use nexus_transport::control::{decode_framed_control, encode_framed_control};
 use nexus_transport::quic::{make_client_endpoint, make_server_endpoint};
-use prost::Message;
+use nexus_transport::video::{decode_video_datagram, encode_video_datagram};
 
 /// Fail-fast budget for every `.await` the server task blocks on. QUIC
 /// datagrams are unreliable by definition, so a regression that drops one
@@ -45,7 +46,7 @@ async fn synthetic_frame_and_input_travel_over_quic_loopback() {
             .expect("timed out reading input stream")
             .expect("failed to read input stream");
         let received_mouse_move =
-            MouseMove::decode(stream_bytes.as_slice()).expect("failed to decode MouseMove");
+            decode_framed_control::<MouseMove>(&stream_bytes).expect("failed to decode MouseMove");
         tracing::info!(?received_mouse_move, "server: decoded input message");
 
         // Unreliable datagram: video packet (Section 14).
@@ -54,7 +55,7 @@ async fn synthetic_frame_and_input_travel_over_quic_loopback() {
             .expect("timed out waiting for video datagram")
             .expect("failed to read video datagram");
         let (received_header, received_payload) =
-            VideoPacketHeader::decode(&datagram).expect("failed to decode video packet header");
+            decode_video_datagram(&datagram).expect("failed to decode video packet header");
         tracing::info!(
             ?received_header,
             payload_len = received_payload.len(),
@@ -78,8 +79,7 @@ async fn synthetic_frame_and_input_travel_over_quic_loopback() {
 
     // Send the input message over a reliable bidirectional stream.
     let sent_mouse_move = MouseMove { x: 640, y: 360 };
-    let mut mouse_move_buf = Vec::new();
-    sent_mouse_move.encode(&mut mouse_move_buf).unwrap();
+    let mouse_move_buf = encode_framed_control(&sent_mouse_move).unwrap();
 
     let (mut send, _recv) = connection.open_bi().await.expect("failed to open stream");
     send.write_all(&mouse_move_buf)
@@ -101,8 +101,7 @@ async fn synthetic_frame_and_input_travel_over_quic_loopback() {
         payload_len: 4,
     };
     let sent_payload = [0xDEu8, 0xAD, 0xBE, 0xEF];
-    let mut datagram_buf = Vec::new();
-    sent_header.encode(&sent_payload, &mut datagram_buf);
+    let datagram_buf = encode_video_datagram(&sent_header, &sent_payload).unwrap();
     connection
         .send_datagram(datagram_buf.into())
         .expect("failed to send video datagram");

@@ -32,3 +32,51 @@ fn session_hello_round_trip() {
 
     assert_eq!(decoded, msg);
 }
+
+#[test]
+fn input_messages_round_trip() {
+    let key = nexus_protocol::KeyEvent {
+        physical_code: 30,
+        logical_code: 65,
+        pressed: true,
+        modifiers: 3,
+    };
+    let mut encoded = Vec::new();
+    key.encode(&mut encoded).unwrap();
+    assert_eq!(
+        nexus_protocol::KeyEvent::decode(encoded.as_slice()).unwrap(),
+        key
+    );
+
+    let button = nexus_protocol::MouseButton {
+        button: 1,
+        pressed: false,
+    };
+    encoded.clear();
+    button.encode(&mut encoded).unwrap();
+    assert_eq!(
+        nexus_protocol::MouseButton::decode(encoded.as_slice()).unwrap(),
+        button
+    );
+
+    let wheel = nexus_protocol::MouseWheel {
+        delta_x: -1,
+        delta_y: 120,
+    };
+    encoded.clear();
+    wheel.encode(&mut encoded).unwrap();
+    assert_eq!(
+        nexus_protocol::MouseWheel::decode(encoded.as_slice()).unwrap(),
+        wheel
+    );
+
+    let text = nexus_protocol::TextInput {
+        text: "Xin chào".to_owned(),
+    };
+    encoded.clear();
+    text.encode(&mut encoded).unwrap();
+    assert_eq!(
+        nexus_protocol::TextInput::decode(encoded.as_slice()).unwrap(),
+        text
+    );
+}

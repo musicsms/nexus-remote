@@ -1,6 +1,11 @@
-//! nexus-capture crate
-//! Part of Nexus Remote Desktop Platform
+//! Platform-independent desktop capture contracts and freshness buffering.
+
+mod frame;
+mod latest_queue;
+
+pub use frame::{CaptureError, CaptureSource, CapturedFrame, PixelFormat};
+pub use latest_queue::LatestFrameQueue;
 
 pub fn init() {
-    // Initializer stub for nexus-capture
+    // Reserved for platform backend registration.
 }

@@ -484,6 +484,7 @@ dependencies = [
 name = "nexus-capture"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "nexus-common",
  "serde",
  "thiserror 1.0.69",
@@ -518,6 +519,8 @@ dependencies = [
 name = "nexus-codec"
 version = "0.1.0"
 dependencies = [
+ "bytes",
+ "nexus-capture",
  "nexus-common",
  "serde",
  "thiserror 1.0.69",
