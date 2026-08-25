@@ -160,3 +160,36 @@ fn cursor_shape_and_position_round_trip() {
         position
     );
 }
+
+#[test]
+fn session_capability_round_trip_and_validation() {
+    let mut capability = nexus_protocol::SessionCapability {
+        version: 1,
+        issuer: "control".into(),
+        session_id: "ses_01".into(),
+        subject_user_id: "usr_01".into(),
+        client_device_id: "dev_c".into(),
+        target_device_id: "dev_t".into(),
+        permissions: vec!["desktop.control".into()],
+        restrictions: vec![],
+        not_before: 10,
+        expires_at: 20,
+        nonce: vec![1, 2, 3],
+        agent_min_protocol: 1,
+        agent_max_protocol: 1,
+        client_ephemeral_public_key: vec![],
+        signature: vec![],
+    };
+    assert!(capability.validate().is_ok());
+    let mut bytes = Vec::new();
+    capability.encode(&mut bytes).unwrap();
+    assert_eq!(
+        nexus_protocol::SessionCapability::decode(bytes.as_slice()).unwrap(),
+        capability
+    );
+    capability.expires_at = 10;
+    assert!(matches!(
+        capability.validate(),
+        Err(nexus_protocol::SessionCapabilityError::InvalidValidityWindow)
+    ));
+}
