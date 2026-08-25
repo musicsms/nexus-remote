@@ -48,7 +48,7 @@ repo yet.
 | `nexus-protocol` | Versioned wire/control schema | **In progress** — Protobuf codegen for session and MVP input messages via `proto/nexus.proto`; hand-rolled `VideoPacketHeader` encode/decode (Section 21) with malformed-input tests |
 | `nexus-transport` | QUIC connections, streams, datagrams, metrics | In progress — self-signed-cert QUIC loopback endpoint helpers (`make_server_endpoint`/`make_client_endpoint`); Sprint 1 demo proves reliable-stream input + unreliable-datagram video both work end to end. No metrics, no relay integration yet |
 | `nexus-session` | Session state machine, reconnect semantics | **In progress** — explicit lifecycle transitions plus stable reconnect-window policy and deadline validation |
-| `nexus-auth` | User/device authentication logic | Scaffolded — stub only |
+| `nexus-auth` | User/device authentication logic | **In progress** — bounded TTL nonce replay cache for signed capability verification; user/device enrollment remains next |
 | `nexus-policy` | RBAC/ABAC evaluation | Scaffolded — stub only |
 | `nexus-audit` | Audit event model and sinks | Scaffolded — stub only |
 | `nexus-codec` | Encoder/decoder abstractions | **In progress** — OS-independent `VideoEncoder`, H.264 config, encoded-frame metadata, and keyframe/reconfigure contract; no native backend yet |
