@@ -15,6 +15,27 @@ pub enum SignatureError {
     VerificationFailed,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedPayload {
+    pub payload: Vec<u8>,
+    pub signature: [u8; 64],
+}
+
+impl SignedPayload {
+    pub fn sign(secret_key: &[u8; 32], payload: impl Into<Vec<u8>>) -> Self {
+        let payload = payload.into();
+        Self {
+            signature: sign_ed25519(secret_key, &payload),
+            payload,
+        }
+    }
+
+    pub fn verify(&self, public_key: &[u8; 32]) -> Result<&[u8], SignatureError> {
+        verify_ed25519(public_key, &self.payload, &self.signature)?;
+        Ok(&self.payload)
+    }
+}
+
 pub fn sign_ed25519(secret_key: &[u8; 32], payload: &[u8]) -> [u8; 64] {
     let key = SigningKey::from_bytes(secret_key);
     key.sign(payload).to_bytes()
@@ -49,6 +70,19 @@ mod tests {
         assert!(verify_ed25519(&public, payload, &signature).is_ok());
         assert_eq!(
             verify_ed25519(&public, b"tampered", &signature),
+            Err(SignatureError::VerificationFailed)
+        );
+    }
+
+    #[test]
+    fn signed_payload_envelope_detects_mutation() {
+        let secret = [9u8; 32];
+        let public = SigningKey::from_bytes(&secret).verifying_key().to_bytes();
+        let mut signed = SignedPayload::sign(&secret, b"capability".to_vec());
+        assert_eq!(signed.verify(&public).unwrap(), b"capability");
+        signed.payload[0] ^= 1;
+        assert_eq!(
+            signed.verify(&public),
             Err(SignatureError::VerificationFailed)
         );
     }
