@@ -140,9 +140,9 @@ nexus/
 │   ├── nexus-codec/
 │   ├── nexus-capture/
 │   ├── nexus-input/
-│   ├── nexus-audio/
-│   ├── nexus-file-transfer/
-│   └── nexus-observability/
+│   ├── nexus-observability/
+│   ├── nexus-audio/            # added Phase 3 / v0.3, see Section 28
+│   └── nexus-file-transfer/    # added Phase 3 / v0.3, see Section 27
 ├── apps/
 │   ├── nexusd/
 │   ├── nexus-relay/
@@ -181,6 +181,12 @@ Native OS / codec APIs
 
 nexus-protocol, nexus-session, and nexus-crypto must never import windows-rs or other OS-specific bindings.
 
+`apps/` binaries may contain their own private internal library crate(s) (e.g. `nexus-client-core`, Section 29) alongside their `main.rs`. These follow the same dependency-direction rule as everything else, but — unlike the crates in `crates/`, which are cross-app OS-independent core logic tracked individually in Appendix A — an app-internal crate is scoped to that one app and is not itself a top-level workspace concern.
+
+The initial Cargo workspace (Phase 0/1) contains only the twelve crates listed above `nexus-audio`: `nexus-common`, `nexus-crypto`, `nexus-protocol`, `nexus-transport`, `nexus-session`, `nexus-auth`, `nexus-policy`, `nexus-audit`, `nexus-codec`, `nexus-capture`, `nexus-input`, `nexus-observability`. `nexus-audio` and `nexus-file-transfer` are scaffolded in Phase 3 (v0.3) alongside the features in Sections 27–28, not before — this keeps the repository layout and the active workspace in agreement. See Appendix A for the same phase mapping per crate.
+
+The tree above is the target end-state layout, built out incrementally across the phases in Section 48. It is not a snapshot of what exists in the repository today. Current build status against this target — which paths are scaffolded, in progress, or not yet started — is tracked separately in `docs/IMPLEMENTATION_STATUS.md` so that status updates (which change often) don't churn this architecture document (which should stay stable).
+
 ────────
 
 6. Recommended Technology Stack
@@ -194,7 +200,9 @@ Core runtime
 • rustls for TLS 1.3.
 • Prost for Protobuf control messages.
 • Serde for persisted/configuration formats.
-• SQLx + PostgreSQL.
+• SQLx as the async SQL layer, backend-agnostic by design.
+• SQLite as the default embedded database for MVP and single-node self-hosting (zero external dependency, matches the "self-hostable" goal in Section 1).
+• PostgreSQL as the upgrade path for multi-tenant or horizontally scaled control-plane deployments, using the same SQLx models/queries.
 • tracing + OpenTelemetry.
 • Prometheus metrics export.
 
@@ -242,10 +250,12 @@ nexusd is a modular monolith for the first releases.
       |                  |                  |
       +------------------+------------------+
                          |
-                    PostgreSQL
+          SQLite (default) / PostgreSQL (scale)
 ```
 
 Do not split into microservices until operational scale or organizational boundaries justify it.
+
+SQLite is the MVP and default self-hosted backend; a deployment migrates to PostgreSQL (same SQLx schema/query layer) only when it needs concurrent multi-writer access, horizontal scaling, or multi-region control-plane HA — none of which are MVP requirements per Section 2.
 
 7.2 Control-plane modules
 
@@ -307,6 +317,8 @@ Requirements
 • Device credential rotation is supported.
 • Revocation can disable new sessions immediately.
 • The agent should continue to verify already-established sessions according to the session policy snapshot unless the session is explicitly revoked.
+
+The policy snapshot an already-established session runs under is not frozen forever: the control plane may push a narrower snapshot to the agent at any time (see Section 12 and ADR-017, `docs/adr/ADR-017-continuous-authorization-narrow-only-push.md`). This is how MVP's static-snapshot model extends into the continuous re-evaluation described in Section 61.3 without a rewrite — a push may only restrict an active session, never grant it permissions beyond what `permissions[]` in the original signed capability allowed.
 
 ────────
 
@@ -421,10 +433,20 @@ SessionCapability {
     expires_at
     nonce
 
+    agent_min_protocol
+    agent_max_protocol
+
     client_ephemeral_public_key
     signature
 }
 ```
+
+`agent_min_protocol`/`agent_max_protocol` pin the agent's advertised
+protocol range (Section 31) as reported over presence (Section 9) at the
+moment the capability is issued. The Section 13 mutual identity-proof
+handshake must reject a `negotiated_protocol` outside this signed range —
+see ADR-016 for the downgrade attack this closes and why the range is bound
+here rather than signing the live negotiated value.
 
 Example restrictions:
 
@@ -434,6 +456,7 @@ file_transfer = disabled
 recording = required
 max_duration = 30m
 max_resolution = 2560x1440
+unattended_consent = notify   # notify | silent — see ADR-023
 ```
 
 Properties
@@ -444,6 +467,25 @@ Properties
 • Signed by a control-plane signing key.
 • Host agent validates the signature locally.
 • Replay attempts must fail.
+
+`expires_at` (with `not_before`) governs only the establishment window: the
+agent must receive and validate the initial `SessionHello` carrying this
+capability before `expires_at`. Once the session reaches ESTABLISHED,
+`expires_at` is no longer checked — ongoing session duration is governed
+exclusively by the `max_duration` restriction (see example above) plus
+explicit revoke and the reconnect-window rules in Section 46. See
+ADR-014 (`docs/adr/ADR-014-session-capability-ttl-semantics.md`) for the
+rationale; this keeps the wire schema unchanged while removing the
+ambiguity between a short establishment TTL and a long-running active
+session.
+
+`restrictions` may be updated in place on an ESTABLISHED session via a
+signed `session.policy_update` message over the presence channel (Section
+9). The agent applies the new `restrictions` only if it narrows the
+existing ones; it must reject any update that would grant a permission not
+present in the original `permissions[]`, since that field is part of what
+the initial signature covers. Widening access always requires a fresh
+capability and a fresh identity handshake. See ADR-017.
 
 ────────
 
@@ -484,6 +526,13 @@ REVOKED
 ```
 
 State transitions must be idempotent and auditable.
+
+A session request for `desktop.control` on a target device that already has
+an ACTIVE `desktop.control` session is denied (`DENIED`, reason: device
+already under control); `desktop.view` may be granted concurrently
+regardless of an active `desktop.control` session on the same device. See
+ADR-015 for the full policy and the race-safety requirement on the
+control-plane check.
 
 ────────
 
@@ -553,7 +602,28 @@ v0.1 may intentionally support relay-only connectivity. This reduces risk while 
 
 v0.2 NAT traversal
 
-Implement an ICE-like candidate exchange without requiring full WebRTC. A STUN-compatible or STUN-inspired discovery server can be used. Symmetric NAT and blocked UDP fall back to relay.
+Implement an ICE-like candidate exchange without requiring full WebRTC.
+Reflexive-address discovery is a custom endpoint on the existing
+authenticated control-plane channel rather than a standalone STUN server
+(ADR-019, `docs/adr/ADR-019-custom-reflexive-discovery.md`) — this avoids
+exposing an additional unauthenticated service to the Internet and reuses
+trust already established for signaling. A STUN-compatible mode can be
+added later for interop if needed. Symmetric NAT and blocked UDP fall back
+to relay.
+
+Relay connection setup and P2P connectivity checks run in parallel from the
+start of CONNECTING, not sequentially (ADR-018,
+`docs/adr/ADR-018-parallel-p2p-relay-race.md`) — whichever candidate
+succeeds first is used, with a short grace window to prefer a successful
+P2P candidate over a relay candidate that also succeeded. A sequential
+"try P2P, then fall back to relay" design would risk missing the <1–2s
+first-frame target (Section 1) on networks where P2P negotiation is slow.
+
+The client must always treat the `candidates` array returned by
+`POST /api/v1/sessions` (Section 32) as a list to iterate, even in v0.1
+where it contains exactly one relay candidate. This keeps the v0.1 → v0.2
+transition additive (more candidate types appended to the same list)
+instead of requiring a client rewrite once P2P candidates are introduced.
 
 ────────
 
@@ -641,6 +711,25 @@ Windows requires separation between the system service and the interactive deskt
 
 The privileged service must expose only a minimal IPC API to the desktop process.
 
+`nexus-desktop-host.exe` runs in two distinct privilege contexts, not one:
+a `SYSTEM`-privileged instance spawned into the `Winlogon` desktop, used only
+to reach the pre-login/lock screen for unattended access; and an
+instance spawned via `CreateProcessAsUser` running as the interactive user,
+used for normal in-session capture. Running the in-session capture process
+as `SYSTEM` would violate the minimum-privilege principle in Section 45.
+See ADR-021 (`docs/adr/ADR-021-desktop-host-privilege-split.md`).
+
+Note: neither Windows Graphics Capture nor DXGI Desktop Duplication can
+capture the Secure Desktop (UAC elevation prompts, Ctrl+Alt+Del screen) —
+this is a Windows security boundary, not an implementation gap. The client
+UX for this state (e.g. a placeholder overlay while the remote desktop is
+on the Secure Desktop) is not yet decided; see Section 58.
+
+If the desktop-host process crashes mid-session, the service detects the
+process exit and respawns it, reusing the existing session's reconnect
+semantics (Section 46) rather than ending the session outright — see
+ADR-024 (`docs/adr/ADR-024-desktop-host-crash-respawn.md`).
+
 ────────
 
 19. Screen Capture
@@ -659,14 +748,20 @@ Desired path:
 
 ```text
 Desktop compositor
-      -> D3D11 texture
+      -> D3D11 texture (RGBA8)
+      -> D3D11 Video Processor color conversion (RGBA8 -> NV12, on VRAM)
       -> hardware encoder
       -> encoded bitstream
       -> packetizer
       -> QUIC datagrams
 ```
 
-The normal path should avoid GPU-to-CPU framebuffer copies.
+The color-conversion step is not optional: hardware H.264 encoders
+(NVENC/QSV/AMF) take NV12 input, not the compositor's native RGBA8/BGRA8
+texture format, so this step exists on the normal path even though it was
+previously implicit rather than shown (see Section 61.1). The normal path
+should avoid GPU-to-CPU framebuffer copies — the conversion above stays on
+VRAM.
 
 ────────
 
@@ -761,7 +856,15 @@ Outputs
 
 Control rule
 
-Degrade quickly when the network worsens; increase quality slowly when conditions improve.
+Degrade quickly when the network worsens; increase quality slowly when conditions improve. Tune the specific "quickly"/"slowly" constants against the network-simulation profiles already defined in Section 47, rather than as free parameters — the profiles exist precisely to make this measurable.
+
+A resolution-scale change is not a free adjustment: it breaks inter-frame prediction, so the encoder must issue a forced keyframe immediately on any resolution-scale change, in addition to the existing keyframe triggers (packet-loss recovery, post-reconnect per Section 46).
+
+Backpressure at the capture/encode boundary follows Principle 3.2
+(interactive freshness): the queue between capture and encode is bounded to
+depth 1 with replace-not-block semantics — a new frame replaces a still-queued
+older one rather than the capture thread blocking on a slow encoder. See
+ADR-022 (`docs/adr/ADR-022-capture-encode-backpressure-drop-stale.md`).
 
 ────────
 
@@ -928,6 +1031,8 @@ Potential UI frameworks:
 
 The remote-display surface should be native/GPU rendered rather than drawn through a browser canvas.
 
+`nexus-client-core` is a library crate private to `apps/nexus-client/` (see Section 5), not a member of the top-level `crates/` directory — its submodules (session, transport, crypto, decoder, renderer, input) are client-specific wiring, not cross-app shared logic, so it is not tracked in Appendix A alongside the OS-independent core crates.
+
 ────────
 
 30. Video Decoding and Rendering
@@ -1064,7 +1169,7 @@ Protocol schemas belong in proto/ and are generated during build. Breaking field
 
 34. Database Model
 
-Initial PostgreSQL tables:
+Initial database tables (SQLite by default for MVP/self-host; the same schema runs on PostgreSQL once a deployment upgrades — see Section 6):
 
 • organizations
 • users
@@ -1115,6 +1220,8 @@ ended_at
 policy_snapshot_json
 termination_reason
 ```
+
+Schema and migrations must stay portable between SQLite and PostgreSQL (avoid backend-specific types/features) so the SQLite-to-PostgreSQL upgrade path stays a configuration change, not a rewrite.
 
 ────────
 
@@ -1394,9 +1501,9 @@ A formal threat-model document should be produced before v0.3 enterprise feature
 
 45. Secure Privilege Boundary
 
-On Windows, nexus-agent-service may run with elevated privilege, but the media process should use the minimum privilege needed for the active user desktop.
+On Windows, nexus-agent-service may run with elevated privilege, but the media process should use the minimum privilege needed for the active user desktop — concretely, `SYSTEM` only when reaching the pre-login `Winlogon` desktop for unattended access, and the interactive user's own privilege for normal in-session capture (Section 18, ADR-021).
 
-The privileged IPC surface should be allow-listed, authenticated, versioned, and fuzz-tested.
+The privileged IPC surface should be allow-listed, authenticated, versioned, and fuzz-tested. "Authenticated" means verifying the connecting process's identity (code signature/hash), not only the Windows ACL on the pipe — an ACL restricts which account can connect, not which binary (ADR-020).
 
 The desktop process must not have unrestricted APIs to:
 
@@ -1418,6 +1525,12 @@ Required state
 • Encoder should issue a fresh keyframe after media reconnection.
 • Input events must not be replayed accidentally.
 • Clipboard and file transfer state must be independently resumable or explicitly aborted.
+
+This section is written from the network-loss perspective, but the same
+semantics apply when `nexus-desktop-host` itself crashes mid-session (e.g. a
+faulty encoder backend): the service detects the process exit and respawns
+the desktop-host under the same `session_id`, treating it as a reconnect
+rather than ending the session (ADR-024).
 
 Recommended default reconnect window: 30–120 seconds configurable.
 
@@ -1688,6 +1801,7 @@ Create Architecture Decision Records for at least these decisions:
 10. ADR-010: Protocol core remains OS-independent.
 11. ADR-011: Relay-only v0.1, P2P in v0.2.
 12. ADR-012: Native client; no Electron.
+13. ADR-013: SQLite as the default MVP/self-host database, with PostgreSQL as the drop-in upgrade path for scaled/multi-tenant deployments.
 
 These ADRs prevent architectural drift during the first implementation cycle.
 
@@ -1729,7 +1843,7 @@ Sprint 4 - Identity and enrollment
 
 • Device key generation.
 • nexusd.
-• PostgreSQL schema.
+• Database schema (SQLite default, PostgreSQL-compatible).
 • Device enrollment.
 • Presence.
 • Minimal user auth.
@@ -1774,7 +1888,7 @@ Internet
    |
    +--> nexusd
    |       |
-   |       +--> PostgreSQL
+   |       +--> SQLite (default, single file on local disk)
    |
    +--> nexus-relay
 ```
@@ -1784,7 +1898,7 @@ Suggested production separation:
 ```text
 Control plane network:
   nexusd
-  PostgreSQL
+  SQLite (default) or PostgreSQL (once multi-writer/scale is needed)
   object storage
 
 Edge network:
@@ -1793,7 +1907,7 @@ Edge network:
   relay-fra1
 ```
 
-Relay nodes should be replaceable/stateless. Control plane can begin as a single-region HA deployment later.
+Relay nodes should be replaceable/stateless. Control plane can begin as a single-region HA deployment later. Moving from SQLite to PostgreSQL is a `database.driver` configuration change (Section 54), not a schema rewrite, so self-hosters can start on SQLite and graduate only when they actually need it.
 
 ────────
 
@@ -1805,8 +1919,9 @@ Example nexusd configuration:
 server:
   listen: 0.0.0.0:8443
 
-postgres:
-  url: ${DATABASE_URL}
+database:
+  driver: sqlite   # sqlite (MVP/self-host default) | postgres (scaled/multi-tenant)
+  url: ${DATABASE_URL}   # e.g. sqlite:///var/lib/nexus/nexus.db or postgres://...
 
 identity:
   signing_key: /var/lib/nexus/keys/session-signing.key
@@ -1819,7 +1934,7 @@ relay:
   registration_secret_file: /var/lib/nexus/relay-secret
 
 audit:
-  backend: postgres
+  backend: sqlite   # inherits database.driver; postgres once the control plane scales
 ```
 
 Example relay configuration:
@@ -1908,15 +2023,15 @@ A protocol feature is not complete until:
 These questions should become ADRs or experiments rather than informal assumptions:
 
 • Exact session capability encoding: compact binary, COSE, PASETO-like, or project-specific signed structure.
-• Whether application E2E encryption is applied per QUIC datagram or at a higher framed layer.
+• Whether application E2E encryption is applied per QUIC datagram or at a higher framed layer. Section 61.2 states one candidate answer (encoded-frame-payload level, i.e. one AEAD operation per encoded frame before Section 21's packetizer fragments it), but Section 61 is a later, informally-reconciled addition to this spec — see the correction made to its Packet Loss Recovery row for a concrete case where a 61.x entry contradicted Sections 14/21/58. Do not treat the 61.2 entry as authoritative for this question until it is either cross-checked against Section 17 and frozen as an ADR, or Section 17 is updated directly. Natural home for that ADR: Section 17 (End-to-End Encryption).
 • Native decoder API choice on Windows.
 • Primary UI framework: Slint versus another native option.
-• Whether a STUN-compatible server is sufficient or a custom connectivity service is needed.
+• ~~Whether a STUN-compatible server is sufficient or a custom connectivity service is needed.~~ Resolved — ADR-019: custom reflexive discovery over the control-plane channel for v0.2, STUN-compatible interop deferred.
 • Whether to use wgpu in the main client renderer or direct platform APIs initially.
 • Exact H.264 packetization strategy and maximum datagram payload.
 • Whether FEC belongs in v0.2 or later.
-• Secure Desktop/UAC support model on Windows.
-• Unattended-access consent/notification policy.
+• Secure Desktop/UAC support model on Windows. Partially resolved: the privilege-context split (SYSTEM for Winlogon/pre-login, as-user in-session) is settled by ADR-021. Still open: client-side UX while the remote desktop is on the Secure Desktop, which cannot be captured at all (Section 19).
+• ~~Unattended-access consent/notification policy.~~ Resolved — ADR-023: configurable per role/device via `SessionCapability.restrictions`, not one fixed global behavior. Chosen specifically because the spec's two named use cases (Section 1) have conflicting expectations here.
 
 ────────
 
@@ -1974,24 +2089,26 @@ The first product milestone should prove one thing exceptionally well:
 
 ────────
 
-Appendix A - Initial Crate Responsibilities
+Appendix A - Crate Responsibilities and Workspace Phase
 
-|Crate                |Responsibility                                              |
-|---------------------|------------------------------------------------------------|
-|`nexus-common`       |IDs, shared errors, time, configuration primitives          |
-|`nexus-crypto`       |Device keys, capability verification, session key derivation|
-|`nexus-protocol`     |Versioned wire/control schema                               |
-|`nexus-transport`    |QUIC connections, streams, datagrams, metrics               |
-|`nexus-session`      |Session state machine, reconnect semantics                  |
-|`nexus-auth`         |User/device authentication logic                            |
-|`nexus-policy`       |RBAC/ABAC evaluation                                        |
-|`nexus-audit`        |Audit event model and sinks                                 |
-|`nexus-codec`        |Encoder/decoder abstractions                                |
-|`nexus-capture`      |Platform-neutral capture traits                             |
-|`nexus-input`        |Semantic input model                                        |
-|`nexus-audio`        |Audio model and Opus pipeline                               |
-|`nexus-file-transfer`|Chunking, resume, integrity                                 |
-|`nexus-observability`|tracing, metrics, session quality telemetry                 |
+|Crate                |Responsibility                                              |Introduced        |
+|---------------------|------------------------------------------------------------|-------------------|
+|`nexus-common`       |IDs, shared errors, time, configuration primitives          |Phase 0 (initial) |
+|`nexus-crypto`       |Device keys, capability verification, session key derivation|Phase 0 (initial) |
+|`nexus-protocol`     |Versioned wire/control schema                               |Phase 0 (initial) |
+|`nexus-transport`    |QUIC connections, streams, datagrams, metrics               |Phase 0 (initial) |
+|`nexus-session`      |Session state machine, reconnect semantics                  |Phase 0 (initial) |
+|`nexus-auth`         |User/device authentication logic                            |Phase 0 (initial) |
+|`nexus-policy`       |RBAC/ABAC evaluation                                        |Phase 0 (initial) |
+|`nexus-audit`        |Audit event model and sinks                                 |Phase 0 (initial) |
+|`nexus-codec`        |Encoder/decoder abstractions                                |Phase 0 (initial) |
+|`nexus-capture`      |Platform-neutral capture traits                             |Phase 0 (initial) |
+|`nexus-input`        |Semantic input model                                        |Phase 0 (initial) |
+|`nexus-observability`|tracing, metrics, session quality telemetry                 |Phase 0 (initial) |
+|`nexus-audio`        |Audio model and Opus pipeline                               |Phase 3 (v0.3)    |
+|`nexus-file-transfer`|Chunking, resume, integrity                                 |Phase 3 (v0.3)    |
+
+"Phase 0 (initial)" crates are the twelve members of the Cargo workspace from the start of implementation. `nexus-audio` and `nexus-file-transfer` are added to `Cargo.toml` when Phase 3 work begins, matching Sections 5, 27, and 28.
 
 ────────
 
@@ -2004,7 +2121,7 @@ Example defaults; final values must be configurable.
 |`nexusd`              |443 |HTTPS/WSS                   |API, auth, signaling       |
 |`nexus-relay`         |4433|UDP/QUIC                    |Relay data plane           |
 |`nexus-relay` fallback|443 |TCP/TLS/QUIC where supported|Restricted-network fallback|
-|STUN/connectivity     |3478|UDP                         |NAT discovery, v0.2        |
+|STUN/connectivity (optional, deferred)|3478|UDP|Not used by the v0.2 baseline — reflexive-address discovery runs over the authenticated control-plane channel instead (ADR-019). Reserved only for a possible future STUN-compatible interop mode; do not open this port as part of the v0.2 build.|
 
 ────────
 
@@ -2051,17 +2168,17 @@ To bridge the gap between initial MVP execution speed and ultimate long-term tec
 | Feature Category | Short-Term (MVP Recommendation) | Long-Term (Target State / Best-in-Class) |
 |---|---|---|
 | Color Space Conversion | D3D11 Video Processor (`ID3D11VideoProcessor`) RGBA8 -> NV12 conversion directly on VRAM. Zero-CPU copy. | Custom D3D11/D3D12 Compute Shader pipeline supporting NV12, P010 (10-bit), and RGB444 color formats. |
-| Desktop Capture API | Primary DXGI Desktop Duplication for low latency; fallback to Windows Graphics Capture (WGC). | Dynamic API switching + Custom Indirect Display Driver (IddCx) for headless virtual display creation up to 240Hz/4K. |
-| UAC & Winlogon Handling | `WM_WTSSESSION_CHANGE` listener in Service; spawn dedicated `SYSTEM`-privileged host runner in `Winlogon` desktop. | Seamless Desktop Handle Migration with shared DXGI GPU context across desktop boundaries. |
+| Desktop Capture API | Primary Windows Graphics Capture (WGC); DXGI Desktop Duplication fallback (matches Sections 6 and 19 — corrected here for consistency). | Dynamic API switching + Custom Indirect Display Driver (IddCx) for headless virtual display creation up to 240Hz/4K. |
+| UAC & Winlogon Handling | `WM_WTSSESSION_CHANGE` listener in Service; spawn dedicated `SYSTEM`-privileged host runner in `Winlogon` desktop for pre-login/unattended capture only — the in-session desktop-host runs as the interactive user (ADR-021). | Seamless Desktop Handle Migration with shared DXGI GPU context across desktop boundaries. |
 | Color Depth & Display | 8-bit SDR (1080p / 4K @ 60fps). | 10-bit HDR (HDR10/Dolby Vision) with wide color gamut (Rec.2020) and dynamic client-side GPU upscaling (DirectML / WebGPU NIS/FSR). |
 
 61.2 Transport, Network & Loss Recovery
 
 | Feature Category | Short-Term (MVP Recommendation) | Long-Term (Target State / Best-in-Class) |
 |---|---|---|
-| Packet Loss Recovery | Stream-per-Frame with instant `STREAM_RESET` / `CANCEL_STREAM` on frame loss to prioritize interactive freshness. | Adaptive Fountain Codes / RaptorQ FEC with real-time loss model prediction (0ms retransmission latency overhead). |
+| Packet Loss Recovery | Unreliable QUIC datagrams per Sections 14/21 — no retransmission; a lost fragment simply drops, and the encoder/agent issues a keyframe on request (Section 20/22) rather than blocking newer frames on redelivery of an old one (corrected here for consistency with Sections 14, 21, 58 — a prior draft of this row proposed reliable Stream-per-Frame with `STREAM_RESET`/`CANCEL_STREAM`, which contradicts the datagram-based design used everywhere else in the spec). | Adaptive Fountain Codes / RaptorQ FEC with real-time loss model prediction (0ms retransmission latency overhead) — FEC is meaningful specifically because the underlying transport stays unreliable/datagram-based; it would be redundant on top of a reliable stream. |
 | Application E2E Crypto | ChaCha20-Poly1305 / AES-GCM applied at the Encoded Frame Payload level (60 AEAD ops/sec). | Per-frame AEAD with hardware-accelerated AES-NI / ARM Crypto extensions + zero-copy payload slicing. |
-| Network Traversal | ICE-inspired UDP P2P hole punching with fallback to QUIC Relay nodes. | Multipath QUIC (MP-QUIC) across Wi-Fi + 5G/LTE simultaneous links + Anycast Blind Relay Mesh with sub-10ms failover. |
+| Network Traversal | ICE-inspired UDP P2P hole punching (parallel-raced against relay setup, ADR-018) with fallback to QUIC Relay nodes; reflexive discovery via ADR-019. | Multipath QUIC (MP-QUIC) across Wi-Fi + 5G/LTE simultaneous links + Anycast Blind Relay Mesh with sub-10ms failover. |
 
 61.3 Security, Identity & Device Trust
 
@@ -2069,7 +2186,7 @@ To bridge the gap between initial MVP execution speed and ultimate long-term tec
 |---|---|---|
 | Key Storage & Identity | Software Ed25519/X25519 keypairs stored in OS secure keychains (Windows Credential Manager). | TPM 2.0 / Secure Enclave hardware-bound keys with Platform Configuration Register (PCR) remote attestation. |
 | Cryptographic Primitives | Classical TLS 1.3 + Ed25519 + X25519 + ChaCha20-Poly1305. | Quantum-Resistant Hybrid Crypto (X25519 + ML-KEM-768 / Kyber for KEM, Ed25519 + ML-DSA / Dilithium for Signatures). |
-| Session Authorization | Short-lived signed capability tokens validated locally by Agent. | Continuous Zero-Trust Attestation (real-time posture re-evaluation, EDR integration, instant token revocation push). |
+| Session Authorization | Short-lived signed capability tokens validated locally by Agent, narrowable in place via signed policy-update push (ADR-017) — the evolution path to the target state, not a separate architecture. | Continuous Zero-Trust Attestation (real-time posture re-evaluation, EDR integration, instant token revocation push). |
 
 61.4 Input, Peripherals & Audio
 
@@ -2084,7 +2201,7 @@ To bridge the gap between initial MVP execution speed and ultimate long-term tec
 | Feature Category | Short-Term (MVP Recommendation) | Long-Term (Target State / Best-in-Class) |
 |---|---|---|
 | Media Concurrency | Dedicated OS Native Thread (`std::thread`) for capture/encode loop; Tokio async runtime for networking. | Zero-allocation lock-free SPSC queues (`crossbeam`) + NUMA-aware thread pinning for GPU/Network IO. |
-| Process IPC | Named Pipes with strict ACL security descriptor between Agent Service and Desktop Host. | Zero-copy Shared Memory Ring Buffers (`shm`) with event signal synchronization. |
+| Process IPC | Named Pipes with strict ACL security descriptor, plus verification of the connecting process's code signature/hash (ADR-020) — ACL alone does not stop a same-user process from opening the pipe. | Zero-copy Shared Memory Ring Buffers (`shm`) with event signal synchronization. |
 
 ────────
 
