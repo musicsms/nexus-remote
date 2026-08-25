@@ -46,3 +46,20 @@ message MonitorInfo {
   uint32 height = 5;
   float scale = 6;
 }
+
+message CursorShape {
+  uint32 id = 1;
+  uint32 width = 2;
+  uint32 height = 3;
+  uint32 hotspot_x = 4;
+  uint32 hotspot_y = 5;
+  uint32 pixel_format = 6;
+  bytes data = 7;
+}
+
+message CursorPosition {
+  sint32 x = 1;
+  sint32 y = 2;
+  bool visible = 3;
+  uint32 shape_id = 4;
+}
