@@ -46,7 +46,7 @@ repo yet.
 | `nexus-common` | IDs, shared errors, time, configuration primitives | Scaffolded — `Cargo.toml` + stub `lib.rs` (`pub fn init() {}`) only |
 | `nexus-crypto` | Device keys, capability verification, session key derivation | Scaffolded — stub only |
 | `nexus-protocol` | Versioned wire/control schema | In progress — Protobuf codegen wired via `prost-build` (`build.rs` compiles `proto/nexus.proto` at build time); `SessionHello` and `MouseMove` control messages implemented with round-trip tests (Section 33); video packet binary header (Section 21) not yet started |
-| `nexus-transport` | QUIC connections, streams, datagrams, metrics | Scaffolded — stub only, no Quinn integration yet |
+| `nexus-transport` | QUIC connections, streams, datagrams, metrics | In progress — self-signed-cert QUIC loopback helpers (`quic::make_server_endpoint`, `quic::make_client_endpoint`) via Quinn 0.11 + rustls 0.23 + rcgen 0.13 (Spec Section 6, 14; ADR-003), with an explicit bounded `datagram_receive_buffer_size` (Spec Section 57 rule 1); test-only loopback cert model, not production; no real connection/stream/datagram API surface for application use yet |
 | `nexus-session` | Session state machine, reconnect semantics | Scaffolded — stub only |
 | `nexus-auth` | User/device authentication logic | Scaffolded — stub only |
 | `nexus-policy` | RBAC/ABAC evaluation | Scaffolded — stub only |

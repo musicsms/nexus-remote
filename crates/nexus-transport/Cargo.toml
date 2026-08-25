@@ -10,3 +10,11 @@ nexus-common = { path = "../nexus-common" }
 thiserror.workspace = true
 serde.workspace = true
 tracing.workspace = true
+tokio.workspace = true
+quinn.workspace = true
+rustls.workspace = true
+anyhow.workspace = true
+rcgen.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
