@@ -63,3 +63,21 @@ message CursorPosition {
   bool visible = 3;
   uint32 shape_id = 4;
 }
+
+message SessionCapability {
+  uint32 version = 1;
+  string issuer = 2;
+  string session_id = 3;
+  string subject_user_id = 4;
+  string client_device_id = 5;
+  string target_device_id = 6;
+  repeated string permissions = 7;
+  bytes restrictions = 8;
+  uint64 not_before = 9;
+  uint64 expires_at = 10;
+  bytes nonce = 11;
+  uint32 agent_min_protocol = 12;
+  uint32 agent_max_protocol = 13;
+  bytes client_ephemeral_public_key = 14;
+  bytes signature = 15;
+}
