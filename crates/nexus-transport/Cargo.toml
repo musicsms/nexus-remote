@@ -12,8 +12,7 @@ serde.workspace = true
 tracing.workspace = true
 tokio.workspace = true
 quinn.workspace = true
-rustls.workspace = true
-anyhow.workspace = true
+rustls = { workspace = true, features = ["ring"] }
 rcgen.workspace = true
 
 [dev-dependencies]
