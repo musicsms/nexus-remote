@@ -44,6 +44,8 @@ pub struct VideoPacketHeader {
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum VideoPacketError {
+    #[error("unsupported video packet version: expected {expected}, got {actual}")]
+    UnsupportedVersion { expected: u8, actual: u8 },
     #[error("buffer too short for header: need {HEADER_LEN} bytes, got {got}")]
     HeaderTooShort { got: usize },
     #[error("buffer too short for payload: header declares {declared} bytes, got {got}")]
@@ -85,6 +87,12 @@ impl VideoPacketHeader {
         }
 
         let version = buf[0];
+        if version != CURRENT_VERSION {
+            return Err(VideoPacketError::UnsupportedVersion {
+                expected: CURRENT_VERSION,
+                actual: version,
+            });
+        }
         let flags = buf[1];
         let stream_id = u16::from_be_bytes([buf[2], buf[3]]);
         let frame_id = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
@@ -158,6 +166,20 @@ mod tests {
         let buf = [0u8; 10];
         let err = VideoPacketHeader::decode(&buf).unwrap_err();
         assert_eq!(err, VideoPacketError::HeaderTooShort { got: 10 });
+    }
+
+    #[test]
+    fn decode_rejects_unsupported_version() {
+        let mut buf = vec![0u8; HEADER_LEN];
+        buf[0] = CURRENT_VERSION + 1;
+        let err = VideoPacketHeader::decode(&buf).unwrap_err();
+        assert_eq!(
+            err,
+            VideoPacketError::UnsupportedVersion {
+                expected: CURRENT_VERSION,
+                actual: CURRENT_VERSION + 1,
+            }
+        );
     }
 
     #[test]
