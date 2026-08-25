@@ -80,3 +80,27 @@ fn input_messages_round_trip() {
         text
     );
 }
+
+#[test]
+fn session_hello_validation_rejects_hostile_values() {
+    use nexus_protocol::{SessionHelloError, CURRENT_PROTOCOL_VERSION, MAX_CAPABILITY_LEN};
+    let mut hello = nexus_protocol::SessionHello {
+        protocol_version: CURRENT_PROTOCOL_VERSION,
+        session_id: "ses_01".into(),
+        device_id: "dev_01".into(),
+        capability: vec![],
+        ephemeral_public_key: vec![],
+    };
+    assert!(hello.validate().is_ok());
+    hello.protocol_version = CURRENT_PROTOCOL_VERSION + 1;
+    assert!(matches!(
+        hello.validate(),
+        Err(SessionHelloError::UnsupportedVersion { .. })
+    ));
+    hello.protocol_version = CURRENT_PROTOCOL_VERSION;
+    hello.capability = vec![0; MAX_CAPABILITY_LEN + 1];
+    assert!(matches!(
+        hello.validate(),
+        Err(SessionHelloError::CapabilityTooLarge { .. })
+    ));
+}
