@@ -36,3 +36,13 @@ message MouseWheel {
   sint32 delta_x = 1;
   sint32 delta_y = 2;
 }
+
+// Spec Section 33/25.
+message MonitorInfo {
+  uint32 id = 1;
+  sint32 origin_x = 2;
+  sint32 origin_y = 3;
+  uint32 width = 4;
+  uint32 height = 5;
+  float scale = 6;
+}

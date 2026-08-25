@@ -4,7 +4,9 @@
 pub mod proto;
 pub mod video_packet;
 
-pub use proto::{KeyEvent, MouseButton, MouseMove, MouseWheel, SessionHello, TextInput};
+pub use proto::{
+    KeyEvent, MonitorInfo, MouseButton, MouseMove, MouseWheel, SessionHello, TextInput,
+};
 pub use video_packet::{VideoPacketError, VideoPacketHeader};
 
 use thiserror::Error;
@@ -27,6 +29,26 @@ pub enum SessionHelloError {
     CapabilityTooLarge { max: usize },
     #[error("ephemeral public key exceeds {max} bytes")]
     EphemeralKeyTooLarge { max: usize },
+}
+
+#[derive(Debug, Error, PartialEq)]
+pub enum MonitorInfoError {
+    #[error("monitor dimensions must be non-zero")]
+    InvalidDimensions,
+    #[error("monitor scale must be finite and greater than zero")]
+    InvalidScale,
+}
+
+impl MonitorInfo {
+    pub fn validate(&self) -> Result<(), MonitorInfoError> {
+        if self.width == 0 || self.height == 0 {
+            return Err(MonitorInfoError::InvalidDimensions);
+        }
+        if !self.scale.is_finite() || self.scale <= 0.0 {
+            return Err(MonitorInfoError::InvalidScale);
+        }
+        Ok(())
+    }
 }
 
 impl SessionHello {
