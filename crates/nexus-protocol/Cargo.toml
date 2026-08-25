@@ -10,3 +10,7 @@ nexus-common = { path = "../nexus-common" }
 thiserror.workspace = true
 serde.workspace = true
 tracing.workspace = true
+prost.workspace = true
+
+[build-dependencies]
+prost-build.workspace = true

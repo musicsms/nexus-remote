@@ -1,0 +1,17 @@
+syntax = "proto3";
+package nexus.protocol.v1;
+
+// Spec Section 33.
+message SessionHello {
+  uint32 protocol_version = 1;
+  string session_id = 2;
+  string device_id = 3;
+  bytes capability = 4;
+  bytes ephemeral_public_key = 5;
+}
+
+// Spec Section 33.
+message MouseMove {
+  sint32 x = 1;
+  sint32 y = 2;
+}
