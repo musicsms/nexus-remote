@@ -25,7 +25,7 @@ Last audited: 2026-08-25.
 
 | Phase | Scope | Exit condition | Status |
 |---|---|---|---|
-| Phase 0 — Foundation | Workspace, CI, protocol crate, QUIC PoC, Windows capture PoC, H.264 encoder PoC | Capture a Windows desktop and stream frames between two local processes | **In progress** — workspace and crate/app skeletons exist; CI running (fmt/clippy/test on Linux, build on Windows); `nexus-protocol` has a Protobuf codegen pipeline with `SessionHello`/`MouseMove` control messages; no QUIC PoC, no capture, no encoder yet |
+| Phase 0 — Foundation | Workspace, CI, protocol crate, QUIC PoC, Windows capture PoC, H.264 encoder PoC | Capture a Windows desktop and stream frames between two local processes | **In progress** — workspace/CI done; nexus-protocol has SessionHello/MouseMove (Protobuf) + Section 21 video packet header; nexus-transport proves both over a real QUIC loopback connection (Sprint 1 demo, Section 52). No Windows capture or hardware encoder PoC yet |
 | Phase 1 — MVP v0.1 | Windows host/client, minimal nexusd, enrollment, relay-only QUIC, H.264 1080p60, input, cursor, reconnect, telemetry overlay | User can enroll a host + client and control it over the Internet through a relay | Not started |
 | Phase 2 — v0.2 Connectivity | Candidate discovery, hole punching, P2P QUIC, adaptive bitrate, clipboard text | P2P succeeds on common NATs, falls back to relay | Not started |
 | Phase 3 — v0.3 Productization | File transfer, audio, recording, RBAC, audit UI/API, signed updates | — | Not started |
@@ -45,8 +45,8 @@ repo yet.
 |---|---|---|
 | `nexus-common` | IDs, shared errors, time, configuration primitives | Scaffolded — `Cargo.toml` + stub `lib.rs` (`pub fn init() {}`) only |
 | `nexus-crypto` | Device keys, capability verification, session key derivation | Scaffolded — stub only |
-| `nexus-protocol` | Versioned wire/control schema | In progress — Protobuf codegen wired via `prost-build` (`build.rs` compiles `proto/nexus.proto` at build time); `SessionHello` and `MouseMove` control messages implemented with round-trip tests (Section 33); video packet binary header (Section 21) not yet started |
-| `nexus-transport` | QUIC connections, streams, datagrams, metrics | In progress — self-signed-cert QUIC loopback helpers (`quic::make_server_endpoint`, `quic::make_client_endpoint`) via Quinn 0.11 + rustls 0.23 + rcgen 0.13 (Spec Section 6, 14; ADR-003), with an explicit bounded `datagram_receive_buffer_size` (Spec Section 57 rule 1); test-only loopback cert model, not production; no real connection/stream/datagram API surface for application use yet |
+| `nexus-protocol` | Versioned wire/control schema | In progress — Protobuf codegen (`SessionHello`, `MouseMove`) via prost-build from `proto/nexus.proto`; hand-rolled `VideoPacketHeader` encode/decode (Section 21) with malformed-input tests |
+| `nexus-transport` | QUIC connections, streams, datagrams, metrics | In progress — self-signed-cert QUIC loopback endpoint helpers (`make_server_endpoint`/`make_client_endpoint`); Sprint 1 demo proves reliable-stream input + unreliable-datagram video both work end to end. No metrics, no relay integration yet |
 | `nexus-session` | Session state machine, reconnect semantics | Scaffolded — stub only |
 | `nexus-auth` | User/device authentication logic | Scaffolded — stub only |
 | `nexus-policy` | RBAC/ABAC evaluation | Scaffolded — stub only |
