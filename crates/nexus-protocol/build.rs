@@ -1,7 +1,7 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Automatically locate/build protoc using protobuf-src if PROTOC environment variable is not set
     if std::env::var("PROTOC").is_err() {
-        std::env::set_var("PROTOC", protobuf_src::protoc());
+        let protoc_path = protoc_bin_vendored::protoc_bin_path()?;
+        std::env::set_var("PROTOC", protoc_path);
     }
 
     println!("cargo:rerun-if-changed=../../proto/nexus.proto");
