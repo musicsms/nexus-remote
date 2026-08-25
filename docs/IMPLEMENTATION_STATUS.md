@@ -25,7 +25,7 @@ Last audited: 2026-08-25.
 
 | Phase | Scope | Exit condition | Status |
 |---|---|---|---|
-| Phase 0 — Foundation | Workspace, CI, protocol crate, QUIC PoC, Windows capture PoC, H.264 encoder PoC | Capture a Windows desktop and stream frames between two local processes | **Not started** — workspace and crate/app skeletons exist (see below), but no CI, no protocol schema, no QUIC PoC, no capture, no encoder |
+| Phase 0 — Foundation | Workspace, CI, protocol crate, QUIC PoC, Windows capture PoC, H.264 encoder PoC | Capture a Windows desktop and stream frames between two local processes | **In progress** — workspace and crate/app skeletons exist; CI running (fmt/clippy/test on Linux, build on Windows); no protocol schema, no QUIC PoC, no capture, no encoder yet |
 | Phase 1 — MVP v0.1 | Windows host/client, minimal nexusd, enrollment, relay-only QUIC, H.264 1080p60, input, cursor, reconnect, telemetry overlay | User can enroll a host + client and control it over the Internet through a relay | Not started |
 | Phase 2 — v0.2 Connectivity | Candidate discovery, hole punching, P2P QUIC, adaptive bitrate, clipboard text | P2P succeeds on common NATs, falls back to relay | Not started |
 | Phase 3 — v0.3 Productization | File transfer, audio, recording, RBAC, audit UI/API, signed updates | — | Not started |
