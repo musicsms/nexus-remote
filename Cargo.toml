@@ -23,6 +23,7 @@ serde_json = "1.0"
 
 # Protocol & Serialization
 prost = "0.13"
+prost-build = "0.13"
 
 # Crypto
 ed25519-dalek = "2.1"
