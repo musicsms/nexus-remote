@@ -1,0 +1,55 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/*",
+    "apps/*",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Nexus Team"]
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+# Core async & network
+tokio = { version = "1.38", features = ["full"] }
+quinn = "0.11"
+rustls = "0.23"
+axum = "0.7"
+tower = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Protocol & Serialization
+prost = "0.13"
+
+# Crypto
+ed25519-dalek = "2.1"
+x25519-dalek = "2.0"
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+blake3 = "1.5"
+
+# Utilities & Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "1.0"
+anyhow = "1.0"
+async-trait = "0.1"
+bytes = "1.6"
+
+# Internal Workspace Crates
+nexus-common = { path = "crates/nexus-common" }
+nexus-crypto = { path = "crates/nexus-crypto" }
+nexus-protocol = { path = "crates/nexus-protocol" }
+nexus-transport = { path = "crates/nexus-transport" }
+nexus-session = { path = "crates/nexus-session" }
+nexus-auth = { path = "crates/nexus-auth" }
+nexus-policy = { path = "crates/nexus-policy" }
+nexus-audit = { path = "crates/nexus-audit" }
+nexus-codec = { path = "crates/nexus-codec" }
+nexus-capture = { path = "crates/nexus-capture" }
+nexus-input = { path = "crates/nexus-input" }
+nexus-observability = { path = "crates/nexus-observability" }
