@@ -104,3 +104,27 @@ fn session_hello_validation_rejects_hostile_values() {
         Err(SessionHelloError::CapabilityTooLarge { .. })
     ));
 }
+
+#[test]
+fn monitor_info_round_trip_and_validation() {
+    let mut monitor = nexus_protocol::MonitorInfo {
+        id: 1,
+        origin_x: -1920,
+        origin_y: 0,
+        width: 1920,
+        height: 1080,
+        scale: 1.25,
+    };
+    assert!(monitor.validate().is_ok());
+    let mut bytes = Vec::new();
+    monitor.encode(&mut bytes).unwrap();
+    assert_eq!(
+        nexus_protocol::MonitorInfo::decode(bytes.as_slice()).unwrap(),
+        monitor
+    );
+    monitor.width = 0;
+    assert!(matches!(
+        monitor.validate(),
+        Err(nexus_protocol::MonitorInfoError::InvalidDimensions)
+    ));
+}
