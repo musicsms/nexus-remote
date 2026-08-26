@@ -69,7 +69,7 @@ repo yet.
 |---|---|---|
 | `nexusd` | Control plane: auth, devices, policy, sessions, signaling, audit | **In progress** — Axum HTTP router with `/healthz`, `/api/v1/devices/enroll` (proof-of-possession verification & signed DeviceCredential), `/api/v1/devices` listing, and `/api/v1/sessions/request` (PolicyEngine evaluation, signed SessionCapability, client/host RelayTokens, and BLAKE3 audit logging); SQL persistence remains next |
 | `nexus-relay` | Stateless encrypted packet relay | **In progress** — Ed25519-signed stateless RelayToken verification (ADR-006), RelaySessionTable with Client/Host endpoint pairing, RelayMetrics accounting, QUIC forwarder bridging bidirectional reliable streams and datagrams with live E2E integration test |
-| `nexus-agent` | Host service: identity, presence, session lifecycle, privilege boundary | Scaffolded — stub binary only |
+| `nexus-agent` | Host service: identity, presence, session lifecycle, privilege boundary | **In progress** — AgentIdentity local private key persistence, EnrollmentClient auto-registration with proof-of-possession against nexusd, and AgentSessionManager capability verification (TTL, protocol range, replay defense) & host session tracking; OS service runner remains next |
 | `nexus-desktop-host` | User-session process: capture, encode, input, clipboard, audio | Scaffolded — stub binary only |
 | `nexus-client` | Native viewer/controller | Scaffolded — stub binary only |
 | `nexus-cli` | Administrative/debugging CLI | Scaffolded — stub binary only |
