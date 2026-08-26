@@ -43,6 +43,8 @@ thiserror = "1.0"
 anyhow = "1.0"
 async-trait = "0.1"
 bytes = "1.6"
+tempfile = "3.10"
+
 
 # Internal Workspace Crates
 nexus-common = { path = "crates/nexus-common" }
