@@ -44,6 +44,7 @@ anyhow = "1.0"
 async-trait = "0.1"
 bytes = "1.6"
 tempfile = "3.10"
+rand = "0.8"
 
 
 # Internal Workspace Crates

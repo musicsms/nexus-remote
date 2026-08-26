@@ -104,22 +104,22 @@ pub async fn enroll_device_handler(
         ));
     }
 
-    // 2. Consume one use from the enrollment token store
-    if let Err(e) = state.consume_enrollment_token(&req.enrollment_token.token_id, now) {
-        return Err((
-            StatusCode::FORBIDDEN,
-            Json(ErrorResponse {
-                error: format!("enrollment token cannot be consumed: {e}"),
-            }),
-        ));
-    }
-
-    // 3. Verify proof of possession against the device's public key
+    // Verify proof before consuming the one-shot enrollment budget. Otherwise
+    // unauthenticated callers can exhaust a valid enrollment token with bad PoP.
     if let Err(e) = req.verify_proof() {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
                 error: format!("invalid proof-of-possession: {e}"),
+            }),
+        ));
+    }
+
+    if let Err(e) = state.consume_enrollment_token(&req.enrollment_token.token_id, now) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse {
+                error: format!("enrollment token cannot be consumed: {e}"),
             }),
         ));
     }
@@ -411,21 +411,13 @@ pub async fn request_session_handler(
 }
 
 fn rand_bytes_16() -> Vec<u8> {
-    use std::time::SystemTime;
-    let t = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let mut b = Vec::with_capacity(16);
-    b.extend_from_slice(&t.to_be_bytes());
-    b
+    let mut b = [0u8; 16];
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut b);
+    b.to_vec()
 }
 
 fn uuid_simple() -> String {
-    use std::time::SystemTime;
-    let t = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    format!("{:032x}", t)
+    let mut b = [0u8; 16];
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut b);
+    b.iter().map(|x| format!("{x:02x}")).collect()
 }
