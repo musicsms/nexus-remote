@@ -863,8 +863,16 @@ name = "nexus-relay"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
+ "ed25519-dalek",
  "nexus-common",
  "nexus-protocol",
+ "quinn",
+ "rcgen",
+ "rustls",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
  "tokio",
  "tracing",
  "tracing-subscriber",

@@ -68,7 +68,7 @@ repo yet.
 | App | Target responsibility | Status |
 |---|---|---|
 | `nexusd` | Control plane: auth, devices, policy, sessions, signaling, audit | Scaffolded — binary boots, initializes `tracing_subscriber`, logs a startup line. No HTTP/gRPC server, no DB, no auth, no session broker |
-| `nexus-relay` | Stateless encrypted packet relay | Scaffolded — stub binary only |
+| `nexus-relay` | Stateless encrypted packet relay | **In progress** — Ed25519-signed stateless RelayToken verification (ADR-006), RelaySessionTable with Client/Host endpoint pairing, RelayMetrics accounting, QUIC forwarder bridging bidirectional reliable streams and datagrams with live E2E integration test |
 | `nexus-agent` | Host service: identity, presence, session lifecycle, privilege boundary | Scaffolded — stub binary only |
 | `nexus-desktop-host` | User-session process: capture, encode, input, clipboard, audio | Scaffolded — stub binary only |
 | `nexus-client` | Native viewer/controller | Scaffolded — stub binary only |
