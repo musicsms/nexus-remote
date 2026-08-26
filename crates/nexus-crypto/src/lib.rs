@@ -21,6 +21,34 @@ pub struct SignedPayload {
     pub signature: [u8; 64],
 }
 
+/// An Ed25519 device identity backed by provisioned 32-byte seed material.
+/// The seed is intentionally private; persistence and rotation belong to the
+/// platform/control-plane layer rather than the wire protocol.
+#[derive(Clone)]
+pub struct DeviceKeypair {
+    signing_key: SigningKey,
+}
+
+impl DeviceKeypair {
+    pub fn from_seed(seed: [u8; 32]) -> Self {
+        Self {
+            signing_key: SigningKey::from_bytes(&seed),
+        }
+    }
+
+    pub fn public_key(&self) -> [u8; 32] {
+        self.signing_key.verifying_key().to_bytes()
+    }
+
+    pub fn sign(&self, payload: &[u8]) -> [u8; 64] {
+        self.signing_key.sign(payload).to_bytes()
+    }
+
+    pub fn verify(&self, payload: &[u8], signature: &[u8; 64]) -> Result<(), SignatureError> {
+        verify_ed25519(&self.public_key(), payload, signature)
+    }
+}
+
 impl SignedPayload {
     pub fn sign(secret_key: &[u8; 32], payload: impl Into<Vec<u8>>) -> Self {
         let payload = payload.into();
@@ -83,6 +111,32 @@ mod tests {
         signed.payload[0] ^= 1;
         assert_eq!(
             signed.verify(&public),
+            Err(SignatureError::VerificationFailed)
+        );
+    }
+
+    #[test]
+    fn device_keypair_round_trips_without_exposing_seed() {
+        let identity = DeviceKeypair::from_seed([11; 32]);
+        let signature = identity.sign(b"device identity");
+        assert!(identity.verify(b"device identity", &signature).is_ok());
+        assert_eq!(
+            identity.public_key(),
+            SigningKey::from_bytes(&[11; 32]).verifying_key().to_bytes()
+        );
+        assert_eq!(
+            identity.verify(b"tampered", &signature),
+            Err(SignatureError::VerificationFailed)
+        );
+    }
+
+    #[test]
+    fn device_keypair_rejects_signature_from_another_identity() {
+        let first = DeviceKeypair::from_seed([1; 32]);
+        let second = DeviceKeypair::from_seed([2; 32]);
+        let signature = first.sign(b"payload");
+        assert_eq!(
+            second.verify(b"payload", &signature),
             Err(SignatureError::VerificationFailed)
         );
     }
