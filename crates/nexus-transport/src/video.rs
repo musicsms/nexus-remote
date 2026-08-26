@@ -253,6 +253,9 @@ impl VideoFrameReassembler {
 
         // Single-packet fast path
         if header.packet_count == 1 {
+            if payload.len() > self.max_frame_bytes {
+                return Ok(None);
+            }
             self.last_delivered_frame_id = Some(header.frame_id);
             self.prune_stale_before(header.frame_id);
             return Ok(Some(AssembledFrame {
@@ -407,6 +410,26 @@ mod tests {
         assert_eq!(
             encode_video_datagram(&header, &[1]),
             Err(VideoDatagramError::PayloadLengthMismatch)
+        );
+    }
+
+    #[test]
+    fn single_packet_respects_max_frame_bytes() {
+        let header = VideoPacketHeader {
+            version: CURRENT_VERSION,
+            flags: nexus_protocol::video_packet::flags::FRAME_START
+                | nexus_protocol::video_packet::flags::FRAME_END,
+            stream_id: 1,
+            frame_id: 1,
+            packet_id: 0,
+            packet_count: 1,
+            timestamp_us: 0,
+            payload_len: 4,
+        };
+        let mut reassembler = VideoFrameReassembler::new(2, 3);
+        assert_eq!(
+            reassembler.process_packet(&header, &[1, 2, 3, 4]).unwrap(),
+            None
         );
     }
 
