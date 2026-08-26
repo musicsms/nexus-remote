@@ -44,6 +44,23 @@ impl ReconnectPolicy {
 pub enum SessionPolicyError {
     #[error("reconnect window must be greater than zero")]
     ZeroReconnectWindow,
+    #[error("session duration must be greater than zero")]
+    ZeroSessionDuration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionDurationPolicy {
+    pub max_duration: Duration,
+}
+
+impl SessionDurationPolicy {
+    pub fn new(max_duration: Duration) -> Result<Self, SessionPolicyError> {
+        if max_duration.is_zero() {
+            Err(SessionPolicyError::ZeroSessionDuration)
+        } else {
+            Ok(Self { max_duration })
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,7 +103,7 @@ impl SessionState {
                 Self::Active | Self::Failed | Self::Revoked
             ) | (
                 Self::Active,
-                Self::Disconnected | Self::Revoked | Self::Ended
+                Self::Disconnected | Self::Revoked | Self::Ended | Self::Expired
             ) | (Self::Disconnected, Self::Connecting | Self::Ended)
         )
     }
@@ -96,6 +113,8 @@ impl SessionState {
 pub struct SessionStateMachine {
     state: SessionState,
     reconnect_deadline: Option<Instant>,
+    established_at: Option<Instant>,
+    max_duration: Option<Duration>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,6 +156,8 @@ impl SessionStateMachine {
         Self {
             state: SessionState::Requested,
             reconnect_deadline: None,
+            established_at: None,
+            max_duration: None,
         }
     }
 
@@ -159,6 +180,25 @@ impl SessionStateMachine {
             && self
                 .reconnect_deadline
                 .is_some_and(|deadline| now <= deadline)
+    }
+
+    pub fn mark_established_at(
+        &mut self,
+        now: Instant,
+        policy: SessionDurationPolicy,
+    ) -> Result<(), InvalidTransition> {
+        self.transition(SessionState::Established)?;
+        self.established_at = Some(now);
+        self.max_duration = Some(policy.max_duration);
+        Ok(())
+    }
+
+    pub fn duration_expired(&self, now: Instant) -> bool {
+        matches!(self.state, SessionState::Established | SessionState::Active)
+            && self
+                .established_at
+                .zip(self.max_duration)
+                .is_some_and(|(at, max)| now.saturating_duration_since(at) >= max)
     }
 
     pub fn transition(&mut self, next: SessionState) -> Result<(), InvalidTransition> {
@@ -234,6 +274,31 @@ mod tests {
         assert_eq!(id.as_str(), "ses_01");
         assert!(SessionId::new("").is_err());
         assert!(SessionId::new("x".repeat(129)).is_err());
+    }
+
+    #[test]
+    fn established_duration_expires_at_boundary() {
+        let now = Instant::now();
+        let mut machine = SessionStateMachine::new();
+        let policy = SessionDurationPolicy::new(Duration::from_secs(30)).unwrap();
+        machine.transition(SessionState::Authorized).unwrap();
+        machine.transition(SessionState::Connecting).unwrap();
+        machine.mark_established_at(now, policy).unwrap();
+        assert!(!machine.duration_expired(now + Duration::from_secs(29)));
+        assert!(machine.duration_expired(now + Duration::from_secs(30)));
+        machine.transition(SessionState::Active).unwrap();
+        machine.transition(SessionState::Expired).unwrap();
+        let mut revoked = SessionStateMachine::new();
+        revoked.transition(SessionState::Authorized).unwrap();
+        revoked.transition(SessionState::Revoked).unwrap();
+    }
+
+    #[test]
+    fn duration_policy_rejects_zero() {
+        assert_eq!(
+            SessionDurationPolicy::new(Duration::ZERO),
+            Err(SessionPolicyError::ZeroSessionDuration)
+        );
     }
 
     #[test]
