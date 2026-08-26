@@ -6,8 +6,7 @@
 //! [`SinkError`] for error handling.
 
 use async_trait::async_trait;
-use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use crate::chain::ChainedAuditEvent;
 
@@ -49,7 +48,7 @@ pub trait AuditSink: Send + Sync {
     }
 }
 
-/// An in-memory audit sink backed by an `Arc<tokio::sync::RwLock<Vec<ChainedAuditEvent>>>`.
+/// An in-memory audit sink backed by an `Arc<std::sync::RwLock<Vec<ChainedAuditEvent>>>`.
 ///
 /// Useful for testing, validation, and in-memory aggregation.
 #[derive(Debug, Clone)]
@@ -75,36 +74,24 @@ impl MemoryAuditSink {
     /// Returns a copy of all recorded chained audit events.
     #[must_use]
     pub fn events(&self) -> Vec<ChainedAuditEvent> {
-        if let Ok(guard) = self.events.try_read() {
-            return guard.clone();
-        }
-        for _ in 0..10_000 {
-            std::thread::yield_now();
-            if let Ok(guard) = self.events.try_read() {
-                return guard.clone();
-            }
-        }
-        Vec::new()
+        self.events
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Returns a copy of all recorded chained audit events asynchronously.
     pub async fn events_async(&self) -> Vec<ChainedAuditEvent> {
-        self.events.read().await.clone()
+        self.events()
     }
 
     /// Returns the number of events recorded in the sink.
     #[must_use]
     pub fn len(&self) -> usize {
-        if let Ok(guard) = self.events.try_read() {
-            return guard.len();
-        }
-        for _ in 0..10_000 {
-            std::thread::yield_now();
-            if let Ok(guard) = self.events.try_read() {
-                return guard.len();
-            }
-        }
-        0
+        self.events
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
     }
 
     /// Returns `true` if the sink contains no events.
@@ -115,29 +102,27 @@ impl MemoryAuditSink {
 
     /// Clears all events stored in the sink.
     pub fn clear(&self) {
-        if let Ok(mut guard) = self.events.try_write() {
-            guard.clear();
-            return;
-        }
-        for _ in 0..10_000 {
-            std::thread::yield_now();
-            if let Ok(mut guard) = self.events.try_write() {
-                guard.clear();
-                return;
-            }
-        }
+        let mut guard = self
+            .events
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.clear();
     }
 
     /// Clears all events stored in the sink asynchronously.
     pub async fn clear_async(&self) {
-        self.events.write().await.clear();
+        self.clear();
     }
 }
 
 #[async_trait]
 impl AuditSink for MemoryAuditSink {
     async fn record(&self, event: &ChainedAuditEvent) -> Result<(), SinkError> {
-        self.events.write().await.push(event.clone());
+        let mut guard = self
+            .events
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.push(event.clone());
         Ok(())
     }
 
