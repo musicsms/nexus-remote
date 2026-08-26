@@ -45,7 +45,7 @@ pub enum NonceSequenceError {
 }
 
 /// Monotonic per-channel nonce allocator matching ADR-025's 32+64 layout.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct NonceSequence {
     domain: u32,
     next: u64,
