@@ -1,10 +1,15 @@
 use std::sync::{Mutex, PoisonError};
 
+#[derive(Debug)]
+struct QueueInner<T> {
+    slot: Option<T>,
+    dropped: u64,
+}
+
 /// Depth-one queue where the newest frame replaces a stale queued frame.
 #[derive(Debug)]
 pub struct LatestFrameQueue<T> {
-    slot: Mutex<Option<T>>,
-    dropped: Mutex<u64>,
+    inner: Mutex<QueueInner<T>>,
 }
 
 impl<T> Default for LatestFrameQueue<T> {
@@ -16,28 +21,33 @@ impl<T> Default for LatestFrameQueue<T> {
 impl<T> LatestFrameQueue<T> {
     pub const fn new() -> Self {
         Self {
-            slot: Mutex::new(None),
-            dropped: Mutex::new(0),
+            inner: Mutex::new(QueueInner {
+                slot: None,
+                dropped: 0,
+            }),
         }
     }
 
     pub fn replace(&self, frame: T) {
-        let mut slot = self.slot.lock().unwrap_or_else(PoisonError::into_inner);
-        if slot.replace(frame).is_some() {
-            let mut dropped = self.dropped.lock().unwrap_or_else(PoisonError::into_inner);
-            *dropped += 1;
+        let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        if inner.slot.replace(frame).is_some() {
+            inner.dropped += 1;
         }
     }
 
     pub fn take(&self) -> Option<T> {
-        self.slot
+        self.inner
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+            .slot
             .take()
     }
 
     pub fn dropped_count(&self) -> u64 {
-        *self.dropped.lock().unwrap_or_else(PoisonError::into_inner)
+        self.inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .dropped
     }
 }
 

@@ -176,6 +176,34 @@ impl SessionCapability {
         }
         Ok(())
     }
+
+    /// Serializes all capability fields except the signature field in canonical Protobuf format.
+    /// This is the exact payload signed by the control plane and verified by endpoints.
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        use prost::Message;
+        let unsigned = SessionCapability {
+            version: self.version,
+            issuer: self.issuer.clone(),
+            session_id: self.session_id.clone(),
+            subject_user_id: self.subject_user_id.clone(),
+            client_device_id: self.client_device_id.clone(),
+            target_device_id: self.target_device_id.clone(),
+            permissions: self.permissions.clone(),
+            restrictions: self.restrictions.clone(),
+            not_before: self.not_before,
+            expires_at: self.expires_at,
+            nonce: self.nonce.clone(),
+            agent_min_protocol: self.agent_min_protocol,
+            agent_max_protocol: self.agent_max_protocol,
+            client_ephemeral_public_key: self.client_ephemeral_public_key.clone(),
+            signature: Vec::new(),
+        };
+        let mut buf = Vec::with_capacity(unsigned.encoded_len());
+        unsigned
+            .encode(&mut buf)
+            .expect("SessionCapability serialization cannot fail");
+        buf
+    }
 }
 
 pub fn init() {

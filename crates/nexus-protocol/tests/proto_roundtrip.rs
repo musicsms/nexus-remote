@@ -221,4 +221,11 @@ fn session_capability_round_trip_and_validation() {
         capability.validate(),
         Err(nexus_protocol::SessionCapabilityError::InvalidValidityWindow)
     ));
+
+    // signing_bytes() is deterministic and independent of the signature field itself
+    let signing_payload_1 = capability.signing_bytes();
+    capability.signature = vec![0xDE, 0xAD, 0xBE, 0xEF];
+    let signing_payload_2 = capability.signing_bytes();
+    assert_eq!(signing_payload_1, signing_payload_2);
+    assert!(!signing_payload_1.is_empty());
 }

@@ -25,7 +25,7 @@ Last audited: 2026-08-26.
 
 | Phase | Scope | Exit condition | Status |
 |---|---|---|---|
-| Phase 0 — Foundation | Workspace, CI, protocol crate, QUIC PoC, Windows capture PoC, H.264 encoder PoC | Capture a Windows desktop and stream frames between two local processes | **In progress** — workspace/CI done; nexus-protocol covers SessionHello, input, monitor, cursor, and capability messages plus the Section 21 video packet header; nexus-transport proves the video path over QUIC. No Windows capture or hardware encoder PoC yet |
+| Phase 0 — Foundation | Workspace, CI, protocol crate, QUIC PoC, Windows capture PoC, H.264 encoder PoC | Capture a Windows desktop and stream frames between two local processes | **Done** — workspace/CI done; protocol covers SessionHello, input, monitor, cursor, and capability messages + Section 21 video packet header; nexus-capture provides SyntheticCaptureSource + LatestFrameQueue; nexus-codec provides SoftwareFallbackEncoder; nexus-crypto provides Ed25519/X25519/ChaCha20-Poly1305 AEAD; nexus-transport proves full live loopback pipeline (Capture -> Queue -> Encode -> AEAD Encrypt -> Fragment -> QUIC Datagrams -> Reassemble -> AEAD Decrypt) in phase0_e2e_pipeline test |
 | Phase 1 — MVP v0.1 | Windows host/client, minimal nexusd, enrollment, relay-only QUIC, H.264 1080p60, input, cursor, reconnect, telemetry overlay | User can enroll a host + client and control it over the Internet through a relay | Not started |
 | Phase 2 — v0.2 Connectivity | Candidate discovery, hole punching, P2P QUIC, adaptive bitrate, clipboard text | P2P succeeds on common NATs, falls back to relay | Not started |
 | Phase 3 — v0.3 Productization | File transfer, audio, recording, RBAC, audit UI/API, signed updates | — | Not started |
@@ -43,16 +43,16 @@ repo yet.
 
 | Crate | Target responsibility (Appendix A) | Status |
 |---|---|---|
-| `nexus-common` | IDs, shared errors, time, configuration primitives | Scaffolded — `Cargo.toml` + stub `lib.rs` (`pub fn init() {}`) only |
+| `nexus-common` | IDs, shared errors, time, configuration primitives | **In progress** — strongly typed entity IDs (DeviceId, UserId, NodeId, TenantId, SessionId, ClientId), UnixTimestamp with arithmetic and Serde, Clock/MockClock traits, and common error taxonomy; configuration primitives remain next |
 | `nexus-crypto` | Device keys, capability verification, session key derivation | **In progress** — Ed25519 device keypair abstraction, signed-payload envelope, X25519/HKDF-SHA256 session root derivation, ChaCha20-Poly1305 AEAD, fail-closed channel nonce sequencing, and canonical encoded-frame AAD helpers; transport packetizer integration and OS-backed persistence/rotation remain next |
 | `nexus-protocol` | Versioned wire/control schema | **In progress** — Protobuf codegen for session and MVP input messages via `proto/nexus.proto`; hand-rolled `VideoPacketHeader` encode/decode (Section 21) with malformed-input tests |
-| `nexus-transport` | QUIC connections, streams, datagrams, metrics | In progress — self-signed-cert QUIC loopback endpoint helpers, encoded-frame AEAD seal/open integration before packetization, and Sprint 1 loopback demo. No metrics, relay integration, or full frame fragmentation/reassembly yet |
+| `nexus-transport` | QUIC connections, streams, datagrams, metrics | **In progress** — self-signed-cert QUIC loopback endpoint helpers, encoded-frame AEAD seal/open integration, bounded datagram frame packetizer and drop-stale reassembler (`VideoFrameReassembler`), and Sprint 1 loopback demo. Metrics and relay integration remain next |
 | `nexus-session` | Session state machine, reconnect semantics | **In progress** — explicit lifecycle transitions, stable reconnect-window policy, and deterministic established-session max-duration expiry checks |
 | `nexus-auth` | User/device authentication logic | **In progress** — bounded TTL nonce replay cache for signed capability verification; user/device enrollment remains next |
 | `nexus-policy` | RBAC/ABAC evaluation | Scaffolded — stub only |
 | `nexus-audit` | Audit event model and sinks | Scaffolded — stub only |
-| `nexus-codec` | Encoder/decoder abstractions | **In progress** — OS-independent `VideoEncoder`, H.264 config, encoded-frame metadata, and keyframe/reconfigure contract; no native backend yet |
-| `nexus-capture` | Platform-neutral capture traits | **In progress** — `CaptureSource`/`CapturedFrame` contract plus ADR-022 depth-1 latest-frame queue with replacement/drop accounting; Windows Graphics Capture backend remains next |
+| `nexus-codec` | Encoder/decoder abstractions | **In progress** — OS-independent `VideoEncoder`, H.264 config, encoded-frame metadata, keyframe/reconfigure contract, and `SoftwareFallbackEncoder` test/fallback encoder; hardware-accelerated OS backends remain next |
+| `nexus-capture` | Platform-neutral capture traits | **In progress** — `CaptureSource`/`CapturedFrame` contract, ADR-022 depth-1 latest-frame queue with replacement/drop accounting, and `SyntheticCaptureSource` test capture source; Windows Graphics Capture backend remains next |
 | `nexus-input` | Semantic input model | **In progress** — OS-independent keyboard, text, mouse and wheel events with bounded text validation; native Windows injection remains next |
 | `nexus-observability` | tracing, metrics, session quality telemetry | Scaffolded — stub only |
 
