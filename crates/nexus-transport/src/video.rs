@@ -1,7 +1,49 @@
+use nexus_crypto::{
+    open_encoded_frame, seal_encoded_frame, EncodedFrameMetadata, EncryptedFrame, FrameSealError,
+    NonceSequence,
+};
 use nexus_protocol::{VideoPacketError, VideoPacketHeader};
 use thiserror::Error;
 
 pub const MAX_VIDEO_DATAGRAM_SIZE: usize = 64 * 1024;
+
+pub fn seal_video_frame(
+    key: &[u8; 32],
+    sequence: &mut NonceSequence,
+    header: &VideoPacketHeader,
+    codec_config_id: u32,
+    encoded_frame: &[u8],
+) -> Result<EncryptedFrame, FrameSealError> {
+    seal_encoded_frame(
+        key,
+        sequence,
+        EncodedFrameMetadata {
+            protocol_version: header.version as u32,
+            channel: header.stream_id as u32,
+            frame_id: header.frame_id,
+            codec_config_id,
+        },
+        encoded_frame,
+    )
+}
+
+pub fn open_video_frame(
+    key: &[u8; 32],
+    header: &VideoPacketHeader,
+    codec_config_id: u32,
+    encrypted: &EncryptedFrame,
+) -> Result<Vec<u8>, nexus_crypto::AeadError> {
+    open_encoded_frame(
+        key,
+        EncodedFrameMetadata {
+            protocol_version: header.version as u32,
+            channel: header.stream_id as u32,
+            frame_id: header.frame_id,
+            codec_config_id,
+        },
+        encrypted,
+    )
+}
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum VideoDatagramError {
@@ -117,6 +159,32 @@ mod tests {
         assert_eq!(
             encode_video_datagram(&header, &[1]),
             Err(VideoDatagramError::PayloadLengthMismatch)
+        );
+    }
+
+    #[test]
+    fn seals_video_frame_before_packetization_and_authenticates_header_metadata() {
+        let header = VideoPacketHeader {
+            version: CURRENT_VERSION,
+            flags: 0,
+            stream_id: 7,
+            frame_id: 9,
+            packet_id: 0,
+            packet_count: 1,
+            timestamp_us: 0,
+            payload_len: 0,
+        };
+        let mut sequence = NonceSequence::new(0x0102_0304);
+        let encrypted = seal_video_frame(&[4; 32], &mut sequence, &header, 12, b"encoded").unwrap();
+        assert_eq!(
+            open_video_frame(&[4; 32], &header, 12, &encrypted).unwrap(),
+            b"encoded"
+        );
+        let mut changed = header.clone();
+        changed.frame_id += 1;
+        assert_eq!(
+            open_video_frame(&[4; 32], &changed, 12, &encrypted),
+            Err(nexus_crypto::AeadError::AuthenticationFailed)
         );
     }
 }
