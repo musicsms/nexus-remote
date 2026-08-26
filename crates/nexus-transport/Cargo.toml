@@ -21,3 +21,6 @@ rcgen.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tracing-subscriber.workspace = true
+nexus-capture = { path = "../nexus-capture" }
+nexus-codec = { path = "../nexus-codec" }
+

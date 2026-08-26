@@ -843,6 +843,8 @@ dependencies = [
 name = "nexus-transport"
 version = "0.1.0"
 dependencies = [
+ "nexus-capture",
+ "nexus-codec",
  "nexus-common",
  "nexus-crypto",
  "nexus-protocol",
