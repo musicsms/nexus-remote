@@ -25,7 +25,7 @@ Last audited: 2026-08-25.
 
 | Phase | Scope | Exit condition | Status |
 |---|---|---|---|
-| Phase 0 — Foundation | Workspace, CI, protocol crate, QUIC PoC, Windows capture PoC, H.264 encoder PoC | Capture a Windows desktop and stream frames between two local processes | **In progress** — workspace/CI done; nexus-protocol has SessionHello/MouseMove (Protobuf) + Section 21 video packet header; nexus-transport proves both over a real QUIC loopback connection (Sprint 1 demo, Section 52). No Windows capture or hardware encoder PoC yet |
+| Phase 0 — Foundation | Workspace, CI, protocol crate, QUIC PoC, Windows capture PoC, H.264 encoder PoC | Capture a Windows desktop and stream frames between two local processes | **In progress** — workspace/CI done; nexus-protocol covers SessionHello, input, monitor, cursor, and capability messages plus the Section 21 video packet header; nexus-transport proves the video path over QUIC. No Windows capture or hardware encoder PoC yet |
 | Phase 1 — MVP v0.1 | Windows host/client, minimal nexusd, enrollment, relay-only QUIC, H.264 1080p60, input, cursor, reconnect, telemetry overlay | User can enroll a host + client and control it over the Internet through a relay | Not started |
 | Phase 2 — v0.2 Connectivity | Candidate discovery, hole punching, P2P QUIC, adaptive bitrate, clipboard text | P2P succeeds on common NATs, falls back to relay | Not started |
 | Phase 3 — v0.3 Productization | File transfer, audio, recording, RBAC, audit UI/API, signed updates | — | Not started |
@@ -44,7 +44,7 @@ repo yet.
 | Crate | Target responsibility (Appendix A) | Status |
 |---|---|---|
 | `nexus-common` | IDs, shared errors, time, configuration primitives | Scaffolded — `Cargo.toml` + stub `lib.rs` (`pub fn init() {}`) only |
-| `nexus-crypto` | Device keys, capability verification, session key derivation | **In progress** — Ed25519 primitives plus signed-payload envelope for capability verification; key lifecycle and replay cache remain next |
+| `nexus-crypto` | Device keys, capability verification, session key derivation | **In progress** — Ed25519 primitives plus signed-payload envelope for capability verification; key lifecycle remains next (replay protection is in `nexus-auth`) |
 | `nexus-protocol` | Versioned wire/control schema | **In progress** — Protobuf codegen for session and MVP input messages via `proto/nexus.proto`; hand-rolled `VideoPacketHeader` encode/decode (Section 21) with malformed-input tests |
 | `nexus-transport` | QUIC connections, streams, datagrams, metrics | In progress — self-signed-cert QUIC loopback endpoint helpers (`make_server_endpoint`/`make_client_endpoint`); Sprint 1 demo proves reliable-stream input + unreliable-datagram video both work end to end. No metrics, no relay integration yet |
 | `nexus-session` | Session state machine, reconnect semantics | **In progress** — explicit lifecycle transitions plus stable reconnect-window policy and deadline validation |
@@ -81,7 +81,7 @@ repo yet.
 | `platform/windows/` | Windows-specific OS/codec bindings | Not started |
 | `platform/macos/` | macOS-specific bindings (Phase 5) | Not started |
 | `platform/linux/` | Linux-specific bindings (Phase 5) | Not started |
-| `proto/` | Protobuf schemas (Section 33) | Scaffolded — `proto/nexus.proto` defines `SessionHello` and `MouseMove` (package `nexus.protocol.v1`), compiled into `nexus-protocol` by `build.rs` via `prost-build` |
+| `proto/` | Protobuf schemas (Section 33) | Scaffolded — `proto/nexus.proto` defines the Phase 0 session, input, monitor, cursor, and capability messages (package `nexus.protocol.v1`), compiled into `nexus-protocol` by `build.rs` via `prost-build` |
 | `migrations/` | SQL migrations (SQLite-first, Section 34) | Not started |
 | `deployment/` | Deployment manifests (Section 53) | Not started |
 | `test/integration/` | Client → relay → agent integration tests | Not started |

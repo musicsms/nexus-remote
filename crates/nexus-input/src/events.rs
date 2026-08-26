@@ -9,6 +9,12 @@ impl Modifiers {
     pub const CTRL: Self = Self(1 << 1);
     pub const ALT: Self = Self(1 << 2);
     pub const META: Self = Self(1 << 3);
+    pub const fn bits(self) -> u32 {
+        self.0 as u32
+    }
+    pub const fn from_bits(bits: u32) -> Self {
+        Self((bits & 0x0f) as u8)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,5 +94,12 @@ mod tests {
                 max_bytes: InputEvent::MAX_TEXT_BYTES
             })
         );
+    }
+
+    #[test]
+    fn modifier_bits_round_trip_canonically() {
+        assert_eq!(Modifiers::SHIFT.bits(), 1);
+        assert_eq!(Modifiers::CTRL.bits(), 2);
+        assert_eq!(Modifiers::from_bits(0xF1).bits(), 1);
     }
 }

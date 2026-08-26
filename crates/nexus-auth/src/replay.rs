@@ -26,14 +26,7 @@ impl NonceReplayCache {
             return false;
         }
         if self.entries.len() >= self.capacity {
-            if let Some(oldest) = self
-                .entries
-                .iter()
-                .min_by_key(|(_, seen)| *seen)
-                .map(|(key, _)| key.clone())
-            {
-                self.entries.remove(&oldest);
-            }
+            return false;
         }
         self.entries.insert(nonce.to_vec(), now);
         true
@@ -59,12 +52,12 @@ mod tests {
     }
 
     #[test]
-    fn evicts_oldest_when_capacity_is_reached() {
+    fn rejects_new_nonce_when_capacity_is_reached() {
         let now = Instant::now();
         let mut cache = NonceReplayCache::new(Duration::from_secs(60), 2);
         assert!(cache.accept(b"a", now));
         assert!(cache.accept(b"b", now + Duration::from_secs(1)));
-        assert!(cache.accept(b"c", now + Duration::from_secs(2)));
-        assert!(cache.accept(b"a", now + Duration::from_secs(3)));
+        assert!(!cache.accept(b"c", now + Duration::from_secs(2)));
+        assert!(!cache.accept(b"a", now + Duration::from_secs(3)));
     }
 }

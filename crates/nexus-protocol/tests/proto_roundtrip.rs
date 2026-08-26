@@ -138,7 +138,7 @@ fn cursor_shape_and_position_round_trip() {
         hotspot_x: 1,
         hotspot_y: 2,
         pixel_format: 1,
-        data: vec![0; 64],
+        data: vec![0; 16 * 16 * 4],
     };
     assert!(shape.validate().is_ok());
     let position = nexus_protocol::CursorPosition {
@@ -158,6 +158,35 @@ fn cursor_shape_and_position_round_trip() {
     assert_eq!(
         nexus_protocol::CursorPosition::decode(bytes.as_slice()).unwrap(),
         position
+    );
+}
+
+#[test]
+fn rejects_invalid_monitor_scale_and_cursor_payload() {
+    let monitor = nexus_protocol::MonitorInfo {
+        id: 1,
+        origin_x: 0,
+        origin_y: 0,
+        width: 1,
+        height: 1,
+        scale: 100.1,
+    };
+    assert_eq!(
+        monitor.validate(),
+        Err(nexus_protocol::MonitorInfoError::ScaleTooLarge)
+    );
+    let shape = nexus_protocol::CursorShape {
+        id: 1,
+        width: 2,
+        height: 2,
+        hotspot_x: 0,
+        hotspot_y: 0,
+        pixel_format: 1,
+        data: vec![0; 3],
+    };
+    assert_eq!(
+        shape.validate(),
+        Err(nexus_protocol::CursorShapeError::InvalidPayloadLength)
     );
 }
 
