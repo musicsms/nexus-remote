@@ -49,7 +49,7 @@ repo yet.
 | `nexus-transport` | QUIC connections, streams, datagrams, metrics | **In progress** — self-signed-cert QUIC loopback endpoint helpers, encoded-frame AEAD seal/open integration, bounded datagram frame packetizer and drop-stale reassembler (`VideoFrameReassembler`), and Sprint 1 loopback demo. Metrics and relay integration remain next |
 | `nexus-session` | Session state machine, reconnect semantics | **In progress** — explicit lifecycle transitions, stable reconnect-window policy, and deterministic established-session max-duration expiry checks |
 | `nexus-auth` | User/device authentication logic | **In progress** — bounded TTL nonce replay cache for signed capability verification; user/device enrollment remains next |
-| `nexus-policy` | RBAC/ABAC evaluation | Scaffolded — stub only |
+| `nexus-policy` | RBAC/ABAC evaluation | **In progress** — 11 first-class actions (Action/ActionSet), role & device label matching models, PolicyEngine evaluating RBAC/ABAC with ADR-015 concurrent control exclusivity, and ADR-017 dynamic policy narrowing validator; database-backed role persistence remains next |
 | `nexus-audit` | Audit event model and sinks | Scaffolded — stub only |
 | `nexus-codec` | Encoder/decoder abstractions | **In progress** — OS-independent `VideoEncoder`, H.264 config, encoded-frame metadata, keyframe/reconfigure contract, and `SoftwareFallbackEncoder` test/fallback encoder; hardware-accelerated OS backends remain next |
 | `nexus-capture` | Platform-neutral capture traits | **In progress** — `CaptureSource`/`CapturedFrame` contract, ADR-022 depth-1 latest-frame queue with replacement/drop accounting, and `SyntheticCaptureSource` test capture source; Windows Graphics Capture backend remains next |

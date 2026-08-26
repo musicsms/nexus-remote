@@ -10,3 +10,6 @@ nexus-common = { path = "../nexus-common" }
 thiserror.workspace = true
 serde.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
