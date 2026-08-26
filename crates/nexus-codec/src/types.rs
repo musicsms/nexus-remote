@@ -45,6 +45,8 @@ pub enum CodecError {
     InvalidRateOrBitrate,
     #[error("encoder frame dimensions do not match configured dimensions")]
     FrameDimensionsMismatch,
+    #[error("encoder is not configured")]
+    NotConfigured,
 }
 
 pub trait VideoEncoder: Send {
