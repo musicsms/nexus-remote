@@ -38,6 +38,61 @@ pub enum AeadError {
     AuthenticationFailed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncodedFrameMetadata {
+    pub protocol_version: u32,
+    pub channel: u32,
+    pub frame_id: u32,
+    pub codec_config_id: u32,
+}
+
+impl EncodedFrameMetadata {
+    pub fn aad(self) -> [u8; 16] {
+        let mut aad = [0u8; 16];
+        aad[..4].copy_from_slice(&self.protocol_version.to_be_bytes());
+        aad[4..8].copy_from_slice(&self.channel.to_be_bytes());
+        aad[8..12].copy_from_slice(&self.frame_id.to_be_bytes());
+        aad[12..].copy_from_slice(&self.codec_config_id.to_be_bytes());
+        aad
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct EncryptedFrame {
+    pub nonce: [u8; 12],
+    pub ciphertext: Vec<u8>,
+}
+
+pub fn seal_encoded_frame(
+    key: &[u8; 32],
+    sequence: &mut NonceSequence,
+    metadata: EncodedFrameMetadata,
+    plaintext: &[u8],
+) -> Result<EncryptedFrame, FrameSealError> {
+    let nonce = sequence.next_nonce().map_err(FrameSealError::Nonce)?;
+    let aad = metadata.aad();
+    let ciphertext =
+        seal_session_payload(key, &nonce, &aad, plaintext).map_err(FrameSealError::Aead)?;
+    Ok(EncryptedFrame { nonce, ciphertext })
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum FrameSealError {
+    #[error("frame nonce allocation failed: {0}")]
+    Nonce(#[from] NonceSequenceError),
+    #[error("frame encryption failed: {0}")]
+    Aead(#[from] AeadError),
+}
+
+pub fn open_encoded_frame(
+    key: &[u8; 32],
+    metadata: EncodedFrameMetadata,
+    encrypted: &EncryptedFrame,
+) -> Result<Vec<u8>, AeadError> {
+    let aad = metadata.aad();
+    open_session_payload(key, &encrypted.nonce, &aad, &encrypted.ciphertext)
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum NonceSequenceError {
     #[error("AEAD nonce sequence exhausted; session must be rekeyed")]
@@ -339,5 +394,28 @@ mod tests {
         assert!(sequence.next_nonce().is_ok());
         assert!(sequence.next_nonce().is_ok());
         assert_eq!(sequence.next_nonce(), Err(NonceSequenceError::Exhausted));
+    }
+
+    #[test]
+    fn encoded_frame_contract_binds_canonical_metadata() {
+        let metadata = EncodedFrameMetadata {
+            protocol_version: 1,
+            channel: 2,
+            frame_id: 3,
+            codec_config_id: 4,
+        };
+        let mut sequence = NonceSequence::new(9);
+        let encrypted =
+            seal_encoded_frame(&[7; 32], &mut sequence, metadata, b"encoded frame").unwrap();
+        assert_eq!(
+            open_encoded_frame(&[7; 32], metadata, &encrypted).unwrap(),
+            b"encoded frame"
+        );
+        let mut changed = metadata;
+        changed.frame_id += 1;
+        assert_eq!(
+            open_encoded_frame(&[7; 32], changed, &encrypted),
+            Err(AeadError::AuthenticationFailed)
+        );
     }
 }
