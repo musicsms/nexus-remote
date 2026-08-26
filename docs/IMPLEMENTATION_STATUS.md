@@ -87,7 +87,7 @@ repo yet.
 | `test/integration/` | Client → relay → agent integration tests | Not started |
 | `test/network-sim/` | Network simulation profiles (Section 47) | Not started |
 | `test/performance/` | Performance regression tests | Not started |
-| `docs/adr/` | Frozen ADRs (Section 51) | **Done** — 24/24 tracked ADRs written; see ADR table below. (Several further open items remain from Section 58 that aren't part of this tracked set — e.g. session-capability encoding, native decoder API choice, UI framework choice — see Section 58.) |
+| `docs/adr/` | Frozen ADRs (Section 51) | **Done** — ADR-001 through ADR-025 are recorded; ADR-025 freezes encoded-frame AEAD granularity and nonce/AAD boundaries. |
 | `docs/protocol/` | Protocol documentation | In progress — 5 design notes added: `session-establishment-signaling.md`, `session-authorization-model.md`, `connectivity-nat-traversal.md`, `windows-agent-privilege-boundary.md`, `video-media-pipeline.md` |
 | `docs/security/` | Threat model, security docs (Section 44) | Not started |
 
@@ -95,7 +95,7 @@ repo yet.
 
 ## 3. ADR status (Spec Section 51, plus ADRs discovered during design review)
 
-All 24 of the tracked ADRs have now been written as documents in
+All 25 of the tracked ADRs have now been written as documents in
 `docs/adr/`. ADR-001 through ADR-013 were the 13 foundational decisions
 Section 51 called for "before heavy implementation" — they were already
 implemented in practice (e.g. the crates in `Cargo.toml` already encoded
@@ -131,6 +131,7 @@ Phase 1 and are documented in `docs/protocol/`.
 | ADR-022 | Capture/encode queue backpressure is drop-stale (bounded depth-1, replace not block), extending Principle 3.2 to the capture stage | **Done** — `docs/adr/ADR-022-capture-encode-backpressure-drop-stale.md` |
 | ADR-023 | Unattended-access consent/notification is a per-role/per-device policy setting (resolves the Section 58 open question) | **Done** — `docs/adr/ADR-023-unattended-consent-policy-per-role.md` |
 | ADR-024 | Desktop-host process crash triggers automatic respawn reusing existing session reconnect semantics, not session termination | **Done** — `docs/adr/ADR-024-desktop-host-crash-respawn.md` |
+| ADR-025 | Encoded-frame payload AEAD granularity, directional nonce domains, and stable AAD metadata | **Done** — `docs/adr/ADR-025-encoded-frame-aead-framing.md` |
 
 ---
 
