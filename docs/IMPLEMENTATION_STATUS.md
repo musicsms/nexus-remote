@@ -25,7 +25,7 @@ Last audited: 2026-08-26.
 
 | Phase | Scope | Exit condition | Status |
 |---|---|---|---|
-| Phase 0 — Foundation | Workspace, CI, protocol crate, QUIC PoC, Windows capture PoC, H.264 encoder PoC | Capture a Windows desktop and stream frames between two local processes | **Done** — workspace/CI done; protocol covers SessionHello, input, monitor, cursor, and capability messages + Section 21 video packet header; nexus-capture provides SyntheticCaptureSource + LatestFrameQueue; nexus-codec provides SoftwareFallbackEncoder; nexus-crypto provides Ed25519/X25519/ChaCha20-Poly1305 AEAD; nexus-transport proves full live loopback pipeline (Capture -> Queue -> Encode -> AEAD Encrypt -> Fragment -> QUIC Datagrams -> Reassemble -> AEAD Decrypt) in phase0_e2e_pipeline test |
+| Phase 0 — Foundation | Workspace, CI, protocol crate, QUIC PoC, Windows capture PoC, H.264 encoder PoC | Capture a Windows desktop and stream frames between two local processes | **Done for OS-independent foundation** — protocol, capture/queue, software codec, crypto, fragmentation/reassembly, and QUIC loopback are verified end-to-end in `phase0_e2e_pipeline`; live Windows Graphics Capture/DXGI and hardware H.264 remain Phase 1 platform work |
 | Phase 1 — MVP v0.1 | Windows host/client, minimal nexusd, enrollment, relay-only QUIC, H.264 1080p60, input, cursor, reconnect, telemetry overlay | User can enroll a host + client and control it over the Internet through a relay | Not started |
 | Phase 2 — v0.2 Connectivity | Candidate discovery, hole punching, P2P QUIC, adaptive bitrate, clipboard text | P2P succeeds on common NATs, falls back to relay | Not started |
 | Phase 3 — v0.3 Productization | File transfer, audio, recording, RBAC, audit UI/API, signed updates | — | Not started |

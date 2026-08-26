@@ -26,6 +26,9 @@ impl NonceReplayCache {
             return false;
         }
         if self.entries.len() >= self.capacity {
+            // Do not evict a still-valid nonce: that would turn bounded replay
+            // protection into an attacker-controlled replay window. Callers
+            // should treat saturation as temporary authentication backpressure.
             return false;
         }
         self.entries.insert(nonce.to_vec(), now);
