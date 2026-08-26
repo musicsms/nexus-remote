@@ -38,6 +38,50 @@ pub enum AeadError {
     AuthenticationFailed,
 }
 
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum NonceSequenceError {
+    #[error("AEAD nonce sequence exhausted; session must be rekeyed")]
+    Exhausted,
+}
+
+/// Monotonic per-channel nonce allocator matching ADR-025's 32+64 layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NonceSequence {
+    domain: u32,
+    next: u64,
+    exhausted: bool,
+}
+
+impl NonceSequence {
+    pub const fn new(domain: u32) -> Self {
+        Self {
+            domain,
+            next: 0,
+            exhausted: false,
+        }
+    }
+
+    pub const fn domain(self) -> u32 {
+        self.domain
+    }
+
+    pub fn next_nonce(&mut self) -> Result<[u8; 12], NonceSequenceError> {
+        if self.exhausted {
+            return Err(NonceSequenceError::Exhausted);
+        }
+        let sequence = self.next;
+        if sequence == u64::MAX {
+            self.exhausted = true;
+        } else {
+            self.next += 1;
+        }
+        let mut nonce = [0u8; 12];
+        nonce[..4].copy_from_slice(&self.domain.to_be_bytes());
+        nonce[4..].copy_from_slice(&sequence.to_be_bytes());
+        Ok(nonce)
+    }
+}
+
 pub fn seal_session_payload(
     key: &[u8; 32],
     nonce: &[u8; 12],
@@ -273,5 +317,27 @@ mod tests {
             open_session_payload(&[2; 32], &nonce, b"aad", &ciphertext),
             Err(AeadError::AuthenticationFailed)
         );
+    }
+
+    #[test]
+    fn nonce_sequence_encodes_domain_and_monotonic_counter() {
+        let mut sequence = NonceSequence::new(0x0102_0304);
+        assert_eq!(
+            sequence.next_nonce().unwrap(),
+            [1, 2, 3, 4, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(sequence.next_nonce().unwrap()[11], 1);
+    }
+
+    #[test]
+    fn nonce_sequence_fails_closed_before_wrap() {
+        let mut sequence = NonceSequence {
+            domain: 7,
+            next: u64::MAX - 1,
+            exhausted: false,
+        };
+        assert!(sequence.next_nonce().is_ok());
+        assert!(sequence.next_nonce().is_ok());
+        assert_eq!(sequence.next_nonce(), Err(NonceSequenceError::Exhausted));
     }
 }
