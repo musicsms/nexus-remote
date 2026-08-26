@@ -166,6 +166,9 @@ pub fn packetize_video_frame(
 pub struct AssembledFrame {
     pub header: VideoPacketHeader,
     pub payload: Vec<u8>,
+    /// Full reassembled payload length. `header.payload_len` remains the
+    /// per-packet wire length and is not widened beyond its u16 protocol field.
+    pub assembled_len: usize,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -269,6 +272,7 @@ impl VideoFrameReassembler {
             self.prune_stale_before(header.frame_id);
             return Ok(Some(AssembledFrame {
                 header: header.clone(),
+                assembled_len: payload.len(),
                 payload: payload.to_vec(),
             }));
         }
@@ -316,7 +320,6 @@ impl VideoFrameReassembler {
                 full_payload.extend_from_slice(&bytes);
             }
             let mut final_header = in_flight.base_header;
-            final_header.payload_len = (full_payload.len().min(u16::MAX as usize)) as u16;
             final_header.flags |= nexus_protocol::video_packet::flags::FRAME_START
                 | nexus_protocol::video_packet::flags::FRAME_END;
 
@@ -325,6 +328,7 @@ impl VideoFrameReassembler {
 
             Ok(Some(AssembledFrame {
                 header: final_header,
+                assembled_len: full_payload.len(),
                 payload: full_payload,
             }))
         } else {
