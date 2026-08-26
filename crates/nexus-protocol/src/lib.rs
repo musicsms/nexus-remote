@@ -40,6 +40,8 @@ pub enum MonitorInfoError {
     InvalidDimensions,
     #[error("monitor scale must be finite and greater than zero")]
     InvalidScale,
+    #[error("monitor scale exceeds supported maximum")]
+    ScaleTooLarge,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -50,6 +52,8 @@ pub enum CursorShapeError {
     InvalidHotspot,
     #[error("cursor payload exceeds {max} bytes")]
     DataTooLarge { max: usize },
+    #[error("BGRA cursor payload length does not match dimensions")]
+    InvalidPayloadLength,
 }
 
 impl CursorShape {
@@ -67,6 +71,14 @@ impl CursorShape {
                 max: Self::MAX_DATA_LEN,
             });
         }
+        if self.pixel_format == 1
+            && self.data.len()
+                != (self.width as usize)
+                    .saturating_mul(self.height as usize)
+                    .saturating_mul(4)
+        {
+            return Err(CursorShapeError::InvalidPayloadLength);
+        }
         Ok(())
     }
 }
@@ -78,6 +90,9 @@ impl MonitorInfo {
         }
         if !self.scale.is_finite() || self.scale <= 0.0 {
             return Err(MonitorInfoError::InvalidScale);
+        }
+        if self.scale > 100.0 {
+            return Err(MonitorInfoError::ScaleTooLarge);
         }
         Ok(())
     }

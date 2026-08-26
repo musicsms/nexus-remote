@@ -19,7 +19,11 @@ pub struct EncoderConfig {
 impl EncoderConfig {
     pub fn validate(self) -> Result<Self, CodecError> {
         if self.width == 0 || self.height == 0 || self.max_fps == 0 || self.bitrate_bps == 0 {
-            return Err(CodecError::InvalidDimensions);
+            return Err(if self.width == 0 || self.height == 0 {
+                CodecError::InvalidDimensions
+            } else {
+                CodecError::InvalidRateOrBitrate
+            });
         }
         Ok(self)
     }
@@ -37,6 +41,8 @@ pub struct EncodedFrame {
 pub enum CodecError {
     #[error("encoder configuration dimensions must be non-zero")]
     InvalidDimensions,
+    #[error("encoder frame rate and bitrate must be non-zero")]
+    InvalidRateOrBitrate,
     #[error("encoder frame dimensions do not match configured dimensions")]
     FrameDimensionsMismatch,
 }
@@ -74,6 +80,6 @@ mod tests {
             max_fps: 0,
             bitrate_bps: 1,
         };
-        assert_eq!(config.validate(), Err(CodecError::InvalidDimensions));
+        assert_eq!(config.validate(), Err(CodecError::InvalidRateOrBitrate));
     }
 }

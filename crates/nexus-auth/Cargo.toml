@@ -7,6 +7,10 @@ license.workspace = true
 
 [dependencies]
 nexus-common = { path = "../nexus-common" }
+nexus-crypto = { path = "../nexus-crypto" }
+nexus-protocol = { path = "../nexus-protocol" }
 thiserror.workspace = true
 serde.workspace = true
 tracing.workspace = true
+prost.workspace = true
+ed25519-dalek.workspace = true
