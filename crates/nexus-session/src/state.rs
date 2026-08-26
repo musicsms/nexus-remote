@@ -149,6 +149,16 @@ impl Session {
     pub fn reconnect_allowed(&self, now: Instant) -> bool {
         self.machine.reconnect_allowed(now)
     }
+    pub fn mark_established_at(
+        &mut self,
+        now: Instant,
+        policy: SessionDurationPolicy,
+    ) -> Result<(), InvalidTransition> {
+        self.machine.mark_established_at(now, policy)
+    }
+    pub fn duration_expired(&self, now: Instant) -> bool {
+        self.machine.duration_expired(now)
+    }
 }
 
 impl SessionStateMachine {
@@ -188,8 +198,10 @@ impl SessionStateMachine {
         policy: SessionDurationPolicy,
     ) -> Result<(), InvalidTransition> {
         self.transition(SessionState::Established)?;
-        self.established_at = Some(now);
-        self.max_duration = Some(policy.max_duration);
+        if self.established_at.is_none() {
+            self.established_at = Some(now);
+            self.max_duration = Some(policy.max_duration);
+        }
         Ok(())
     }
 
@@ -299,6 +311,28 @@ mod tests {
             SessionDurationPolicy::new(Duration::ZERO),
             Err(SessionPolicyError::ZeroSessionDuration)
         );
+    }
+
+    #[test]
+    fn reconnect_does_not_reset_established_duration() {
+        let start = Instant::now();
+        let policy = SessionDurationPolicy::new(Duration::from_secs(30)).unwrap();
+        let mut machine = SessionStateMachine::new();
+        machine.transition(SessionState::Authorized).unwrap();
+        machine.transition(SessionState::Connecting).unwrap();
+        machine.mark_established_at(start, policy).unwrap();
+        machine.transition(SessionState::Active).unwrap();
+        machine
+            .mark_disconnected(
+                ReconnectPolicy::new(Duration::from_secs(5)).unwrap(),
+                start + Duration::from_secs(10),
+            )
+            .unwrap();
+        machine.transition(SessionState::Connecting).unwrap();
+        machine
+            .mark_established_at(start + Duration::from_secs(20), policy)
+            .unwrap();
+        assert!(machine.duration_expired(start + Duration::from_secs(30)));
     }
 
     #[test]
