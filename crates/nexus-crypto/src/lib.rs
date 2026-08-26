@@ -1,7 +1,10 @@
 //! Small, OS-independent cryptographic primitives used by capabilities.
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use hkdf::Hkdf;
+use sha2::Sha256;
 use thiserror::Error;
+use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum SignatureError {
@@ -13,6 +16,32 @@ pub enum SignatureError {
     InvalidSignature,
     #[error("signature verification failed")]
     VerificationFailed,
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum KeyDerivationError {
+    #[error("x25519 produced an invalid all-zero shared secret")]
+    InvalidSharedSecret,
+    #[error("HKDF expansion failed")]
+    ExpansionFailed,
+}
+
+/// Derive a domain-separated 32-byte session root key from X25519 material.
+pub fn derive_session_key(
+    local_secret: &[u8; 32],
+    peer_public: &[u8; 32],
+    transcript_context: &[u8],
+) -> Result<[u8; 32], KeyDerivationError> {
+    let shared =
+        StaticSecret::from(*local_secret).diffie_hellman(&X25519PublicKey::from(*peer_public));
+    if shared.as_bytes().iter().all(|byte| *byte == 0) {
+        return Err(KeyDerivationError::InvalidSharedSecret);
+    }
+    let hkdf = Hkdf::<Sha256>::new(Some(b"nexus/session-key/v1"), shared.as_bytes());
+    let mut output = [0u8; 32];
+    hkdf.expand(transcript_context, &mut output)
+        .map_err(|_| KeyDerivationError::ExpansionFailed)?;
+    Ok(output)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,6 +167,34 @@ mod tests {
         assert_eq!(
             second.verify(b"payload", &signature),
             Err(SignatureError::VerificationFailed)
+        );
+    }
+
+    #[test]
+    fn session_key_derivation_is_symmetric_and_context_bound() {
+        let alice_secret = StaticSecret::from([3u8; 32]);
+        let bob_secret = StaticSecret::from([4u8; 32]);
+        let alice_public = X25519PublicKey::from(&alice_secret);
+        let bob_public = X25519PublicKey::from(&bob_secret);
+        let first =
+            derive_session_key(alice_secret.as_bytes(), bob_public.as_bytes(), b"session-1")
+                .unwrap();
+        let second =
+            derive_session_key(bob_secret.as_bytes(), alice_public.as_bytes(), b"session-1")
+                .unwrap();
+        assert_eq!(first, second);
+        assert_ne!(
+            first,
+            derive_session_key(alice_secret.as_bytes(), bob_public.as_bytes(), b"session-2")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn session_key_derivation_rejects_low_order_peer_key() {
+        assert_eq!(
+            derive_session_key(&[9; 32], &[0; 32], b"ctx"),
+            Err(KeyDerivationError::InvalidSharedSecret)
         );
     }
 }
