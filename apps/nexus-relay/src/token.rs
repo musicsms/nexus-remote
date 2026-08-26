@@ -48,6 +48,10 @@ pub enum RelayTokenError {
     SignatureLength,
     #[error("relay token has an empty relay id")]
     InvalidRelayId,
+    #[error("relay token is missing required field: {0}")]
+    MissingField(&'static str),
+    #[error("relay token field is too long: {0}")]
+    FieldTooLong(&'static str),
 }
 
 impl RelayToken {
@@ -55,9 +59,23 @@ impl RelayToken {
         RelayTokenBuilder::default()
     }
     pub fn signing_bytes(&self) -> Vec<u8> {
-        let mut clone = self.clone();
-        clone.signature.clear();
-        serde_json::to_vec(&clone).expect("relay token fields are serializable")
+        // Explicit, versioned wire encoding prevents signatures depending on
+        // serializer implementation details or field ordering.
+        let mut out = b"nexus-relay-token/v1\0".to_vec();
+        fn put(out: &mut Vec<u8>, s: &str) {
+            out.extend_from_slice(&(s.len() as u16).to_be_bytes());
+            out.extend_from_slice(s.as_bytes());
+        }
+        put(&mut out, self.session_id.as_str());
+        put(&mut out, &self.relay_id);
+        put(&mut out, self.client_device_id.as_str());
+        put(&mut out, self.target_device_id.as_str());
+        out.push(match self.role {
+            EndpointRole::Client => 0,
+            EndpointRole::Host => 1,
+        });
+        out.extend_from_slice(&self.expires_at.as_secs().to_be_bytes());
+        out
     }
     pub fn sign(&mut self, key: &SigningKey) {
         self.signature = key.sign(&self.signing_bytes()).to_bytes().to_vec();
@@ -100,16 +118,31 @@ impl RelayTokenBuilder {
     }
     pub fn build(self) -> Result<RelayToken, RelayTokenError> {
         Ok(RelayToken {
-            session_id: self.session_id.ok_or(RelayTokenError::InvalidRelayId)?,
-            relay_id: self.relay_id.ok_or(RelayTokenError::InvalidRelayId)?,
+            session_id: self
+                .session_id
+                .ok_or(RelayTokenError::MissingField("session_id"))?,
+            relay_id: {
+                let id = self
+                    .relay_id
+                    .ok_or(RelayTokenError::MissingField("relay_id"))?;
+                if id.is_empty() {
+                    return Err(RelayTokenError::InvalidRelayId);
+                }
+                if id.len() > u16::MAX as usize {
+                    return Err(RelayTokenError::FieldTooLong("relay_id"));
+                }
+                id
+            },
             client_device_id: self
                 .client_device_id
-                .ok_or(RelayTokenError::InvalidRelayId)?,
+                .ok_or(RelayTokenError::MissingField("client_device_id"))?,
             target_device_id: self
                 .target_device_id
-                .ok_or(RelayTokenError::InvalidRelayId)?,
-            role: self.role.ok_or(RelayTokenError::InvalidRelayId)?,
-            expires_at: self.expires_at.ok_or(RelayTokenError::InvalidRelayId)?,
+                .ok_or(RelayTokenError::MissingField("target_device_id"))?,
+            role: self.role.ok_or(RelayTokenError::MissingField("role"))?,
+            expires_at: self
+                .expires_at
+                .ok_or(RelayTokenError::MissingField("expires_at"))?,
             signature: Vec::new(),
         })
     }
