@@ -3,8 +3,8 @@
 mod state;
 
 pub use state::{
-    InvalidTransition, ReconnectPolicy, Session, SessionId, SessionIdError, SessionPolicyError,
-    SessionState, SessionStateMachine, DEFAULT_RECONNECT_WINDOW,
+    InvalidTransition, ReconnectPolicy, Session, SessionDurationPolicy, SessionId, SessionIdError,
+    SessionPolicyError, SessionState, SessionStateMachine, DEFAULT_RECONNECT_WINDOW,
 };
 
 pub fn init() {
