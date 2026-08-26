@@ -4,6 +4,7 @@
 pub mod action;
 pub mod engine;
 pub mod model;
+pub mod narrowing;
 
 pub use action::{Action, ActionParseError, ActionSet};
 pub use engine::{
@@ -13,6 +14,7 @@ pub use engine::{
 pub use model::{
     DeviceLabelSelector, PolicyConditions, Role, SessionRestrictions, DEFAULT_MAX_DURATION_SECONDS,
 };
+pub use narrowing::{validate_policy_narrowing, NarrowingError};
 
 pub fn init() {
     // Initializer stub for nexus-policy
