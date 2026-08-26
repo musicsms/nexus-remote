@@ -1,5 +1,9 @@
 //! Small, OS-independent cryptographic primitives used by capabilities.
 
+use chacha20poly1305::{
+    aead::{Aead, KeyInit, Payload},
+    ChaCha20Poly1305, Key, Nonce,
+};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use hkdf::Hkdf;
 use sha2::Sha256;
@@ -24,6 +28,48 @@ pub enum KeyDerivationError {
     InvalidSharedSecret,
     #[error("HKDF expansion failed")]
     ExpansionFailed,
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum AeadError {
+    #[error("AEAD encryption failed")]
+    EncryptionFailed,
+    #[error("AEAD authentication failed")]
+    AuthenticationFailed,
+}
+
+pub fn seal_session_payload(
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    associated_data: &[u8],
+    plaintext: &[u8],
+) -> Result<Vec<u8>, AeadError> {
+    ChaCha20Poly1305::new(Key::from_slice(key))
+        .encrypt(
+            Nonce::from_slice(nonce),
+            Payload {
+                msg: plaintext,
+                aad: associated_data,
+            },
+        )
+        .map_err(|_| AeadError::EncryptionFailed)
+}
+
+pub fn open_session_payload(
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    associated_data: &[u8],
+    ciphertext: &[u8],
+) -> Result<Vec<u8>, AeadError> {
+    ChaCha20Poly1305::new(Key::from_slice(key))
+        .decrypt(
+            Nonce::from_slice(nonce),
+            Payload {
+                msg: ciphertext,
+                aad: associated_data,
+            },
+        )
+        .map_err(|_| AeadError::AuthenticationFailed)
 }
 
 /// Derive a domain-separated 32-byte session root key from X25519 material.
@@ -195,6 +241,37 @@ mod tests {
         assert_eq!(
             derive_session_key(&[9; 32], &[0; 32], b"ctx"),
             Err(KeyDerivationError::InvalidSharedSecret)
+        );
+    }
+
+    #[test]
+    fn aead_round_trip_authenticates_associated_data() {
+        let key = [5u8; 32];
+        let nonce = [6u8; 12];
+        let ciphertext = seal_session_payload(&key, &nonce, b"header", b"frame").unwrap();
+        assert_eq!(
+            open_session_payload(&key, &nonce, b"header", &ciphertext).unwrap(),
+            b"frame"
+        );
+        assert_eq!(
+            open_session_payload(&key, &nonce, b"tampered", &ciphertext),
+            Err(AeadError::AuthenticationFailed)
+        );
+    }
+
+    #[test]
+    fn aead_rejects_ciphertext_mutation_and_wrong_key() {
+        let nonce = [8u8; 12];
+        let mut ciphertext = seal_session_payload(&[1; 32], &nonce, b"aad", b"secret").unwrap();
+        ciphertext[0] ^= 1;
+        assert_eq!(
+            open_session_payload(&[1; 32], &nonce, b"aad", &ciphertext),
+            Err(AeadError::AuthenticationFailed)
+        );
+        let ciphertext = seal_session_payload(&[1; 32], &nonce, b"aad", b"secret").unwrap();
+        assert_eq!(
+            open_session_payload(&[2; 32], &nonce, b"aad", &ciphertext),
+            Err(AeadError::AuthenticationFailed)
         );
     }
 }
