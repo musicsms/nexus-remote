@@ -17,7 +17,7 @@ Status legend: **Not started** (path/doc does not exist yet) · **Scaffolded**
 progress** (real implementation underway, not feature-complete) · **Done**
 (meets the relevant Definition of Done / exit condition in the spec).
 
-Last audited: 2026-08-25.
+Last audited: 2026-08-26.
 
 ---
 
@@ -47,7 +47,7 @@ repo yet.
 | `nexus-crypto` | Device keys, capability verification, session key derivation | **In progress** — Ed25519 primitives plus signed-payload envelope for capability verification; key lifecycle remains next (replay protection is in `nexus-auth`) |
 | `nexus-protocol` | Versioned wire/control schema | **In progress** — Protobuf codegen for session and MVP input messages via `proto/nexus.proto`; hand-rolled `VideoPacketHeader` encode/decode (Section 21) with malformed-input tests |
 | `nexus-transport` | QUIC connections, streams, datagrams, metrics | In progress — self-signed-cert QUIC loopback endpoint helpers (`make_server_endpoint`/`make_client_endpoint`); Sprint 1 demo proves reliable-stream input + unreliable-datagram video both work end to end. No metrics, no relay integration yet |
-| `nexus-session` | Session state machine, reconnect semantics | **In progress** — explicit lifecycle transitions plus stable reconnect-window policy and deadline validation |
+| `nexus-session` | Session state machine, reconnect semantics | **In progress** — explicit lifecycle transitions, stable reconnect-window policy, and deterministic established-session max-duration expiry checks |
 | `nexus-auth` | User/device authentication logic | **In progress** — bounded TTL nonce replay cache for signed capability verification; user/device enrollment remains next |
 | `nexus-policy` | RBAC/ABAC evaluation | Scaffolded — stub only |
 | `nexus-audit` | Audit event model and sinks | Scaffolded — stub only |
