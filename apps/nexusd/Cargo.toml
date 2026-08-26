@@ -5,10 +5,34 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "nexusd"
+path = "src/main.rs"
+
 [dependencies]
 nexus-common.workspace = true
 nexus-protocol.workspace = true
+nexus-auth = { path = "../../crates/nexus-auth" }
+nexus-policy = { path = "../../crates/nexus-policy" }
+nexus-audit = { path = "../../crates/nexus-audit" }
+nexus-session = { path = "../../crates/nexus-session" }
+nexus-relay = { path = "../nexus-relay" }
 tokio.workspace = true
+axum.workspace = true
+tower.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ed25519-dalek.workspace = true
+thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
+prost.workspace = true
+
+[dev-dependencies]
+reqwest.workspace = true
+
+
