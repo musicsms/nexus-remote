@@ -44,7 +44,7 @@ repo yet.
 | Crate | Target responsibility (Appendix A) | Status |
 |---|---|---|
 | `nexus-common` | IDs, shared errors, time, configuration primitives | Scaffolded — `Cargo.toml` + stub `lib.rs` (`pub fn init() {}`) only |
-| `nexus-crypto` | Device keys, capability verification, session key derivation | **In progress** — Ed25519 device keypair abstraction plus signed-payload envelope for capability verification; OS-backed persistence/rotation and session key derivation remain next |
+| `nexus-crypto` | Device keys, capability verification, session key derivation | **In progress** — Ed25519 device keypair abstraction, signed-payload envelope, and X25519/HKDF-SHA256 session root derivation; OS-backed persistence/rotation and AEAD/channel framing remain next |
 | `nexus-protocol` | Versioned wire/control schema | **In progress** — Protobuf codegen for session and MVP input messages via `proto/nexus.proto`; hand-rolled `VideoPacketHeader` encode/decode (Section 21) with malformed-input tests |
 | `nexus-transport` | QUIC connections, streams, datagrams, metrics | In progress — self-signed-cert QUIC loopback endpoint helpers (`make_server_endpoint`/`make_client_endpoint`); Sprint 1 demo proves reliable-stream input + unreliable-datagram video both work end to end. No metrics, no relay integration yet |
 | `nexus-session` | Session state machine, reconnect semantics | **In progress** — explicit lifecycle transitions, stable reconnect-window policy, and deterministic established-session max-duration expiry checks |
