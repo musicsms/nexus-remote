@@ -251,6 +251,15 @@ impl VideoFrameReassembler {
             return Err(ReassemblyError::InvalidBoundaryFlags);
         }
 
+        // Drop if this frame has already been delivered or is older than the last delivered frame (ADR-022).
+        // This check must precede the single-packet fast path so delayed packets
+        // cannot regress the delivery watermark.
+        if let Some(last_id) = self.last_delivered_frame_id {
+            if header.frame_id <= last_id {
+                return Ok(None);
+            }
+        }
+
         // Single-packet fast path
         if header.packet_count == 1 {
             if payload.len() > self.max_frame_bytes {
@@ -262,13 +271,6 @@ impl VideoFrameReassembler {
                 header: header.clone(),
                 payload: payload.to_vec(),
             }));
-        }
-
-        // Drop if this frame has already been delivered or is older than the last delivered frame (ADR-022)
-        if let Some(last_id) = self.last_delivered_frame_id {
-            if header.frame_id <= last_id {
-                return Ok(None);
-            }
         }
 
         // Manage in-flight capacity: if full, evict oldest in-flight frame
@@ -431,6 +433,34 @@ mod tests {
             reassembler.process_packet(&header, &[1, 2, 3, 4]).unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn drops_delayed_single_packet_without_regressing_watermark() {
+        let make_header = |frame_id| VideoPacketHeader {
+            version: CURRENT_VERSION,
+            flags: nexus_protocol::video_packet::flags::FRAME_START
+                | nexus_protocol::video_packet::flags::FRAME_END,
+            stream_id: 1,
+            frame_id,
+            packet_id: 0,
+            packet_count: 1,
+            timestamp_us: 0,
+            payload_len: 1,
+        };
+        let mut reassembler = VideoFrameReassembler::new(2, 8);
+        assert!(reassembler
+            .process_packet(&make_header(10), &[1])
+            .unwrap()
+            .is_some());
+        assert!(reassembler
+            .process_packet(&make_header(9), &[2])
+            .unwrap()
+            .is_none());
+        assert!(reassembler
+            .process_packet(&make_header(11), &[3])
+            .unwrap()
+            .is_some());
     }
 
     #[test]
