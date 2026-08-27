@@ -1,5 +1,6 @@
+use nexus_audit::{verify_chain, AuditChain, AuditEvent, AuditEventType};
 use nexus_auth::{DeviceCredential, DeviceType, EnrollmentToken};
-use nexus_common::id::{DeviceId, TenantId};
+use nexus_common::id::{DeviceId, SessionId, TenantId, UserId};
 use nexus_common::time::UnixTimestamp;
 use nexusd::state::RegisteredDevice;
 use nexusd::storage::EnrollmentError;
@@ -177,4 +178,59 @@ async fn postgres_is_explicitly_unsupported() {
         SqliteStorage::connect(&config).await,
         Err(StorageError::UnsupportedDriver("postgres"))
     ));
+}
+
+#[tokio::test]
+async fn session_and_audit_round_trip() {
+    let storage = storage().await;
+    let org = TenantId::new("org-session").unwrap();
+    sqlx::query("INSERT INTO organizations (id, created_at) VALUES (?, ?)")
+        .bind(org.as_str())
+        .bind(1i64)
+        .execute(storage.pool())
+        .await
+        .unwrap();
+    for device_id in ["client-1", "target-1"] {
+        sqlx::query("INSERT INTO devices (id, organization_id, hostname, os, os_version, architecture, agent_version, public_key, status, capabilities_json, created_at) VALUES (?, ?, '', '', '', '', '', X'', 'active', '[]', 1)")
+            .bind(device_id).bind(org.as_str()).execute(storage.pool()).await.unwrap();
+    }
+    let record = nexusd::storage::AuthorizedSessionRecord {
+        session_id: SessionId::new("sess-1").unwrap(),
+        organization_id: org.clone(),
+        user_id: UserId::new("user-1").unwrap(),
+        client_device_id: DeviceId::new("client-1").unwrap(),
+        target_device_id: DeviceId::new("target-1").unwrap(),
+        relay_id: "relay-1".into(),
+        permissions: vec!["desktop.view".into(), "desktop.control".into()],
+        created_at: UnixTimestamp::from_secs(42),
+        status: "authorized".into(),
+    };
+    storage.insert_authorized_session(&record).await.unwrap();
+    assert_eq!(
+        storage.get_session(&record.session_id).await.unwrap(),
+        Some(record)
+    );
+
+    let mut chain = AuditChain::new(None);
+    let first = chain
+        .append(AuditEvent::new(
+            "evt-1",
+            UnixTimestamp::from_secs(43),
+            org.clone(),
+            AuditEventType::SessionAuthorize,
+        ))
+        .unwrap();
+    let second = chain
+        .append(AuditEvent::new(
+            "evt-2",
+            UnixTimestamp::from_secs(44),
+            org.clone(),
+            AuditEventType::SessionStart,
+        ))
+        .unwrap();
+    storage.insert_audit_event(&first).await.unwrap();
+    storage.insert_audit_event(&second).await.unwrap();
+    let loaded = storage.list_audit_events(&org).await.unwrap();
+    assert_eq!(loaded, vec![first, second]);
+    assert!(verify_chain(&loaded, None).is_ok());
 }

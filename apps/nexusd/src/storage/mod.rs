@@ -2,8 +2,11 @@ use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 
 use crate::config::{DatabaseConfig, DatabaseDriver};
 
+mod audit;
 mod device;
 mod enrollment;
+mod session;
+pub use session::AuthorizedSessionRecord;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
