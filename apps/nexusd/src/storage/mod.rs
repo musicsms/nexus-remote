@@ -2,6 +2,9 @@ use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 
 use crate::config::{DatabaseConfig, DatabaseDriver};
 
+mod device;
+mod enrollment;
+
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
     #[error("unsupported database driver: {0}")]
@@ -22,6 +25,8 @@ pub enum StorageError {
 pub struct SqliteStorage {
     pool: SqlitePool,
 }
+
+pub use enrollment::EnrollmentError;
 
 impl SqliteStorage {
     pub async fn connect(config: &DatabaseConfig) -> Result<Self, StorageError> {
