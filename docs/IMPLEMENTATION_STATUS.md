@@ -67,7 +67,7 @@ repo yet.
 
 | App | Target responsibility | Status |
 |---|---|---|
-| `nexusd` | Control plane: auth, devices, policy, sessions, signaling, audit | **In progress** — Axum HTTP router with `/healthz`, `/api/v1/devices/enroll` (proof-of-possession verification & signed DeviceCredential), `/api/v1/devices` listing, and `/api/v1/sessions/request` (PolicyEngine evaluation, signed SessionCapability, client/host RelayTokens, and BLAKE3 audit logging); SQL persistence remains next |
+| `nexusd` | Control plane: auth, devices, policy, sessions, signaling, audit | **In progress** — Axum API with transactional SQLite persistence for enrollment tokens, devices, sessions, and chained audit events; PostgreSQL and broader domain tables remain next |
 | `nexus-relay` | Stateless encrypted packet relay | **In progress** — Ed25519-signed stateless RelayToken verification (ADR-006), RelaySessionTable with Client/Host endpoint pairing, RelayMetrics accounting, QUIC forwarder bridging bidirectional reliable streams and datagrams with live E2E integration test |
 | `nexus-agent` | Host service: identity, presence, session lifecycle, privilege boundary | **In progress** — AgentIdentity local private key persistence, EnrollmentClient auto-registration with proof-of-possession against nexusd, and AgentSessionManager capability verification (TTL, protocol range, replay defense) & host session tracking; OS service runner remains next |
 | `nexus-desktop-host` | User-session process: capture, encode, input, clipboard, audio | **In progress** — DesktopHostWorker coordinating HostVideoStreamer (depth-1 queue capture, software H.264 encode, ADR-025 ChaCha20-Poly1305 AEAD seal & VideoPacketHeader datagram packetization) and HostInputHandler (Protobuf input event demuxing & dispatch); Windows native GDI/DirectX backends remain next |
@@ -82,7 +82,7 @@ repo yet.
 | `platform/macos/` | macOS-specific bindings (Phase 5) | Not started |
 | `platform/linux/` | Linux-specific bindings (Phase 5) | Not started |
 | `proto/` | Protobuf schemas (Section 33) | Scaffolded — `proto/nexus.proto` defines the Phase 0 session, input, monitor, cursor, and capability messages (package `nexus.protocol.v1`), compiled into `nexus-protocol` by `build.rs` via `prost-build` |
-| `migrations/` | SQL migrations (SQLite-first, Section 34) | Not started |
+| `migrations/` | SQL migrations (SQLite-first, Section 34) | **In progress** — portable foundation migration for organizations, enrollment tokens, devices, credentials, sessions, and audit events |
 | `deployment/` | Deployment manifests (Section 53) | Not started |
 | `test/integration/` | Client → relay → agent integration tests | Not started |
 | `test/network-sim/` | Network simulation profiles (Section 47) | Not started |

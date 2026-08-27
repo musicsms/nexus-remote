@@ -23,13 +23,12 @@ Audit observes
 
 ## Status
 
-**Pre-Phase-0.** The Cargo workspace and all crate/app skeletons exist;
-almost nothing is implemented yet. See
+**Phase 0 foundation complete; Phase 1 persistence work in progress.** See
 [`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md) for the
 current build status against the target architecture — check it before
 assuming any crate has real logic.
 
-All 24 tracked Architecture Decision Records are frozen
+All 25 tracked Architecture Decision Records are frozen
 (see [`docs/adr/`](docs/adr/)); the target design itself is settled even
 though implementation hasn't started.
 
@@ -134,7 +133,7 @@ cargo fmt --all -- --check
 | 4 — v0.5 Enterprise | OIDC, SAML, WebAuthn, access requests, ABAC | — |
 | 5 — v1.0 | macOS/Linux hosts, HEVC/AV1, enterprise SSO, JIT, device trust | — |
 
-Currently pre-Phase-0 — see `docs/IMPLEMENTATION_STATUS.md` for exact
+The OS-independent Phase 0 foundation is complete — see `docs/IMPLEMENTATION_STATUS.md` for exact
 per-crate/per-app status.
 
 ## Contributing
