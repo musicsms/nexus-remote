@@ -234,3 +234,108 @@ async fn session_and_audit_round_trip() {
     assert_eq!(loaded, vec![first, second]);
     assert!(verify_chain(&loaded, None).is_ok());
 }
+
+#[tokio::test]
+async fn failed_session_insert_rolls_back_organization() {
+    let storage = storage().await;
+    let org = TenantId::new("org-session-rollback").unwrap();
+    let record = nexusd::storage::AuthorizedSessionRecord {
+        session_id: SessionId::new("sess-missing-target").unwrap(),
+        organization_id: org.clone(),
+        user_id: UserId::new("user-1").unwrap(),
+        client_device_id: DeviceId::new("missing-client").unwrap(),
+        target_device_id: DeviceId::new("missing-target").unwrap(),
+        relay_id: "relay-1".into(),
+        permissions: vec!["desktop.view".into()],
+        created_at: UnixTimestamp::from_secs(1),
+        status: "authorized".into(),
+    };
+    assert!(storage.insert_authorized_session(&record).await.is_err());
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM organizations WHERE id = ?")
+        .bind(org.as_str())
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[tokio::test]
+async fn failed_audit_insert_rolls_back_organization() {
+    let storage = storage().await;
+    let org = TenantId::new("org-audit-rollback").unwrap();
+    let mut chain = AuditChain::new(None);
+    let event = chain
+        .append(
+            AuditEvent::new(
+                "evt-missing-device",
+                UnixTimestamp::from_secs(1),
+                org.clone(),
+                AuditEventType::DeviceEnroll,
+            )
+            .with_device_id(DeviceId::new("missing-device").unwrap()),
+        )
+        .unwrap();
+    assert!(storage.insert_audit_event(&event).await.is_err());
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM organizations WHERE id = ?")
+        .bind(org.as_str())
+        .fetch_one(storage.pool())
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[tokio::test]
+async fn corrupt_session_permissions_and_audit_columns_are_rejected() {
+    let storage = storage().await;
+    let org = TenantId::new("org-corrupt").unwrap();
+    sqlx::query("INSERT INTO organizations (id, created_at) VALUES (?, 1)")
+        .bind(org.as_str())
+        .execute(storage.pool())
+        .await
+        .unwrap();
+    for device_id in ["corrupt-client", "corrupt-target"] {
+        sqlx::query("INSERT INTO devices (id, organization_id, hostname, os, os_version, architecture, agent_version, public_key, status, capabilities_json, created_at) VALUES (?, ?, '', '', '', '', '', X'', 'active', '[]', 1)")
+            .bind(device_id).bind(org.as_str()).execute(storage.pool()).await.unwrap();
+    }
+    let record = nexusd::storage::AuthorizedSessionRecord {
+        session_id: SessionId::new("sess-corrupt").unwrap(),
+        organization_id: org.clone(),
+        user_id: UserId::new("user-1").unwrap(),
+        client_device_id: DeviceId::new("corrupt-client").unwrap(),
+        target_device_id: DeviceId::new("corrupt-target").unwrap(),
+        relay_id: "relay-1".into(),
+        permissions: vec!["desktop.view".into()],
+        created_at: UnixTimestamp::from_secs(1),
+        status: "authorized".into(),
+    };
+    storage.insert_authorized_session(&record).await.unwrap();
+    sqlx::query("UPDATE sessions SET policy_snapshot_json = '{\"not\":\"an array\"}' WHERE id = ?")
+        .bind(record.session_id.as_str())
+        .execute(storage.pool())
+        .await
+        .unwrap();
+    assert!(matches!(
+        storage.get_session(&record.session_id).await,
+        Err(StorageError::CorruptRow(_))
+    ));
+
+    let mut chain = AuditChain::new(None);
+    let event = chain
+        .append(AuditEvent::new(
+            "evt-corrupt",
+            UnixTimestamp::from_secs(2),
+            org.clone(),
+            AuditEventType::UserLogin,
+        ))
+        .unwrap();
+    storage.insert_audit_event(&event).await.unwrap();
+    sqlx::query("UPDATE audit_events SET event_type = 'policy.update' WHERE event_id = ?")
+        .bind(&event.event.event_id)
+        .execute(storage.pool())
+        .await
+        .unwrap();
+    assert!(matches!(
+        storage.list_audit_events(&org).await,
+        Err(StorageError::CorruptRow(_))
+    ));
+}

@@ -28,6 +28,7 @@ impl SqliteStorage {
             ));
         }
         let policy = serde_json::to_string(&record.permissions)?;
+        let mut transaction = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO organizations (id, created_at) VALUES (?, ?) ON CONFLICT(id) DO NOTHING",
         )
@@ -36,13 +37,14 @@ impl SqliteStorage {
             i64::try_from(record.created_at.as_secs())
                 .map_err(|_| StorageError::CorruptRow("created_at".into()))?,
         )
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
         sqlx::query("INSERT INTO sessions (id, organization_id, user_id, client_device_id, target_device_id, status, connection_mode, relay_id, created_at, started_at, ended_at, policy_snapshot_json, termination_reason) VALUES (?, ?, ?, ?, ?, 'authorized', 'relay', ?, ?, NULL, NULL, ?, NULL)")
             .bind(record.session_id.as_str()).bind(record.organization_id.as_str()).bind(record.user_id.as_str())
             .bind(record.client_device_id.as_str()).bind(record.target_device_id.as_str()).bind(&record.relay_id)
             .bind(i64::try_from(record.created_at.as_secs()).map_err(|_| StorageError::CorruptRow("created_at".into()))?)
-            .bind(policy).execute(&self.pool).await?;
+            .bind(policy).execute(&mut *transaction).await?;
+        transaction.commit().await?;
         Ok(())
     }
 

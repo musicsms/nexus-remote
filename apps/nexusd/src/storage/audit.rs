@@ -11,6 +11,7 @@ impl SqliteStorage {
     ) -> Result<(), StorageError> {
         let event = &chained.event;
         let json = event.canonical_json()?;
+        let mut transaction = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO organizations (id, created_at) VALUES (?, ?) ON CONFLICT(id) DO NOTHING",
         )
@@ -19,10 +20,11 @@ impl SqliteStorage {
             i64::try_from(event.timestamp.as_secs())
                 .map_err(|_| StorageError::CorruptRow("timestamp".into()))?,
         )
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
         sqlx::query("INSERT INTO audit_events (event_id, organization_id, user_id, device_id, session_id, event_type, sequence, event_json, previous_hash, hash, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-            .bind(&event.event_id).bind(event.organization_id.as_str()).bind(event.user_id.as_ref().map(UserId::as_str)).bind(event.device_id.as_ref().map(DeviceId::as_str)).bind(event.session_id.as_ref().map(SessionId::as_str)).bind(event.event_type.as_str()).bind(i64::try_from(chained.sequence).map_err(|_| StorageError::CorruptRow("sequence".into()))?).bind(json).bind(chained.previous_hash.as_bytes()).bind(chained.hash.as_bytes()).bind(i64::try_from(event.timestamp.as_secs()).map_err(|_| StorageError::CorruptRow("timestamp".into()))?).execute(&self.pool).await?;
+            .bind(&event.event_id).bind(event.organization_id.as_str()).bind(event.user_id.as_ref().map(UserId::as_str)).bind(event.device_id.as_ref().map(DeviceId::as_str)).bind(event.session_id.as_ref().map(SessionId::as_str)).bind(event.event_type.as_str()).bind(i64::try_from(chained.sequence).map_err(|_| StorageError::CorruptRow("sequence".into()))?).bind(json).bind(chained.previous_hash.as_bytes()).bind(chained.hash.as_bytes()).bind(i64::try_from(event.timestamp.as_secs()).map_err(|_| StorageError::CorruptRow("timestamp".into()))?).execute(&mut *transaction).await?;
+        transaction.commit().await?;
         Ok(())
     }
 
