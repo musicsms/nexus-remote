@@ -164,13 +164,18 @@ impl AppState {
         &self,
         event: nexus_audit::event::AuditEvent,
     ) -> Result<(), StateError> {
-        let chained = {
+        let (previous_chain, chained) = {
             let mut chain = self.audit_chain.lock().unwrap();
-            chain
+            let previous = chain.clone();
+            let chained = chain
                 .append(event)
-                .map_err(|e| StateError::AuditChain(e.to_string()))?
+                .map_err(|e| StateError::AuditChain(e.to_string()))?;
+            (previous, chained)
         };
-        self.storage.insert_audit_event(&chained).await?;
+        if let Err(error) = self.storage.insert_audit_event(&chained).await {
+            *self.audit_chain.lock().unwrap() = previous_chain;
+            return Err(error.into());
+        }
         self.audit_sink
             .record(&chained)
             .await
