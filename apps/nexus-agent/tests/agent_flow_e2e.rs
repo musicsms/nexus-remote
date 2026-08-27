@@ -11,6 +11,7 @@ use nexus_common::time::UnixTimestamp;
 use nexusd::routes::{SessionAuthorizationResponse, SessionRequestPayload};
 use nexusd::server::ControlPlaneServer;
 use nexusd::state::AppState;
+use nexusd::{DatabaseConfig, SqliteStorage};
 use prost::Message;
 use tempfile::tempdir;
 
@@ -20,8 +21,16 @@ async fn test_agent_auto_enroll_and_session_acceptance_flow() {
     let cp_signing_key = SigningKey::from_bytes(&[89u8; 32]);
     let cp_verifying_key = cp_signing_key.verifying_key();
     let org_id = TenantId::new("org-agent-corp").unwrap();
+    let database_dir = tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        database_dir.path().join("control-plane.db").display()
+    );
+    let storage = SqliteStorage::connect(&DatabaseConfig::sqlite(database_url))
+        .await
+        .unwrap();
 
-    let cp_state = AppState::new(cp_signing_key.clone(), "nexus-cp-host-testing")
+    let cp_state = AppState::new(cp_signing_key.clone(), "nexus-cp-host-testing", storage)
         .with_default_relay_id("relay-agent-test");
 
     // 2. Issue EnrollmentToken in Control Plane
@@ -34,7 +43,10 @@ async fn test_agent_auto_enroll_and_session_acceptance_flow() {
         .build()
         .unwrap();
     enroll_token.sign(&cp_signing_key).unwrap();
-    cp_state.store_enrollment_token(enroll_token.clone());
+    cp_state
+        .store_enrollment_token(enroll_token.clone())
+        .await
+        .unwrap();
 
     // 3. Start Control Plane HTTP Server
     let cp_server = ControlPlaneServer::bind("127.0.0.1:0".parse().unwrap(), cp_state.clone())

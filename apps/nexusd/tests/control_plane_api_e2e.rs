@@ -13,6 +13,7 @@ use nexus_relay::token::RelayTokenVerifier;
 use nexusd::routes::{HealthResponse, SessionAuthorizationResponse, SessionRequestPayload};
 use nexusd::server::ControlPlaneServer;
 use nexusd::state::AppState;
+use nexusd::{DatabaseConfig, SqliteStorage};
 use prost::Message;
 
 #[tokio::test]
@@ -21,8 +22,16 @@ async fn test_control_plane_api_full_e2e_flow() {
     let cp_signing_key = SigningKey::from_bytes(&[55u8; 32]);
     let cp_verifying_key = cp_signing_key.verifying_key();
     let audit_sink = Arc::new(MemoryAuditSink::new());
+    let database_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        database_dir.path().join("control-plane.db").display()
+    );
+    let storage = SqliteStorage::connect(&DatabaseConfig::sqlite(database_url.clone()))
+        .await
+        .unwrap();
 
-    let state = AppState::new(cp_signing_key.clone(), "nexus-cp-e2e-cluster")
+    let state = AppState::new(cp_signing_key.clone(), "nexus-cp-e2e-cluster", storage)
         .with_default_relay_id("relay-e2e-01")
         .with_audit_sink(audit_sink.clone());
 
@@ -37,7 +46,10 @@ async fn test_control_plane_api_full_e2e_flow() {
         .build()
         .unwrap();
     enroll_token.sign(&cp_signing_key).unwrap();
-    state.store_enrollment_token(enroll_token.clone());
+    state
+        .store_enrollment_token(enroll_token.clone())
+        .await
+        .unwrap();
 
     // 3. Bind and run ControlPlaneServer
     let server = ControlPlaneServer::bind("127.0.0.1:0".parse().unwrap(), state.clone())
@@ -147,7 +159,29 @@ async fn test_control_plane_api_full_e2e_flow() {
         .verify(&auth_resp.host_relay_token, SystemClock.now())
         .is_ok());
 
-    // 10. Verify audit records generated
+    // 10. Verify audit records generated and durable across a new connection.
     let audit_events = audit_sink.events();
-    assert!(audit_events.len() >= 2);
+    assert_eq!(audit_events.len(), 2);
+
+    let restarted_storage = SqliteStorage::connect(&DatabaseConfig::sqlite(database_url))
+        .await
+        .unwrap();
+    assert!(restarted_storage
+        .get_device(&host_device_id)
+        .await
+        .unwrap()
+        .is_some());
+    assert!(restarted_storage
+        .get_session(&auth_resp.session_id)
+        .await
+        .unwrap()
+        .is_some());
+    assert_eq!(
+        restarted_storage
+            .list_audit_events(&org_id)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
 }

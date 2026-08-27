@@ -4,6 +4,7 @@
 use ed25519_dalek::SigningKey;
 use nexusd::server::ControlPlaneServer;
 use nexusd::state::AppState;
+use nexusd::{DatabaseConfig, SqliteStorage};
 use std::net::SocketAddr;
 
 #[tokio::main]
@@ -15,7 +16,10 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let signing_key = SigningKey::from_bytes(&[100u8; 32]);
-    let state = AppState::new(signing_key, "nexus-control-plane-primary");
+    let database_url =
+        std::env::var("NEXUS_DATABASE_URL").unwrap_or_else(|_| "sqlite://nexus.db?mode=rwc".into());
+    let storage = SqliteStorage::connect(&DatabaseConfig::sqlite(database_url)).await?;
+    let state = AppState::new(signing_key, "nexus-control-plane-primary", storage);
 
     let bind_addr: SocketAddr = "0.0.0.0:8080".parse()?;
     let server = ControlPlaneServer::bind(bind_addr, state).await?;

@@ -17,7 +17,8 @@ use nexus_relay::token::{EndpointRole, RelayToken};
 use prost::Message;
 use serde::{Deserialize, Serialize};
 
-use crate::state::{AppState, RegisteredDevice};
+use crate::state::{AppState, RegisteredDevice, StateError};
+use crate::storage::AuthorizedSessionRecord;
 
 /// Response returned by the health check endpoint.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,15 +116,6 @@ pub async fn enroll_device_handler(
         ));
     }
 
-    if let Err(e) = state.consume_enrollment_token(&req.enrollment_token.token_id, now) {
-        return Err((
-            StatusCode::FORBIDDEN,
-            Json(ErrorResponse {
-                error: format!("enrollment token cannot be consumed: {e}"),
-            }),
-        ));
-    }
-
     // 4. Generate unique DeviceId and build signed DeviceCredential
     let device_id_str = format!(
         "dev-{}-{}",
@@ -168,13 +160,21 @@ pub async fn enroll_device_handler(
         )
     })?;
 
-    // 5. Save registered device in state
-    state.register_device(
-        credential.clone(),
-        req.hostname.clone(),
-        req.agent_version.clone(),
-        now,
-    );
+    // 5. Atomically consume the token and save the registered device.
+    state
+        .enroll_device(
+            &req.enrollment_token.token_id,
+            now,
+            RegisteredDevice {
+                credential: credential.clone(),
+                hostname: req.hostname.clone(),
+                agent_version: req.agent_version.clone(),
+                enrolled_at: now,
+                is_active: true,
+            },
+        )
+        .await
+        .map_err(enrollment_error_response)?;
 
     // 6. Record audit event
     if let Ok(audit_evt) = AuditEvent::builder()
@@ -191,7 +191,10 @@ pub async fn enroll_device_handler(
         }))
         .build()
     {
-        state.record_audit(audit_evt).await;
+        state
+            .record_audit(audit_evt)
+            .await
+            .map_err(storage_error_response)?;
     }
 
     Ok(Json(credential))
@@ -201,14 +204,17 @@ pub async fn enroll_device_handler(
 pub async fn list_devices_handler(
     State(state): State<AppState>,
     axum::extract::Query(query): axum::extract::Query<ListDevicesQuery>,
-) -> Json<Vec<RegisteredDevice>> {
+) -> Result<Json<Vec<RegisteredDevice>>, (StatusCode, Json<ErrorResponse>)> {
     let org_id_str = query
         .organization_id
         .unwrap_or_else(|| "default".to_string());
     let org_id =
         TenantId::new(org_id_str).unwrap_or_else(|_| TenantId::new("org-default").unwrap());
-    let list = state.list_devices(&org_id);
-    Json(list)
+    let list = state
+        .list_devices(&org_id)
+        .await
+        .map_err(storage_error_response)?;
+    Ok(Json(list))
 }
 
 /// `POST /api/v1/sessions/request` - Requests authorization for a remote desktop session.
@@ -219,14 +225,18 @@ pub async fn request_session_handler(
     let now = SystemClock.now();
 
     // 1. Verify target device exists and is active
-    let target_device = state.get_device(&payload.target_device_id).ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: format!("target device {} not found", payload.target_device_id),
-            }),
-        )
-    })?;
+    let target_device = state
+        .get_device(&payload.target_device_id)
+        .await
+        .map_err(storage_error_response)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("target device {} not found", payload.target_device_id),
+                }),
+            )
+        })?;
 
     if !target_device.is_active {
         return Err((
@@ -277,6 +287,10 @@ pub async fn request_session_handler(
             let expires_at = UnixTimestamp::from_secs(now.as_secs() + ttl_secs);
 
             // 3. Build & sign SessionCapability (ADR-014, ADR-016)
+            let permissions: Vec<String> = granted_actions
+                .iter()
+                .map(|a| a.as_str().to_string())
+                .collect();
             let mut capability = SessionCapability {
                 version: 1,
                 issuer: state.control_plane_id.clone(),
@@ -284,10 +298,7 @@ pub async fn request_session_handler(
                 subject_user_id: payload.subject_user_id.to_string(),
                 client_device_id: payload.client_device_id.to_string(),
                 target_device_id: payload.target_device_id.to_string(),
-                permissions: granted_actions
-                    .into_iter()
-                    .map(|a| a.as_str().to_string())
-                    .collect(),
+                permissions: permissions.clone(),
                 restrictions: vec![],
                 not_before: now.as_secs(),
                 expires_at: expires_at.as_secs(),
@@ -357,6 +368,21 @@ pub async fn request_session_handler(
                 })?;
             host_relay_token.sign(&state.signing_key);
 
+            state
+                .persist_authorized_session(&AuthorizedSessionRecord {
+                    session_id: session_id.clone(),
+                    organization_id: payload.organization_id.clone(),
+                    user_id: payload.subject_user_id.clone(),
+                    client_device_id: payload.client_device_id.clone(),
+                    target_device_id: payload.target_device_id.clone(),
+                    relay_id: state.default_relay_id.clone(),
+                    permissions,
+                    created_at: now,
+                    status: "authorized".into(),
+                })
+                .await
+                .map_err(storage_error_response)?;
+
             // 5. Audit session authorization
             if let Ok(audit_evt) = AuditEvent::builder()
                 .event_id(format!("evt-auth-{}", session_id))
@@ -372,7 +398,10 @@ pub async fn request_session_handler(
                 }))
                 .build()
             {
-                state.record_audit(audit_evt).await;
+                state
+                    .record_audit(audit_evt)
+                    .await
+                    .map_err(storage_error_response)?;
             }
 
             Ok(Json(SessionAuthorizationResponse {
@@ -397,7 +426,10 @@ pub async fn request_session_handler(
                 }))
                 .build()
             {
-                state.record_audit(audit_evt).await;
+                state
+                    .record_audit(audit_evt)
+                    .await
+                    .map_err(storage_error_response)?;
             }
 
             Err((
@@ -420,4 +452,29 @@ fn uuid_simple() -> String {
     let mut b = [0u8; 16];
     rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut b);
     b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+fn enrollment_error_response(error: StateError) -> (StatusCode, Json<ErrorResponse>) {
+    match error {
+        StateError::EnrollmentTokenNotFound(_)
+        | StateError::EnrollmentTokenExhausted(_, _, _)
+        | StateError::EnrollmentTokenExpired { .. }
+        | StateError::EnrollmentTokenNotYetActive { .. } => (
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse {
+                error: format!("enrollment token cannot be consumed: {error}"),
+            }),
+        ),
+        error => storage_error_response(error),
+    }
+}
+
+fn storage_error_response(error: StateError) -> (StatusCode, Json<ErrorResponse>) {
+    tracing::error!(error = %error, "control-plane state operation failed");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ErrorResponse {
+            error: "control-plane storage failure".into(),
+        }),
+    )
 }
