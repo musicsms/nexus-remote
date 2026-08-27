@@ -7,9 +7,15 @@ use sqlx::Row;
 pub(crate) fn device_from_row(
     row: &sqlx::sqlite::SqliteRow,
 ) -> Result<RegisteredDevice, StorageError> {
-    let device_id: String = row.try_get("id")?;
-    let organization_id: String = row.try_get("organization_id")?;
-    let credential_json: String = row.try_get("credential_json")?;
+    let device_id: String = row
+        .try_get("id")
+        .map_err(|e| StorageError::CorruptRow(format!("device_id: {e}")))?;
+    let organization_id: String = row
+        .try_get("organization_id")
+        .map_err(|e| StorageError::CorruptRow(format!("organization_id: {e}")))?;
+    let credential_json: String = row
+        .try_get("credential_json")
+        .map_err(|e| StorageError::CorruptRow(format!("credential_json: {e}")))?;
     let device_id = DeviceId::new(device_id)
         .map_err(|e| StorageError::CorruptRow(format!("device_id: {e}")))?;
     let organization_id = TenantId::new(organization_id)
@@ -25,18 +31,31 @@ pub(crate) fn device_from_row(
             "credential.organization_id".into(),
         ));
     }
-    let enrolled_at: i64 = row.try_get("created_at")?;
+    let enrolled_at: i64 = row
+        .try_get("created_at")
+        .map_err(|e| StorageError::CorruptRow(format!("created_at: {e}")))?;
     let enrolled_at =
         u64::try_from(enrolled_at).map_err(|_| StorageError::CorruptRow("created_at".into()))?;
-    let hostname: String = row.try_get("hostname")?;
-    let agent_version: String = row.try_get("agent_version")?;
-    let status: String = row.try_get("status")?;
+    let hostname: String = row
+        .try_get("hostname")
+        .map_err(|e| StorageError::CorruptRow(format!("hostname: {e}")))?;
+    let agent_version: String = row
+        .try_get("agent_version")
+        .map_err(|e| StorageError::CorruptRow(format!("agent_version: {e}")))?;
+    let status: String = row
+        .try_get("status")
+        .map_err(|e| StorageError::CorruptRow(format!("status: {e}")))?;
+    let is_active = match status.as_str() {
+        "active" => true,
+        "revoked" => false,
+        _ => return Err(StorageError::CorruptRow("status".into())),
+    };
     Ok(RegisteredDevice {
         credential,
         hostname,
         agent_version,
         enrolled_at: UnixTimestamp::from_secs(enrolled_at),
-        is_active: status == "active",
+        is_active,
     })
 }
 

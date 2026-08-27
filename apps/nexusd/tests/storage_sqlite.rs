@@ -97,6 +97,33 @@ async fn concurrent_final_use_allows_exactly_one_device() {
 }
 
 #[tokio::test]
+async fn enrollment_rejects_not_before_and_tenant_mismatch_without_consuming() {
+    let storage = storage().await;
+    let org = TenantId::new("org-window").unwrap();
+    let mut t = token(&org);
+    t.not_before = UnixTimestamp::from_secs(100);
+    storage.store_enrollment_token(&t).await.unwrap();
+    assert!(matches!(
+        storage
+            .enroll_device("tok-1", UnixTimestamp::from_secs(1), device(&org, "dev-a"))
+            .await,
+        Err(EnrollmentError::NotYetActive { .. })
+    ));
+    let other = TenantId::new("org-other").unwrap();
+    assert!(matches!(
+        storage
+            .enroll_device(
+                "tok-1",
+                UnixTimestamp::from_secs(100),
+                device(&other, "dev-b")
+            )
+            .await,
+        Err(EnrollmentError::Storage(_))
+    ));
+    assert_eq!(storage.count_devices().await.unwrap(), 0);
+}
+
+#[tokio::test]
 async fn fresh_database_runs_foundation_migration() {
     let temp = tempfile::tempdir().unwrap();
     let url = format!(

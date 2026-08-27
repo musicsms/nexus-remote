@@ -13,6 +13,11 @@ pub enum EnrollmentError {
         expired_at: UnixTimestamp,
         current_time: UnixTimestamp,
     },
+    #[error("enrollment token not active until {not_before}, current time {current_time}")]
+    NotYetActive {
+        not_before: UnixTimestamp,
+        current_time: UnixTimestamp,
+    },
     #[error("enrollment token {token_id} has exceeded maximum uses ({uses_count}/{max_uses})")]
     Exhausted {
         token_id: String,
@@ -72,13 +77,23 @@ impl SqliteStorage {
         let row = row.ok_or_else(|| EnrollmentError::NotFound {
             token_id: token_id.to_string(),
         })?;
-        let token_json: String = row.try_get("token_json")?;
+        let token_json: String = row
+            .try_get("token_json")
+            .map_err(|e| StorageError::CorruptRow(format!("token_json: {e}")))?;
         let token: EnrollmentToken = serde_json::from_str(&token_json)
             .map_err(|e| StorageError::CorruptRow(format!("token_json: {e}")))?;
-        let uses: i64 = row.try_get("uses_count")?;
-        let max: i64 = row.try_get("max_uses")?;
-        let not_before_db: i64 = row.try_get("not_before")?;
-        let expires_at_db: i64 = row.try_get("expires_at")?;
+        let uses: i64 = row
+            .try_get("uses_count")
+            .map_err(|e| StorageError::CorruptRow(format!("uses_count: {e}")))?;
+        let max: i64 = row
+            .try_get("max_uses")
+            .map_err(|e| StorageError::CorruptRow(format!("max_uses: {e}")))?;
+        let not_before_db: i64 = row
+            .try_get("not_before")
+            .map_err(|e| StorageError::CorruptRow(format!("not_before: {e}")))?;
+        let expires_at_db: i64 = row
+            .try_get("expires_at")
+            .map_err(|e| StorageError::CorruptRow(format!("expires_at: {e}")))?;
         let not_before_db = u64::try_from(not_before_db)
             .map_err(|_| StorageError::CorruptRow("not_before".into()))?;
         let expires_at_db = u64::try_from(expires_at_db)
@@ -87,6 +102,13 @@ impl SqliteStorage {
             u32::try_from(uses).map_err(|_| StorageError::CorruptRow("uses_count".into()))?;
         let max_u = u32::try_from(max).map_err(|_| StorageError::CorruptRow("max_uses".into()))?;
         let expires_at = UnixTimestamp::from_secs(expires_at_db);
+        let not_before = UnixTimestamp::from_secs(not_before_db);
+        if now < not_before {
+            return Err(EnrollmentError::NotYetActive {
+                not_before,
+                current_time: now,
+            });
+        }
         if now > expires_at {
             return Err(EnrollmentError::Expired {
                 expired_at: expires_at,
@@ -117,6 +139,11 @@ impl SqliteStorage {
             });
         }
         let cred = &device.credential;
+        if cred.organization_id != token.organization_id {
+            return Err(EnrollmentError::Storage(StorageError::CorruptRow(
+                "organization_id mismatch".into(),
+            )));
+        }
         let cred_json = serde_json::to_string(cred)?;
         sqlx::query(
             "INSERT INTO organizations (id, created_at) VALUES (?, ?) ON CONFLICT(id) DO NOTHING",
