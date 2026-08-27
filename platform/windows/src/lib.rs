@@ -21,12 +21,29 @@ pub trait CursorBackend {
     fn snapshot(&mut self) -> Result<Vec<u8>, BackendError>;
 }
 
-#[cfg(not(windows))]
 pub struct UnsupportedBackend;
 
 #[cfg(not(windows))]
 impl CaptureBackend for UnsupportedBackend {
     fn start(&mut self) -> Result<(), BackendError> {
+        Err(BackendError::UnsupportedPlatform)
+    }
+}
+
+impl EncoderBackend for UnsupportedBackend {
+    fn configure(&mut self, _width: u32, _height: u32) -> Result<(), BackendError> {
+        Err(BackendError::UnsupportedPlatform)
+    }
+}
+
+impl InputBackend for UnsupportedBackend {
+    fn dispatch(&mut self, _event: &[u8]) -> Result<(), BackendError> {
+        Err(BackendError::UnsupportedPlatform)
+    }
+}
+
+impl CursorBackend for UnsupportedBackend {
+    fn snapshot(&mut self) -> Result<Vec<u8>, BackendError> {
         Err(BackendError::UnsupportedPlatform)
     }
 }

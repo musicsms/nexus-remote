@@ -78,7 +78,7 @@ repo yet.
 
 | Path | Purpose (Spec) | Status |
 |---|---|---|
-| `platform/windows/` | Windows-specific OS/codec bindings | Not started |
+| `platform/windows/` | Windows-specific OS/codec bindings | **Scaffolded** — backend traits, fail-closed non-Windows stubs, and Phase 1 API-selection ADRs; native WGC/DXGI/Media Foundation implementations remain next |
 | `platform/macos/` | macOS-specific bindings (Phase 5) | Not started |
 | `platform/linux/` | Linux-specific bindings (Phase 5) | Not started |
 | `proto/` | Protobuf schemas (Section 33) | Scaffolded — `proto/nexus.proto` defines the Phase 0 session, input, monitor, cursor, and capability messages (package `nexus.protocol.v1`), compiled into `nexus-protocol` by `build.rs` via `prost-build` |
