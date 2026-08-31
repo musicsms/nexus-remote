@@ -5,6 +5,8 @@ use thiserror::Error;
 pub enum CaptureError {
     #[error("captured frame dimensions must be non-zero")]
     InvalidDimensions,
+    #[error("captured frame size overflows the platform size type")]
+    FrameSizeOverflow,
     #[error("BGRA frame payload has {actual} bytes; expected {expected}")]
     InvalidBgraPayload { actual: usize, expected: usize },
 }
@@ -30,6 +32,13 @@ pub struct CapturedFrame {
 }
 
 impl CapturedFrame {
+    pub fn expected_bgra_len(width: u32, height: u32) -> Result<usize, CaptureError> {
+        let pixels = (width as usize)
+            .checked_mul(height as usize)
+            .ok_or(CaptureError::FrameSizeOverflow)?;
+        pixels.checked_mul(4).ok_or(CaptureError::FrameSizeOverflow)
+    }
+
     pub fn new_bgra(
         frame_id: u64,
         timestamp_us: u64,
@@ -54,7 +63,7 @@ impl CapturedFrame {
             return Err(CaptureError::InvalidDimensions);
         }
         if self.format == PixelFormat::Bgra8 {
-            let expected = self.width as usize * self.height as usize * 4;
+            let expected = Self::expected_bgra_len(self.width, self.height)?;
             if self.data.len() != expected {
                 return Err(CaptureError::InvalidBgraPayload {
                     actual: self.data.len(),
@@ -119,5 +128,14 @@ mod tests {
                 expected: 4
             })
         );
+    }
+
+    #[test]
+    fn bgra_size_uses_checked_arithmetic() {
+        assert_eq!(
+            CapturedFrame::expected_bgra_len(u32::MAX, u32::MAX),
+            Err(CaptureError::FrameSizeOverflow)
+        );
+        assert_eq!(CapturedFrame::expected_bgra_len(2, 3), Ok(24));
     }
 }

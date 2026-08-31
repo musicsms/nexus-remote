@@ -59,20 +59,31 @@ pub enum InputEvent {
 pub enum InputError {
     #[error("text input exceeds {max_bytes} bytes")]
     TextTooLong { max_bytes: usize },
+    #[error("physical key code cannot be represented as a 16-bit value")]
+    InvalidPhysicalKeyCode,
+    #[error("mouse wheel delta is outside the allowed range")]
+    WheelDeltaOutOfRange,
 }
 
 impl InputEvent {
     pub const MAX_TEXT_BYTES: usize = 4096;
 
     pub fn validate(&self) -> Result<(), InputError> {
-        if let Self::Text(text) = self {
-            if text.len() > Self::MAX_TEXT_BYTES {
-                return Err(InputError::TextTooLong {
-                    max_bytes: Self::MAX_TEXT_BYTES,
-                });
+        match self {
+            Self::Text(text) if text.len() > Self::MAX_TEXT_BYTES => Err(InputError::TextTooLong {
+                max_bytes: Self::MAX_TEXT_BYTES,
+            }),
+            Self::Key { physical_code, .. } if *physical_code > u16::MAX as u32 => {
+                Err(InputError::InvalidPhysicalKeyCode)
             }
+            Self::MouseWheel { delta_x, delta_y }
+                if !(-120_000..=120_000).contains(delta_x)
+                    || !(-120_000..=120_000).contains(delta_y) =>
+            {
+                Err(InputError::WheelDeltaOutOfRange)
+            }
+            _ => Ok(()),
         }
-        Ok(())
     }
 }
 
@@ -101,5 +112,25 @@ mod tests {
         assert_eq!(Modifiers::SHIFT.bits(), 1);
         assert_eq!(Modifiers::CTRL.bits(), 2);
         assert_eq!(Modifiers::from_bits(0xF1).bits(), 1);
+    }
+
+    #[test]
+    fn rejects_unrepresentable_physical_key_code() {
+        let event = InputEvent::Key {
+            physical_code: 0x1_0000,
+            logical_code: 0,
+            action: KeyAction::Down,
+            modifiers: Modifiers::NONE,
+        };
+        assert_eq!(event.validate(), Err(InputError::InvalidPhysicalKeyCode));
+    }
+
+    #[test]
+    fn rejects_extreme_wheel_delta() {
+        let event = InputEvent::MouseWheel {
+            delta_x: 0,
+            delta_y: i32::MAX,
+        };
+        assert_eq!(event.validate(), Err(InputError::WheelDeltaOutOfRange));
     }
 }
