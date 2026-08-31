@@ -49,7 +49,7 @@ impl CursorSnapshot {
 }
 
 /// Native cursor calls are deliberately expressed without Windows types.
-#[doc(hidden)]
-pub trait NativeCursorApi {
+#[allow(dead_code)]
+pub(crate) trait NativeCursorApi {
     fn snapshot(&mut self) -> BackendResult<CursorSnapshot>;
 }

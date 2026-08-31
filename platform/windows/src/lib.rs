@@ -4,10 +4,8 @@
 
 mod cursor;
 mod error;
-pub mod input;
+mod input;
 
-pub use cursor::{CursorSnapshot, NativeCursorApi};
+pub use cursor::CursorSnapshot;
 pub use error::{BackendError, BackendErrorKind, BackendResult};
 pub use input::{InputInjector, MonitorBounds, SystemInputApi};
-#[doc(hidden)]
-pub use input::{InputRecord, NativeInputApi};
