@@ -2,8 +2,9 @@
 
 Nexus is a greenfield Rust remote-desktop platform (Teleport-inspired
 identity/access plane + custom low-latency media/data plane). The project is
-currently pre-Phase-0: the Cargo workspace and crate/app skeletons exist,
-but almost nothing is implemented yet. Any agent (Claude or otherwise)
+has completed the Phase 0 foundation and is implementing the Phase 1 MVP:
+the Windows platform scaffold and core persistence slices exist, while the
+real Windows host/client session remains in progress. Any agent (Claude or otherwise)
 working in this repo must follow the rules below.
 
 ## 1. Read before you write
@@ -156,7 +157,7 @@ so it stays accurate.
 
 - `docs/Nexus Remote Desktop Platform - Spec.md` — target architecture (read-mostly).
 - `docs/IMPLEMENTATION_STATUS.md` — current build status, and the index of which ADRs exist (update-often).
-- `docs/adr/` — frozen decisions, one file per ADR (24 written so far out of 24 tracked).
+- `docs/adr/` — frozen decisions, one file per ADR (27 written so far out of 27 tracked).
 - `docs/protocol/` — design notes with the reasoning behind those ADRs, organized by area (session establishment, session authorization, connectivity, Windows agent, video pipeline).
 - `crates/` — OS-independent core logic.
 - `apps/` — binaries (`nexusd`, `nexus-relay`, `nexus-agent`, `nexus-desktop-host`, `nexus-client`, `nexus-cli`).

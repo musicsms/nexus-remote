@@ -50,12 +50,12 @@ W3 Windows agent/service ───────┘             │
 - Produces `platform_windows::CaptureBackend`, `EncoderBackend`, `InputBackend`, and `CursorBackend` feature-gated for Windows.
 - Produces ADRs freezing API selection, thread/apartment requirements, fallback behavior, and rendering choice.
 
-- [ ] Verify current Windows SDK/toolchain requirements against the existing Rust MSVC toolchain.
-- [ ] Compare Windows Graphics Capture vs DXGI duplication for session, pre-login, and multi-monitor constraints; record the selected API and fallback in ADR-026.
-- [ ] Compare DirectComposition/Win32 renderer options; record the selected client stack in ADR-027.
-- [ ] Scaffold platform crate with `cfg(windows)` implementations and non-Windows compile stubs that return `UnsupportedPlatform`.
-- [ ] Add compile tests for Windows target and Linux workspace target.
-- [ ] Update status to mark `platform/windows/` scaffolded and the ADRs done.
+- [ ] Verify current Windows SDK/toolchain requirements against the existing Rust MSVC toolchain (real Windows toolchain/hardware validation remains unverified).
+- [x] Compare Windows Graphics Capture vs DXGI duplication for session, pre-login, and multi-monitor constraints; record the selected API and fallback in ADR-026.
+- [x] Compare DirectComposition/Win32 renderer options; record the selected client stack in ADR-027.
+- [x] Scaffold platform crate with `cfg(windows)` implementations and non-Windows compile stubs that return `UnsupportedPlatform`.
+- [ ] Add compile tests for Windows target and Linux workspace target (Windows-target verification remains unverified; the available GNU target currently fails the existing cfg-gated test build).
+- [x] Update status to mark `platform/windows/` scaffolded and the ADRs done.
 - [ ] Run `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo fmt --all -- --check`.
 - [ ] Commit: `feat(platform): scaffold Windows Phase 1 backends`.
 

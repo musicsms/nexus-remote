@@ -17,7 +17,7 @@ Status legend: **Not started** (path/doc does not exist yet) · **Scaffolded**
 progress** (real implementation underway, not feature-complete) · **Done**
 (meets the relevant Definition of Done / exit condition in the spec).
 
-Last audited: 2026-08-26.
+Last audited: 2026-08-31.
 
 ---
 
@@ -26,7 +26,7 @@ Last audited: 2026-08-26.
 | Phase | Scope | Exit condition | Status |
 |---|---|---|---|
 | Phase 0 — Foundation | Workspace, CI, protocol crate, QUIC PoC, Windows capture PoC, H.264 encoder PoC | Capture a Windows desktop and stream frames between two local processes | **Done for OS-independent foundation** — protocol, capture/queue, software codec, crypto, fragmentation/reassembly, and QUIC loopback are verified end-to-end in `phase0_e2e_pipeline`; live Windows Graphics Capture/DXGI and hardware H.264 remain Phase 1 platform work |
-| Phase 1 — MVP v0.1 | Windows host/client, minimal nexusd, enrollment, relay-only QUIC, H.264 1080p60, input, cursor, reconnect, telemetry overlay | User can enroll a host + client and control it over the Internet through a relay | Not started |
+| Phase 1 — MVP v0.1 | Windows host/client, minimal nexusd, enrollment, relay-only QUIC, H.264 1080p60, input, cursor, reconnect, telemetry overlay | User can enroll a host + client and control it over the Internet through a relay | **In progress** — SQLite persistence and Windows backend/API scaffolding are complete; real Windows hardware/session acceptance remains unverified |
 | Phase 2 — v0.2 Connectivity | Candidate discovery, hole punching, P2P QUIC, adaptive bitrate, clipboard text | P2P succeeds on common NATs, falls back to relay | Not started |
 | Phase 3 — v0.3 Productization | File transfer, audio, recording, RBAC, audit UI/API, signed updates | — | Not started |
 | Phase 4 — v0.5 Enterprise | OIDC, SAML, WebAuthn, access requests, device labels, ABAC | — | Not started |
@@ -87,7 +87,7 @@ repo yet.
 | `test/integration/` | Client → relay → agent integration tests | Not started |
 | `test/network-sim/` | Network simulation profiles (Section 47) | Not started |
 | `test/performance/` | Performance regression tests | Not started |
-| `docs/adr/` | Frozen ADRs (Section 51) | **Done** — ADR-001 through ADR-025 are recorded; ADR-025 freezes encoded-frame AEAD granularity and nonce/AAD boundaries. |
+| `docs/adr/` | Frozen ADRs (Section 51) | **Done** — ADR-001 through ADR-027 are recorded; ADR-025 freezes encoded-frame AEAD granularity and nonce/AAD boundaries, while ADR-026/027 freeze Windows capture and client rendering choices. |
 | `docs/protocol/` | Protocol documentation | In progress — 5 design notes added: `session-establishment-signaling.md`, `session-authorization-model.md`, `connectivity-nat-traversal.md`, `windows-agent-privilege-boundary.md`, `video-media-pipeline.md` |
 | `docs/security/` | Threat model, security docs (Section 44) | Not started |
 
@@ -95,15 +95,15 @@ repo yet.
 
 ## 3. ADR status (Spec Section 51, plus ADRs discovered during design review)
 
-All 25 of the tracked ADRs have now been written as documents in
+All 27 of the tracked ADRs have now been written as documents in
 `docs/adr/`. ADR-001 through ADR-013 were the 13 foundational decisions
 Section 51 called for "before heavy implementation" — they were already
 implemented in practice (e.g. the crates in `Cargo.toml` already encoded
 ADR-001/002/003/008/010/012/013) and stated in the spec's prose, but were
 not yet frozen as standalone records until this pass; they are backfill
 ADRs formalizing existing decisions, not new architectural choices.
-ADR-014 through ADR-024 arose from active system-design review ahead of
-Phase 1 and are documented in `docs/protocol/`.
+ADR-014 through ADR-027 arose from active system-design review ahead of
+Phase 1 and are documented in `docs/protocol/` or `docs/adr/`.
 
 | ADR | Decision | Status |
 |---|---|---|
@@ -132,6 +132,8 @@ Phase 1 and are documented in `docs/protocol/`.
 | ADR-023 | Unattended-access consent/notification is a per-role/per-device policy setting (resolves the Section 58 open question) | **Done** — `docs/adr/ADR-023-unattended-consent-policy-per-role.md` |
 | ADR-024 | Desktop-host process crash triggers automatic respawn reusing existing session reconnect semantics, not session termination | **Done** — `docs/adr/ADR-024-desktop-host-crash-respawn.md` |
 | ADR-025 | Encoded-frame payload AEAD granularity, directional nonce domains, and stable AAD metadata | **Done** — `docs/adr/ADR-025-encoded-frame-aead-framing.md` |
+| ADR-026 | Windows Graphics Capture selection with DXGI fallback and dedicated capture apartment | **Done** — `docs/adr/ADR-026-windows-capture-api-selection.md` |
+| ADR-027 | Native Win32 client with Direct3D 11-backed rendering | **Done** — `docs/adr/ADR-027-windows-client-rendering-stack.md` |
 
 ---
 
