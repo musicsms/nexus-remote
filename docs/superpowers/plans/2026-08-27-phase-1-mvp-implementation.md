@@ -56,8 +56,8 @@ W3 Windows agent/service ───────┘             │
 - [x] Scaffold platform crate with `cfg(windows)` implementations and non-Windows compile stubs that return `UnsupportedPlatform`.
 - [ ] Add compile tests for Windows target and Linux workspace target (Windows-target verification remains unverified; the available GNU target currently fails the existing cfg-gated test build).
 - [x] Update status to mark `platform/windows/` scaffolded and the ADRs done.
-- [ ] Run `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo fmt --all -- --check`.
-- [ ] Commit: `feat(platform): scaffold Windows Phase 1 backends`.
+- [x] Run `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo fmt --all -- --check`.
+- [x] Commit: `feat(platform): scaffold Windows Phase 1 backends` (evidenced by commits `fde86ab`, `bcff411`, and `40f7946`; this fix round remains a documentation amendment).
 
 ### Task 2: Implement Real Windows Capture, H.264, Input, and Cursor Backends
 

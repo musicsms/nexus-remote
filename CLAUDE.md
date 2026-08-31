@@ -4,7 +4,8 @@ Nexus is a greenfield Rust remote-desktop platform (Teleport-inspired
 identity/access plane + custom low-latency media/data plane). The project is
 has completed the Phase 0 foundation and is implementing the Phase 1 MVP:
 the Windows platform scaffold and core persistence slices exist, while the
-real Windows host/client session remains in progress. Any agent (Claude or otherwise)
+Phase 1 acceptance condition remains unverified—a real Windows host and
+client must control a host through the relay. Any agent (Claude or otherwise)
 working in this repo must follow the rules below.
 
 ## 1. Read before you write
