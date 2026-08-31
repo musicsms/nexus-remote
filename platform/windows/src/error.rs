@@ -10,6 +10,7 @@ pub enum BackendErrorKind {
     InvalidConfiguration,
     InitializationFailed,
     DeviceLost,
+    InvalidFrame,
     InvalidInput,
     InvalidCursorDimensions,
     HotspotOutOfBounds,
