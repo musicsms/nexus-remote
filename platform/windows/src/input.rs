@@ -193,7 +193,7 @@ fn map_hid_usage(usage: u32) -> BackendResult<WindowsScanCode> {
         0x2f => scan_code(0x1a),
         0x30 => scan_code(0x1b),
         0x31 => scan_code(0x2b),
-        0x32 => scan_code(0x56),
+        0x32 => scan_code(0x2b),
         0x33 => scan_code(0x27),
         0x34 => scan_code(0x28),
         0x35 => scan_code(0x29),
@@ -232,6 +232,7 @@ fn map_hid_usage(usage: u32) -> BackendResult<WindowsScanCode> {
         0x61 => scan_code(0x49),
         0x62 => scan_code(0x52),
         0x63 => scan_code(0x53),
+        0x64 => scan_code(0x56),
         0x65 => extended_scan_code(0x5d),
         0xe0 => scan_code(0x1d),
         0xe1 => scan_code(0x2a),
@@ -507,6 +508,36 @@ mod tests {
             injector.into_inner().records,
             vec![InputRecord::ScanCode {
                 scan_code: 0x02,
+                extended: false,
+                key_up: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn translates_hid_usage_0x32_to_windows_scan_code_0x2b() {
+        let mut injector = injector();
+
+        assert_eq!(injector.inject_records(&key(0x32)), Ok(1));
+        assert_eq!(
+            injector.into_inner().records,
+            vec![InputRecord::ScanCode {
+                scan_code: 0x2b,
+                extended: false,
+                key_up: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn translates_hid_usage_0x64_to_windows_scan_code_0x56() {
+        let mut injector = injector();
+
+        assert_eq!(injector.inject_records(&key(0x64)), Ok(1));
+        assert_eq!(
+            injector.into_inner().records,
+            vec![InputRecord::ScanCode {
+                scan_code: 0x56,
                 extended: false,
                 key_up: false,
             }]
