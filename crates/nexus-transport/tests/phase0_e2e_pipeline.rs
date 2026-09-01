@@ -100,7 +100,11 @@ async fn phase0_full_e2e_pipeline_test() {
         encoder
             .configure(encoder_config)
             .expect("configure encoder");
-        let encoded_frame = encoder.encode(raw_frame).expect("encode frame");
+        let encoded_frame = encoder
+            .encode(raw_frame)
+            .expect("encode frame")
+            .pop()
+            .expect("software encoder must emit one frame per input");
         assert!(encoded_frame.keyframe);
         assert!(!encoded_frame.data.is_empty());
 
@@ -312,7 +316,11 @@ async fn phase0_multi_frame_stream_pipeline() {
             let captured = capture_source.next_frame().unwrap();
             queue.replace(captured);
             let frame = queue.take().unwrap();
-            let encoded = encoder.encode(frame).unwrap();
+            let encoded = encoder
+                .encode(frame)
+                .unwrap()
+                .pop()
+                .expect("software encoder must emit one frame per input");
             expected_frames_data.push(encoded.data.to_vec());
 
             let base_header = VideoPacketHeader {
@@ -435,7 +443,11 @@ async fn phase0_tampered_frame_detection() {
                 bitrate_bps: 1_000_000,
             })
             .unwrap();
-        let encoded = encoder.encode(captured).unwrap();
+        let encoded = encoder
+            .encode(captured)
+            .unwrap()
+            .pop()
+            .expect("software encoder must emit one frame per input");
 
         let mut host_nonce_seq = NonceSequence::new(video_channel_domain);
         let base_header = VideoPacketHeader {

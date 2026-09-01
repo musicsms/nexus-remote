@@ -101,7 +101,7 @@ impl VideoEncoder for SoftwareFallbackEncoder {
         Ok(())
     }
 
-    fn encode(&mut self, frame: CapturedFrame) -> Result<EncodedFrame, CodecError> {
+    fn encode(&mut self, frame: CapturedFrame) -> Result<Vec<EncodedFrame>, CodecError> {
         let config = self.config.as_ref().ok_or(CodecError::NotConfigured)?;
 
         if frame.width != config.width || frame.height != config.height {
@@ -119,12 +119,12 @@ impl VideoEncoder for SoftwareFallbackEncoder {
 
         let payload = self.build_annex_b_payload(config, is_keyframe, &frame.data);
 
-        Ok(EncodedFrame {
+        Ok(vec![EncodedFrame {
             frame_id: frame.frame_id,
             timestamp_us: frame.timestamp_us,
             keyframe: is_keyframe,
             data: payload,
-        })
+        }])
     }
 
     fn request_keyframe(&mut self) -> Result<(), CodecError> {
@@ -185,7 +185,11 @@ mod tests {
         assert_eq!(encoder.frame_count(), 0);
 
         // Frame 1 -> should be keyframe (first frame)
-        let f1 = encoder.encode(sample_frame(1, 0, 640, 480)).unwrap();
+        let f1 = encoder
+            .encode(sample_frame(1, 0, 640, 480))
+            .unwrap()
+            .pop()
+            .unwrap();
         assert_eq!(f1.frame_id, 1);
         assert_eq!(f1.timestamp_us, 0);
         assert!(f1.keyframe, "first frame must be a keyframe");
@@ -196,7 +200,11 @@ mod tests {
         assert_eq!(encoder.frame_count(), 1);
 
         // Frame 2 -> delta frame
-        let f2 = encoder.encode(sample_frame(2, 33333, 640, 480)).unwrap();
+        let f2 = encoder
+            .encode(sample_frame(2, 33333, 640, 480))
+            .unwrap()
+            .pop()
+            .unwrap();
         assert_eq!(f2.frame_id, 2);
         assert_eq!(f2.timestamp_us, 33333);
         assert!(!f2.keyframe, "second frame should not be keyframe");
@@ -205,13 +213,21 @@ mod tests {
         assert_eq!(encoder.frame_count(), 2);
 
         // Frame 3 -> delta frame
-        let f3 = encoder.encode(sample_frame(3, 66666, 640, 480)).unwrap();
+        let f3 = encoder
+            .encode(sample_frame(3, 66666, 640, 480))
+            .unwrap()
+            .pop()
+            .unwrap();
         assert_eq!(f3.frame_id, 3);
         assert!(!f3.keyframe, "third frame should not be keyframe");
         assert_eq!(encoder.frame_count(), 3);
 
         // Frame 4 (frame_count 3 % interval 3 == 0) -> periodic keyframe
-        let f4 = encoder.encode(sample_frame(4, 99999, 640, 480)).unwrap();
+        let f4 = encoder
+            .encode(sample_frame(4, 99999, 640, 480))
+            .unwrap()
+            .pop()
+            .unwrap();
         assert_eq!(f4.frame_id, 4);
         assert!(f4.keyframe, "fourth frame (interval 3) must be keyframe");
         assert_eq!(encoder.frame_count(), 4);
@@ -222,22 +238,38 @@ mod tests {
         let mut encoder = SoftwareFallbackEncoder::with_keyframe_interval(100);
         encoder.configure(valid_config(640, 480)).unwrap();
 
-        let f1 = encoder.encode(sample_frame(1, 0, 640, 480)).unwrap();
+        let f1 = encoder
+            .encode(sample_frame(1, 0, 640, 480))
+            .unwrap()
+            .pop()
+            .unwrap();
         assert!(f1.keyframe);
 
-        let f2 = encoder.encode(sample_frame(2, 33333, 640, 480)).unwrap();
+        let f2 = encoder
+            .encode(sample_frame(2, 33333, 640, 480))
+            .unwrap()
+            .pop()
+            .unwrap();
         assert!(!f2.keyframe);
 
         // Request keyframe explicitly
         encoder.request_keyframe().unwrap();
 
-        let f3 = encoder.encode(sample_frame(3, 66666, 640, 480)).unwrap();
+        let f3 = encoder
+            .encode(sample_frame(3, 66666, 640, 480))
+            .unwrap()
+            .pop()
+            .unwrap();
         assert!(
             f3.keyframe,
             "frame after request_keyframe must be a keyframe"
         );
 
-        let f4 = encoder.encode(sample_frame(4, 99999, 640, 480)).unwrap();
+        let f4 = encoder
+            .encode(sample_frame(4, 99999, 640, 480))
+            .unwrap()
+            .pop()
+            .unwrap();
         assert!(!f4.keyframe, "frame after forced keyframe reverts to delta");
     }
 
@@ -278,9 +310,17 @@ mod tests {
         let mut encoder = SoftwareFallbackEncoder::with_keyframe_interval(100);
         encoder.configure(valid_config(640, 480)).unwrap();
 
-        let f1 = encoder.encode(sample_frame(1, 0, 640, 480)).unwrap();
+        let f1 = encoder
+            .encode(sample_frame(1, 0, 640, 480))
+            .unwrap()
+            .pop()
+            .unwrap();
         assert!(f1.keyframe);
-        let f2 = encoder.encode(sample_frame(2, 33333, 640, 480)).unwrap();
+        let f2 = encoder
+            .encode(sample_frame(2, 33333, 640, 480))
+            .unwrap()
+            .pop()
+            .unwrap();
         assert!(!f2.keyframe);
 
         // Reconfigure with new dimensions
@@ -295,7 +335,11 @@ mod tests {
         );
 
         // New dimensions should succeed and be a keyframe
-        let f3 = encoder.encode(sample_frame(3, 66666, 1280, 720)).unwrap();
+        let f3 = encoder
+            .encode(sample_frame(3, 66666, 1280, 720))
+            .unwrap()
+            .pop()
+            .unwrap();
         assert_eq!(f3.frame_id, 3);
         assert!(
             f3.keyframe,

@@ -1,7 +1,15 @@
 use nexus_capture::{CapturedFrame, PixelFormat};
 use nexus_codec::{CodecError, EncodedFrame, EncoderConfig, VideoEncoder};
 #[cfg(any(windows, test))]
-use std::sync::mpsc::Receiver;
+use std::collections::VecDeque;
+#[cfg(any(windows, test))]
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc::Receiver,
+    Arc, Mutex,
+};
+#[cfg(any(windows, test))]
+use std::thread::{self, JoinHandle};
 #[cfg(any(windows, test))]
 use std::time::Duration;
 
@@ -11,6 +19,8 @@ const MAX_ASYNC_INPUT_CREDITS: usize = 8;
 const MAX_PENDING_OUTPUT_EVENTS: usize = 8;
 #[cfg(any(windows, test))]
 const MFT_OUTPUT_NO_SAMPLE_STATUS: u32 = 0x300;
+#[cfg(any(windows, test))]
+const MFT_OUTPUT_INCOMPLETE_STATUS: u32 = 0x0100_0000;
 
 #[cfg(any(windows, test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +72,7 @@ impl AsyncPump {
         Ok(())
     }
 
+    #[cfg(test)]
     fn input_credits(&self) -> usize {
         self.input_credits
     }
@@ -96,6 +107,52 @@ impl AsyncPump {
     }
 }
 
+/// Couples event credits to queued input commands so that an async MFT can
+/// receive every input it has requested without waiting for the first output.
+#[cfg(any(windows, test))]
+#[derive(Debug)]
+struct AsyncInputScheduler<T> {
+    pump: AsyncPump,
+    queued_inputs: VecDeque<T>,
+}
+
+#[cfg(any(windows, test))]
+impl<T> AsyncInputScheduler<T> {
+    fn new() -> Self {
+        Self {
+            pump: AsyncPump::new(),
+            queued_inputs: VecDeque::new(),
+        }
+    }
+
+    fn observe(&mut self, event: AsyncPumpEvent) -> Result<(), CodecError> {
+        self.pump.observe(event)
+    }
+
+    fn enqueue(&mut self, input: T) -> Result<(), CodecError> {
+        if self.queued_inputs.len() == MAX_ASYNC_INPUT_CREDITS {
+            return Err(CodecError::BackendLost);
+        }
+        self.queued_inputs.push_back(input);
+        Ok(())
+    }
+
+    fn take_ready_input(&mut self) -> Option<T> {
+        if self.queued_inputs.is_empty() || !self.pump.take_input_credit() {
+            return None;
+        }
+        self.queued_inputs.pop_front()
+    }
+
+    fn take_output_event(&mut self) -> bool {
+        self.pump.take_output_event()
+    }
+
+    fn take_drain_complete(&mut self) -> bool {
+        self.pump.take_drain_complete()
+    }
+}
+
 #[cfg(any(windows, test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct OutputBufferSpec {
@@ -108,9 +165,20 @@ fn output_buffer_spec(cb_size: u32, cb_alignment: u32) -> Result<OutputBufferSpe
     if cb_size == 0 {
         return Err(CodecError::BackendUnavailable);
     }
+    let alignment = if cb_alignment == 0 {
+        None
+    } else if cb_alignment.is_power_of_two() {
+        Some(
+            cb_alignment
+                .checked_sub(1)
+                .ok_or(CodecError::BackendUnavailable)?,
+        )
+    } else {
+        return Err(CodecError::BackendUnavailable);
+    };
     Ok(OutputBufferSpec {
         capacity: cb_size,
-        alignment: (cb_alignment != 0).then_some(cb_alignment),
+        alignment,
     })
 }
 
@@ -120,6 +188,104 @@ fn output_sample_is_usable(output_status: u32, sample_len: Option<usize>) -> Opt
         return None;
     }
     sample_len.filter(|length| *length != 0)
+}
+
+#[cfg(any(windows, test))]
+fn output_requires_retry(output_status: u32) -> bool {
+    output_status & MFT_OUTPUT_INCOMPLETE_STATUS != 0
+}
+
+#[cfg(any(windows, test))]
+struct OutputPoll<T> {
+    output: Option<T>,
+    more_output: bool,
+}
+
+#[cfg(any(windows, test))]
+fn collect_output_polls<T>(
+    mut take_output: impl FnMut() -> Result<OutputPoll<T>, CodecError>,
+) -> Result<Vec<T>, CodecError> {
+    let mut outputs = Vec::new();
+    for _ in 0..MAX_PENDING_OUTPUT_EVENTS {
+        let poll = take_output()?;
+        if let Some(output) = poll.output {
+            outputs.push(output);
+        }
+        if !poll.more_output {
+            return Ok(outputs);
+        }
+    }
+    Err(CodecError::BackendLost)
+}
+
+#[cfg(any(windows, test))]
+fn clear_converter_after_drain<T>(
+    converter: &mut Option<T>,
+    result: Result<(), CodecError>,
+) -> Result<(), CodecError> {
+    converter.take();
+    result
+}
+
+/// Owns the native worker's `JoinHandle` after a bounded caller timeout.
+///
+/// A reaper holds and joins the handle on a small Rust thread. The caller can
+/// return without blocking on a stalled driver, but the native worker is never
+/// detached: when it exits, its COM, Media Foundation, and D3D cleanup runs
+/// before the join completes.
+#[cfg(any(windows, test))]
+#[derive(Debug)]
+struct WorkerLifecycle {
+    worker: Mutex<Option<JoinHandle<()>>>,
+    reaping: AtomicBool,
+    finished: AtomicBool,
+}
+
+#[cfg(any(windows, test))]
+impl WorkerLifecycle {
+    fn new(worker: JoinHandle<()>) -> Arc<Self> {
+        Arc::new(Self {
+            worker: Mutex::new(Some(worker)),
+            reaping: AtomicBool::new(false),
+            finished: AtomicBool::new(false),
+        })
+    }
+
+    fn reap_in_background(self: &Arc<Self>) {
+        if self.reaping.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let lifecycle = Arc::clone(self);
+        if thread::Builder::new()
+            .name("nexus-windows-encoder-reaper".to_owned())
+            .spawn(move || lifecycle.join_owned_worker())
+            .is_err()
+        {
+            self.reaping.store(false, Ordering::Release);
+        }
+    }
+
+    fn join_owned_worker(&self) {
+        let worker = self
+            .worker
+            .lock()
+            .expect("worker lifecycle lock poisoned")
+            .take();
+        if let Some(worker) = worker {
+            let _ = worker.join();
+        }
+        self.finished.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    fn reaping(&self) -> bool {
+        self.reaping.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    fn finished(&self) -> bool {
+        self.finished.load(Ordering::Acquire)
+    }
 }
 
 #[cfg(any(windows, test))]
@@ -248,28 +414,10 @@ fn copy_pitched_nv12(
     Ok(nv12)
 }
 
-/// Portable adapter around the platform-owned encoder transform.
+/// Private adapter around the platform-owned encoder transform.
 ///
-/// The trait is exposed only with the explicit `test-support` Cargo feature,
-/// so production consumers cannot replace the Media Foundation backend with a
-/// simulated transform. Native Windows objects remain private to this crate's
-/// worker.
-#[cfg(feature = "test-support")]
-pub trait EncoderTransform: Send {
-    fn configure(&mut self, config: EncoderConfig) -> Result<(), CodecError>;
-
-    fn encode(
-        &mut self,
-        frame: CapturedFrame,
-        force_keyframe: bool,
-    ) -> Result<EncodedFrame, CodecError>;
-
-    fn drain(&mut self) -> Result<(), CodecError>;
-
-    fn shutdown(&mut self);
-}
-
-#[cfg(not(feature = "test-support"))]
+/// Deterministic transforms are available only to this module's unit tests;
+/// dependency builds cannot replace the Media Foundation backend.
 trait EncoderTransform: Send {
     fn configure(&mut self, config: EncoderConfig) -> Result<(), CodecError>;
 
@@ -277,7 +425,7 @@ trait EncoderTransform: Send {
         &mut self,
         frame: CapturedFrame,
         force_keyframe: bool,
-    ) -> Result<EncodedFrame, CodecError>;
+    ) -> Result<Vec<EncodedFrame>, CodecError>;
 
     fn drain(&mut self) -> Result<(), CodecError>;
 
@@ -369,11 +517,8 @@ impl WindowsH264Encoder {
         }
     }
 
-    /// Creates an encoder around a portable test transform.
-    ///
-    /// This test-only seam requires the explicit `test-support` Cargo feature.
-    #[cfg(feature = "test-support")]
-    pub fn with_transform<T>(transform: T) -> Self
+    #[cfg(test)]
+    fn with_transform<T>(transform: T) -> Self
     where
         T: EncoderTransform + 'static,
     {
@@ -388,9 +533,10 @@ impl WindowsH264Encoder {
 #[cfg(windows)]
 mod native {
     use super::{
-        bgra_to_nv12, copy_pitched_nv12, h264_access_unit, output_buffer_spec,
-        output_sample_is_usable, receive_response, AsyncPump, AsyncPumpEvent, EncoderTransform,
-        Nv12Layout,
+        bgra_to_nv12, clear_converter_after_drain, collect_output_polls, copy_pitched_nv12,
+        h264_access_unit, output_buffer_spec, output_requires_retry, output_sample_is_usable,
+        receive_response, AsyncInputScheduler, AsyncPumpEvent, EncoderTransform, Nv12Layout,
+        OutputPoll, WorkerLifecycle,
     };
     use bytes::Bytes;
     use nexus_capture::{CapturedFrame, PixelFormat};
@@ -398,8 +544,11 @@ mod native {
     use std::collections::VecDeque;
     use std::mem::ManuallyDrop;
     use std::ptr;
-    use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
-    use std::thread::{self, JoinHandle};
+    use std::sync::{
+        mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender},
+        Arc,
+    };
+    use std::thread;
     use std::time::{Duration, Instant};
     use windows::core::{Error as WindowsError, Interface, VARIANT};
     use windows::Win32::Foundation::{BOOL, E_FAIL, HMODULE};
@@ -437,14 +586,13 @@ mod native {
         MFT_ENUM_FLAG_SORTANDFILTER, MFT_MESSAGE_COMMAND_DRAIN, MFT_MESSAGE_COMMAND_FLUSH,
         MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM,
         MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
-        MFT_OUTPUT_DATA_BUFFER_NO_SAMPLE, MFT_OUTPUT_STATUS_SAMPLE_READY,
-        MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES,
-        MFT_REGISTER_TYPE_INFO, MF_EVENT_FLAG_NO_WAIT, MF_E_HW_MFT_FAILED_START_STREAMING,
-        MF_E_NO_EVENTS_AVAILABLE, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_LOW_LATENCY,
-        MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE,
-        MF_MT_MAJOR_TYPE, MF_MT_MPEG2_PROFILE, MF_MT_MPEG_SEQUENCE_HEADER,
-        MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC, MF_TRANSFORM_ASYNC_UNLOCK,
-        MF_VERSION,
+        MFT_OUTPUT_DATA_BUFFER_NO_SAMPLE, MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES,
+        MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MF_EVENT_FLAG_NO_WAIT,
+        MF_E_HW_MFT_FAILED_START_STREAMING, MF_E_NO_EVENTS_AVAILABLE,
+        MF_E_TRANSFORM_NEED_MORE_INPUT, MF_LOW_LATENCY, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE,
+        MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MPEG2_PROFILE,
+        MF_MT_MPEG_SEQUENCE_HEADER, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC,
+        MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION,
     };
     use windows::Win32::System::Com::{
         CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_MULTITHREADED,
@@ -455,7 +603,7 @@ mod native {
         Encode(
             CapturedFrame,
             bool,
-            SyncSender<Result<EncodedFrame, CodecError>>,
+            SyncSender<Result<Vec<EncodedFrame>, CodecError>>,
         ),
         Drain(SyncSender<Result<(), CodecError>>),
         Shutdown(SyncSender<()>),
@@ -469,7 +617,7 @@ mod native {
 
     pub(super) struct MediaFoundationTransform {
         command_tx: Option<SyncSender<WorkerCommand>>,
-        worker: Option<JoinHandle<()>>,
+        lifecycle: Arc<WorkerLifecycle>,
     }
 
     impl MediaFoundationTransform {
@@ -480,21 +628,22 @@ mod native {
                 .name("nexus-windows-encoder".to_owned())
                 .spawn(move || worker_main(command_rx, startup_tx))
                 .map_err(|_| CodecError::BackendUnavailable)?;
+            let lifecycle = WorkerLifecycle::new(worker);
 
             match startup_rx.recv_timeout(STARTUP_TIMEOUT) {
                 Ok(Ok(())) => Ok(Self {
                     command_tx: Some(command_tx),
-                    worker: Some(worker),
+                    lifecycle,
                 }),
                 Ok(Err(error)) => {
-                    drop(worker);
+                    lifecycle.reap_in_background();
                     Err(error)
                 }
                 Err(_) => {
                     // A driver can stall during MFStartup or transform activation.
-                    // Never join that worker here: dropping the handle detaches a
-                    // stuck native thread so encoder construction remains bounded.
-                    drop(worker);
+                    // Retain the worker's handle in a reaper so the bounded
+                    // constructor does not detach native COM/MF/D3D ownership.
+                    lifecycle.reap_in_background();
                     Err(CodecError::BackendUnavailable)
                 }
             }
@@ -532,14 +681,7 @@ mod native {
                     let _ = response_rx.recv_timeout(SHUTDOWN_TIMEOUT);
                 }
             }
-            if let Some(worker) = self.worker.take() {
-                // `JoinHandle::join` itself has no timeout. It is called only
-                // after the worker is already finished; a stalled MFT is
-                // detached instead of making Drop hang.
-                if worker.is_finished() {
-                    let _ = worker.join();
-                }
-            }
+            self.lifecycle.reap_in_background();
         }
     }
 
@@ -552,7 +694,7 @@ mod native {
             &mut self,
             frame: CapturedFrame,
             force_keyframe: bool,
-        ) -> Result<EncodedFrame, CodecError> {
+        ) -> Result<Vec<EncodedFrame>, CodecError> {
             self.request(|response| WorkerCommand::Encode(frame, force_keyframe, response))
         }
 
@@ -596,22 +738,32 @@ mod native {
             return;
         }
 
-        while let Ok(command) = command_rx.recv() {
-            match command {
-                WorkerCommand::Configure(config, response) => {
+        loop {
+            match command_rx.recv_timeout(EVENT_POLL_INTERVAL) {
+                Ok(WorkerCommand::Configure(config, response)) => {
                     let _ = response.send(encoder.configure(config));
                 }
-                WorkerCommand::Encode(frame, force_keyframe, response) => {
+                Ok(WorkerCommand::Encode(frame, force_keyframe, response)) => {
                     let _ = response.send(encoder.encode(frame, force_keyframe));
                 }
-                WorkerCommand::Drain(response) => {
+                Ok(WorkerCommand::Drain(response)) => {
                     let _ = response.send(encoder.drain());
                 }
-                WorkerCommand::Shutdown(response) => {
+                Ok(WorkerCommand::Shutdown(response)) => {
                     encoder.shutdown();
                     let _ = response.send(());
                     break;
                 }
+                Err(RecvTimeoutError::Timeout) => {
+                    // Keep pumping asynchronous MFT events while no caller is
+                    // blocked in a command response. Delayed outputs are held
+                    // for the next encode pump; a terminal native error ends
+                    // the worker and causes later requests to fail closed.
+                    if encoder.pump().is_err() {
+                        break;
+                    }
+                }
+                Err(RecvTimeoutError::Disconnected) => break,
             }
         }
         encoder.shutdown();
@@ -642,7 +794,7 @@ mod native {
         transform: Option<IMFTransform>,
         event_generator: Option<IMFMediaEventGenerator>,
         is_async: bool,
-        async_pump: AsyncPump,
+        async_inputs: AsyncInputScheduler<PendingSubmission>,
         config: Option<EncoderConfig>,
         converter: Option<Nv12Converter>,
         sequence_header: Option<Vec<u8>>,
@@ -658,15 +810,15 @@ mod native {
         forced_keyframe: bool,
     }
 
+    struct PendingSubmission {
+        sample: IMFSample,
+        input: PendingInput,
+    }
+
     struct NativeOutput {
         timestamp_hns: Option<i64>,
         keyframe: bool,
         data: Vec<u8>,
-    }
-
-    struct OutputPoll {
-        output: Option<NativeOutput>,
-        more_output: bool,
     }
 
     impl NativeEncoder {
@@ -682,7 +834,7 @@ mod native {
                         transform: Some(transform),
                         event_generator,
                         is_async: false,
-                        async_pump: AsyncPump::new(),
+                        async_inputs: AsyncInputScheduler::new(),
                         config: None,
                         converter: None,
                         sequence_header: None,
@@ -749,7 +901,7 @@ mod native {
             self.converter = Some(Nv12Converter::new(&config));
             self.config = Some(config);
             self.is_async = is_async;
-            self.async_pump = AsyncPump::new();
+            self.async_inputs = AsyncInputScheduler::new();
             self.sequence_header = Some(sequence_header);
             self.pending_inputs.clear();
             self.pending_outputs.clear();
@@ -760,29 +912,15 @@ mod native {
             &mut self,
             frame: CapturedFrame,
             force_keyframe: bool,
-        ) -> Result<EncodedFrame, CodecError> {
+        ) -> Result<Vec<EncodedFrame>, CodecError> {
             let config = self.config.ok_or(CodecError::NotConfigured)?;
-            let transform = self.transform()?.clone();
-            if self.is_async {
-                self.wait_for_input_credit(&config)?;
-            }
-
-            if force_keyframe {
-                force_keyframe_on_transform(&transform)?;
-            }
             let nv12 = self
                 .converter
                 .as_mut()
                 .ok_or(CodecError::NotConfigured)?
                 .convert(&frame)?;
             let input = create_input_sample(&nv12, &frame, &config)?;
-            // SAFETY: The sample owns a complete NV12 buffer and timestamps are
-            // expressed in Media Foundation's 100-nanosecond units.
-            unsafe { transform.ProcessInput(0, &input, 0) }.map_err(map_windows_error)?;
-            if self.is_async && !self.async_pump.take_input_credit() {
-                return Err(CodecError::BackendLost);
-            }
-            self.queue_input(PendingInput {
+            let pending_input = PendingInput {
                 frame_id: frame.frame_id,
                 timestamp_us: frame.timestamp_us,
                 timestamp_hns: frame
@@ -791,54 +929,68 @@ mod native {
                     .and_then(|value| i64::try_from(value).ok())
                     .ok_or(CodecError::InvalidFrame)?,
                 forced_keyframe: force_keyframe,
-            })?;
+            };
 
             if self.is_async {
-                self.wait_for_pending_output(&config)
+                self.async_inputs.enqueue(PendingSubmission {
+                    sample: input,
+                    input: pending_input,
+                })?;
+                self.pump_async(&config)?;
+                Ok(self.take_pending_outputs())
             } else {
+                let transform = self.transform()?.clone();
+                if force_keyframe {
+                    force_keyframe_on_transform(&transform)?;
+                }
+                // SAFETY: The sample owns a complete NV12 buffer and timestamps
+                // are expressed in Media Foundation's 100-nanosecond units.
+                unsafe { transform.ProcessInput(0, &input, 0) }.map_err(map_windows_error)?;
+                self.queue_input(pending_input)?;
                 self.collect_synchronous_output(&config)?;
-                self.pending_outputs
-                    .pop_front()
-                    .ok_or(CodecError::BackendUnavailable)
+                Ok(self.take_pending_outputs())
             }
         }
 
-        fn wait_for_input_credit(&mut self, config: &EncoderConfig) -> Result<(), CodecError> {
-            let deadline = Instant::now() + REQUEST_TIMEOUT;
-            loop {
-                self.poll_async_events(config)?;
-                if self.async_pump.input_credits() != 0 {
-                    return Ok(());
+        fn submit_credited_inputs(&mut self) -> Result<(), CodecError> {
+            let transform = self.transform()?.clone();
+            while let Some(submission) = self.async_inputs.take_ready_input() {
+                if submission.input.forced_keyframe {
+                    force_keyframe_on_transform(&transform)?;
                 }
-                if Instant::now() >= deadline {
-                    return Err(CodecError::BackendLost);
-                }
-                thread::sleep(EVENT_POLL_INTERVAL);
+                // SAFETY: This worker owns the MFT and each queued sample owns
+                // a complete NV12 input buffer. Credits are consumed exactly
+                // once by AsyncInputScheduler before ProcessInput.
+                unsafe { transform.ProcessInput(0, &submission.sample, 0) }
+                    .map_err(map_windows_error)?;
+                self.queue_input(submission.input)?;
             }
+            Ok(())
         }
 
-        fn wait_for_pending_output(
-            &mut self,
-            config: &EncoderConfig,
-        ) -> Result<EncodedFrame, CodecError> {
-            let deadline = Instant::now() + REQUEST_TIMEOUT;
-            loop {
-                if let Some(output) = self.pending_outputs.pop_front() {
-                    return Ok(output);
-                }
-                self.poll_async_events(config)?;
-                if Instant::now() >= deadline {
-                    return Err(CodecError::BackendLost);
-                }
-                thread::sleep(EVENT_POLL_INTERVAL);
+        fn pump(&mut self) -> Result<(), CodecError> {
+            if self.is_async {
+                let config = self.config.ok_or(CodecError::NotConfigured)?;
+                self.pump_async(&config)?;
             }
+            Ok(())
+        }
+
+        fn pump_async(&mut self, config: &EncoderConfig) -> Result<(), CodecError> {
+            self.poll_async_events(config)?;
+            self.submit_credited_inputs()?;
+            self.poll_async_events(config)
+        }
+
+        fn take_pending_outputs(&mut self) -> Vec<EncodedFrame> {
+            self.pending_outputs.drain(..).collect()
         }
 
         fn wait_for_drain_complete(&mut self, config: &EncoderConfig) -> Result<(), CodecError> {
             let deadline = Instant::now() + REQUEST_TIMEOUT;
             loop {
                 self.poll_async_events(config)?;
-                if self.async_pump.take_drain_complete() {
+                if self.async_inputs.take_drain_complete() {
                     return Ok(());
                 }
                 if Instant::now() >= deadline {
@@ -867,34 +1019,28 @@ mod native {
                 status.ok().map_err(|_| classify_hresult(status.0))?;
                 let event_type = unsafe { event.GetType() }.map_err(map_windows_error)?;
                 if event_type == METransformNeedInput.0 as u32 {
-                    self.async_pump.observe(AsyncPumpEvent::NeedInput)?;
+                    self.async_inputs.observe(AsyncPumpEvent::NeedInput)?;
                 } else if event_type == METransformHaveOutput.0 as u32 {
-                    self.async_pump.observe(AsyncPumpEvent::HaveOutput)?;
+                    self.async_inputs.observe(AsyncPumpEvent::HaveOutput)?;
                     self.collect_async_output(config)?;
                 } else if event_type == METransformDrainComplete.0 as u32 {
-                    self.async_pump.observe(AsyncPumpEvent::DrainComplete)?;
+                    self.async_inputs.observe(AsyncPumpEvent::DrainComplete)?;
                 }
             }
         }
 
         fn collect_async_output(&mut self, config: &EncoderConfig) -> Result<(), CodecError> {
-            if !self.async_pump.take_output_event() {
+            if !self.async_inputs.take_output_event() {
                 return Err(CodecError::BackendLost);
             }
             self.collect_synchronous_output(config)
         }
 
         fn collect_synchronous_output(&mut self, config: &EncoderConfig) -> Result<(), CodecError> {
-            for _ in 0..MAX_PENDING_FRAMES {
-                let poll = self.take_output(config)?;
-                if let Some(output) = poll.output {
-                    self.queue_output(output)?;
-                }
-                if !poll.more_output {
-                    return Ok(());
-                }
+            for output in collect_output_polls(|| self.take_output(config))? {
+                self.queue_output(output)?;
             }
-            Err(CodecError::BackendLost)
+            Ok(())
         }
 
         fn queue_input(&mut self, input: PendingInput) -> Result<(), CodecError> {
@@ -933,7 +1079,10 @@ mod native {
             Ok(())
         }
 
-        fn take_output(&self, _config: &EncoderConfig) -> Result<OutputPoll, CodecError> {
+        fn take_output(
+            &self,
+            _config: &EncoderConfig,
+        ) -> Result<OutputPoll<NativeOutput>, CodecError> {
             let transform = self.transform()?;
             let stream_info =
                 unsafe { transform.GetOutputStreamInfo(0) }.map_err(map_windows_error)?;
@@ -974,7 +1123,12 @@ mod native {
             drop(events);
             match result {
                 Ok(()) => {
-                    let more_output = status & MFT_OUTPUT_STATUS_SAMPLE_READY.0 as u32 != 0;
+                    // `status` is `_MFT_PROCESS_OUTPUT_STATUS`, whose current
+                    // flag is NEW_STREAMS; it is not an output-ready flag. The
+                    // per-buffer INCOMPLETE flag is what requires another
+                    // ProcessOutput call.
+                    let _process_output_status = status;
+                    let more_output = output_requires_retry(output.dwStatus);
                     if output.dwStatus & MFT_OUTPUT_DATA_BUFFER_NO_SAMPLE.0 as u32
                         == MFT_OUTPUT_DATA_BUFFER_NO_SAMPLE.0 as u32
                     {
@@ -1044,10 +1198,10 @@ mod native {
                 unsafe { transform.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0) }
                     .map_err(map_windows_error)
             })();
+            let result = clear_converter_after_drain(&mut self.converter, result);
             self.config = None;
-            self.converter.take();
             self.is_async = false;
-            self.async_pump = AsyncPump::new();
+            self.async_inputs = AsyncInputScheduler::new();
             self.sequence_header = None;
             self.pending_inputs.clear();
             self.pending_outputs.clear();
@@ -1575,7 +1729,7 @@ impl VideoEncoder for WindowsH264Encoder {
         Ok(())
     }
 
-    fn encode(&mut self, frame: CapturedFrame) -> Result<EncodedFrame, CodecError> {
+    fn encode(&mut self, frame: CapturedFrame) -> Result<Vec<EncodedFrame>, CodecError> {
         let config = self.config.ok_or(CodecError::NotConfigured)?;
         if frame.width != config.width || frame.height != config.height {
             return Err(CodecError::FrameDimensionsMismatch);
@@ -1625,8 +1779,210 @@ impl Drop for WindowsH264Encoder {
 mod tests {
     use super::*;
     use bytes::Bytes;
-    use std::sync::mpsc::sync_channel;
-    use std::time::Duration;
+    use std::sync::{mpsc::sync_channel, Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum TransformCall {
+        Configure(EncoderConfig),
+        Encode { frame_id: u64, force_keyframe: bool },
+        Drain,
+        Shutdown,
+    }
+
+    struct RecordingTransform {
+        calls: Arc<Mutex<Vec<TransformCall>>>,
+        output_batches: VecDeque<Vec<EncodedFrame>>,
+        fail_configure_call: Option<usize>,
+        configure_count: usize,
+    }
+
+    impl EncoderTransform for RecordingTransform {
+        fn configure(&mut self, config: EncoderConfig) -> Result<(), CodecError> {
+            self.configure_count += 1;
+            self.calls
+                .lock()
+                .unwrap()
+                .push(TransformCall::Configure(config));
+            if self.fail_configure_call == Some(self.configure_count) {
+                return Err(CodecError::BackendLost);
+            }
+            Ok(())
+        }
+
+        fn encode(
+            &mut self,
+            frame: CapturedFrame,
+            force_keyframe: bool,
+        ) -> Result<Vec<EncodedFrame>, CodecError> {
+            self.calls.lock().unwrap().push(TransformCall::Encode {
+                frame_id: frame.frame_id,
+                force_keyframe,
+            });
+            Ok(self.output_batches.pop_front().unwrap_or_else(|| {
+                vec![EncodedFrame {
+                    frame_id: frame.frame_id,
+                    timestamp_us: frame.timestamp_us,
+                    keyframe: force_keyframe,
+                    data: Bytes::from_static(&[0, 0, 0, 1, 0x65]),
+                }]
+            }))
+        }
+
+        fn drain(&mut self) -> Result<(), CodecError> {
+            self.calls.lock().unwrap().push(TransformCall::Drain);
+            Ok(())
+        }
+
+        fn shutdown(&mut self) {
+            self.calls.lock().unwrap().push(TransformCall::Shutdown);
+        }
+    }
+
+    fn config(width: u32, height: u32, bitrate_bps: u32) -> EncoderConfig {
+        EncoderConfig {
+            codec: nexus_codec::CodecKind::H264,
+            width,
+            height,
+            max_fps: 30,
+            bitrate_bps,
+        }
+    }
+
+    fn frame(frame_id: u64, width: u32, height: u32) -> CapturedFrame {
+        CapturedFrame {
+            frame_id,
+            timestamp_us: frame_id * 33_333,
+            width,
+            height,
+            format: PixelFormat::Bgra8,
+            data: Bytes::from(vec![0x80; (width * height * 4) as usize]),
+        }
+    }
+
+    fn encoder(
+        output_batches: VecDeque<Vec<EncodedFrame>>,
+        fail_configure_call: Option<usize>,
+    ) -> (WindowsH264Encoder, Arc<Mutex<Vec<TransformCall>>>) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let transform = RecordingTransform {
+            calls: Arc::clone(&calls),
+            output_batches,
+            fail_configure_call,
+            configure_count: 0,
+        };
+        (WindowsH264Encoder::with_transform(transform), calls)
+    }
+
+    #[test]
+    fn private_state_machine_rejects_invalid_configuration_before_transform_calls() {
+        let (mut encoder, calls) = encoder(VecDeque::new(), None);
+
+        assert_eq!(
+            encoder.configure(config(0, 64, 1_000_000)),
+            Err(CodecError::InvalidDimensions)
+        );
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn private_state_machine_returns_no_output_until_the_transform_has_one() {
+        let delayed = EncodedFrame {
+            frame_id: 1,
+            timestamp_us: 33_333,
+            keyframe: true,
+            data: Bytes::from_static(&[0, 0, 0, 1, 0x65]),
+        };
+        let (mut encoder, calls) =
+            encoder(VecDeque::from([Vec::new(), vec![delayed.clone()]]), None);
+        encoder.configure(config(64, 64, 1_000_000)).unwrap();
+
+        assert!(encoder.encode(frame(1, 64, 64)).unwrap().is_empty());
+        assert_eq!(encoder.encode(frame(2, 64, 64)).unwrap(), vec![delayed]);
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &[
+                TransformCall::Configure(config(64, 64, 1_000_000)),
+                TransformCall::Encode {
+                    frame_id: 1,
+                    force_keyframe: true,
+                },
+                TransformCall::Encode {
+                    frame_id: 2,
+                    force_keyframe: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn private_state_machine_dimension_reconfiguration_drains_and_forces_keyframe() {
+        let (mut encoder, calls) = encoder(VecDeque::new(), None);
+        encoder.configure(config(64, 64, 1_000_000)).unwrap();
+        encoder.encode(frame(1, 64, 64)).unwrap();
+
+        encoder.reconfigure(config(128, 64, 2_000_000)).unwrap();
+        let outputs = encoder.encode(frame(2, 128, 64)).unwrap();
+
+        assert_eq!(outputs.len(), 1);
+        assert!(outputs[0].keyframe);
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &[
+                TransformCall::Configure(config(64, 64, 1_000_000)),
+                TransformCall::Encode {
+                    frame_id: 1,
+                    force_keyframe: true,
+                },
+                TransformCall::Drain,
+                TransformCall::Configure(config(128, 64, 2_000_000)),
+                TransformCall::Encode {
+                    frame_id: 2,
+                    force_keyframe: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn private_state_machine_failed_reconfiguration_leaves_encoder_unconfigured() {
+        let (mut encoder, calls) = encoder(VecDeque::new(), Some(2));
+        encoder.configure(config(64, 64, 1_000_000)).unwrap();
+
+        assert_eq!(
+            encoder.reconfigure(config(128, 64, 2_000_000)),
+            Err(CodecError::BackendLost)
+        );
+        assert_eq!(
+            encoder.encode(frame(1, 64, 64)),
+            Err(CodecError::NotConfigured)
+        );
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &[
+                TransformCall::Configure(config(64, 64, 1_000_000)),
+                TransformCall::Drain,
+                TransformCall::Configure(config(128, 64, 2_000_000)),
+            ]
+        );
+    }
+
+    #[test]
+    fn private_state_machine_drop_drains_before_transform_shutdown() {
+        let (mut encoder, calls) = encoder(VecDeque::new(), None);
+        encoder.configure(config(64, 64, 1_000_000)).unwrap();
+
+        drop(encoder);
+
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &[
+                TransformCall::Configure(config(64, 64, 1_000_000)),
+                TransformCall::Drain,
+                TransformCall::Shutdown,
+            ]
+        );
+    }
 
     #[test]
     fn cpu_nv12_conversion_uses_checked_planes_and_two_by_two_chroma() {
@@ -1664,13 +2020,40 @@ mod tests {
     }
 
     #[test]
-    fn output_buffer_spec_preserves_mft_size_and_alignment() {
+    fn async_input_scheduler_submits_multiple_credited_inputs_before_any_output() {
+        let mut scheduler = AsyncInputScheduler::new();
+        scheduler.enqueue(1_u64).unwrap();
+        scheduler.enqueue(2_u64).unwrap();
+
+        scheduler.observe(AsyncPumpEvent::NeedInput).unwrap();
+        scheduler.observe(AsyncPumpEvent::NeedInput).unwrap();
+
+        assert_eq!(scheduler.take_ready_input(), Some(1));
+        assert_eq!(scheduler.take_ready_input(), Some(2));
+        assert_eq!(scheduler.take_ready_input(), None);
+
+        scheduler.observe(AsyncPumpEvent::HaveOutput).unwrap();
+        assert!(scheduler.take_output_event());
+        scheduler.observe(AsyncPumpEvent::DrainComplete).unwrap();
+        assert!(scheduler.take_drain_complete());
+    }
+
+    #[test]
+    fn output_buffer_spec_converts_mft_alignment_to_a_mask() {
         assert_eq!(
             output_buffer_spec(4_096, 64),
             Ok(OutputBufferSpec {
                 capacity: 4_096,
-                alignment: Some(64),
+                alignment: Some(63),
             })
+        );
+    }
+
+    #[test]
+    fn output_buffer_spec_rejects_a_non_power_of_two_alignment() {
+        assert_eq!(
+            output_buffer_spec(4_096, 48),
+            Err(CodecError::BackendUnavailable)
         );
     }
 
@@ -1679,6 +2062,28 @@ mod tests {
         assert_eq!(output_sample_is_usable(0x300, Some(5)), None);
         assert_eq!(output_sample_is_usable(0, Some(0)), None);
         assert_eq!(output_sample_is_usable(0, Some(5)), Some(5));
+    }
+
+    #[test]
+    fn incomplete_output_status_requests_another_process_output_call() {
+        assert!(output_requires_retry(0x0100_0000));
+        assert!(!output_requires_retry(0));
+    }
+
+    #[test]
+    fn incomplete_output_retries_until_the_buffer_is_complete() {
+        let mut statuses = VecDeque::from([0x0100_0000, 0]);
+
+        let outputs = collect_output_polls(|| {
+            let status = statuses.pop_front().unwrap();
+            Ok(OutputPoll {
+                output: Some(status),
+                more_output: output_requires_retry(status),
+            })
+        })
+        .unwrap();
+
+        assert_eq!(outputs, vec![0x0100_0000, 0]);
     }
 
     #[test]
@@ -1726,6 +2131,42 @@ mod tests {
         assert_eq!(
             receive_response(&receiver, Duration::ZERO),
             Err(CodecError::BackendLost)
+        );
+    }
+
+    #[test]
+    fn failed_drain_releases_converter_before_the_apartment_can_drop() {
+        let mut converter = Some("d3d converter");
+
+        assert_eq!(
+            clear_converter_after_drain(&mut converter, Err(CodecError::BackendLost)),
+            Err(CodecError::BackendLost)
+        );
+        assert_eq!(converter, None);
+    }
+
+    #[test]
+    fn owned_worker_reaper_keeps_the_native_join_handle_until_cleanup() {
+        let (release_tx, release_rx) = sync_channel::<()>(1);
+        let (finished_tx, finished_rx) = sync_channel::<()>(1);
+        let lifecycle = WorkerLifecycle::new(std::thread::spawn(move || {
+            let _ = release_rx.recv();
+            let _ = finished_tx.send(());
+        }));
+
+        lifecycle.reap_in_background();
+        assert!(lifecycle.reaping());
+        assert!(!lifecycle.finished());
+
+        release_tx.send(()).unwrap();
+        finished_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !lifecycle.finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            lifecycle.finished(),
+            "the worker join handle was not reaped after the worker exited"
         );
     }
 }

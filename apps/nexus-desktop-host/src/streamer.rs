@@ -35,7 +35,6 @@ pub struct HostVideoStreamer<C: CaptureSource> {
     queue: LatestFrameQueue<CapturedFrame>,
     aead_key: [u8; 32],
     nonce_seq: NonceSequence,
-    frame_id_counter: u64,
     codec_config_id: u32,
     stream_id: u8,
 }
@@ -65,7 +64,6 @@ impl<C: CaptureSource> HostVideoStreamer<C> {
             queue: LatestFrameQueue::new(),
             aead_key,
             nonce_seq: NonceSequence::new(1),
-            frame_id_counter: 1,
             codec_config_id: 1,
             stream_id: 1,
         })
@@ -85,48 +83,44 @@ impl<C: CaptureSource> HostVideoStreamer<C> {
             return Ok(Vec::new());
         };
 
-        let frame_id = self.frame_id_counter;
-        self.frame_id_counter = self.frame_id_counter.wrapping_add(1);
-
         // 3. Encode video frame
-        let timestamp_us = latest.timestamp_us;
-        let encoded = self.encoder.encode(latest)?;
+        let encoded_frames = self.encoder.encode(latest)?;
 
-        // 4. Build base header
-        let mut flags_val = 0u8;
-        if encoded.keyframe {
-            flags_val |= flags::KEYFRAME;
-        }
+        let mut datagrams = Vec::new();
+        for encoded in encoded_frames {
+            // 4. Build a header from the capture metadata matched to this
+            // access unit, which can belong to an earlier pipelined input.
+            let mut flags_val = 0u8;
+            if encoded.keyframe {
+                flags_val |= flags::KEYFRAME;
+            }
+            let base_header = VideoPacketHeader {
+                version: 1,
+                flags: flags_val,
+                stream_id: self.stream_id as u16,
+                frame_id: encoded.frame_id as u32,
+                packet_id: 0,
+                packet_count: 1,
+                payload_len: 0,
+                timestamp_us: encoded.timestamp_us,
+            };
 
-        let base_header = VideoPacketHeader {
-            version: 1,
-            flags: flags_val,
-            stream_id: self.stream_id as u16,
-            frame_id: (frame_id as u32),
-            packet_id: 0,
-            packet_count: 1,
-            payload_len: 0,
-            timestamp_us,
-        };
+            // 5. Seal encoded frame with ChaCha20-Poly1305 AEAD (ADR-025)
+            let encrypted_frame = seal_video_frame(
+                &self.aead_key,
+                &mut self.nonce_seq,
+                &base_header,
+                self.codec_config_id,
+                &encoded.data,
+            )?;
 
-        // 5. Seal encoded frame with ChaCha20-Poly1305 AEAD (ADR-025)
-        let encrypted_frame = seal_video_frame(
-            &self.aead_key,
-            &mut self.nonce_seq,
-            &base_header,
-            self.codec_config_id,
-            &encoded.data,
-        )?;
+            // 6. Packetize encrypted payload into datagram chunks.
+            let packets = packetize_video_frame(&base_header, &encrypted_frame.ciphertext, 1200)?;
 
-        // 6. Packetize encrypted payload into datagram chunks
-        let chunk_size = 1200; // Safe MTU for QUIC datagrams
-        let packets = packetize_video_frame(&base_header, &encrypted_frame.ciphertext, chunk_size)?;
-
-        // 7. Encode each packet into wire format (VideoPacketHeader + payload)
-        let mut datagrams = Vec::with_capacity(packets.len());
-        for (header, payload) in packets {
-            let encoded_dg = encode_video_datagram(&header, &payload)?;
-            datagrams.push(encoded_dg);
+            // 7. Encode each packet into wire format (VideoPacketHeader + payload).
+            for (header, payload) in packets {
+                datagrams.push(encode_video_datagram(&header, &payload)?);
+            }
         }
 
         Ok(datagrams)

@@ -19,9 +19,25 @@ fn media_foundation_encodes_a_deterministic_bgra_frame() {
         })
         .expect("H.264 encoder must configure");
     let pixels: Vec<u8> = (0_u8..=255).cycle().take(64 * 64 * 4).collect();
-    let frame = CapturedFrame::new_bgra(1, 33_333, 64, 64, Bytes::from(pixels)).unwrap();
-
-    let output = encoder.encode(frame).expect("BGRA frame must encode");
+    let mut outputs = Vec::new();
+    for frame_id in 1..=8 {
+        let frame = CapturedFrame::new_bgra(
+            frame_id,
+            frame_id * 33_333,
+            64,
+            64,
+            Bytes::from(pixels.clone()),
+        )
+        .unwrap();
+        outputs.extend(encoder.encode(frame).expect("BGRA frame must encode"));
+        if !outputs.is_empty() {
+            break;
+        }
+    }
+    let output = outputs
+        .into_iter()
+        .next()
+        .expect("the MFT must emit an H.264 access unit after bounded pumping");
 
     assert!(output.keyframe, "the first output must be a keyframe");
     assert!(
