@@ -3,11 +3,15 @@
 //! Windows API types stay in private `cfg(windows)` implementation modules.
 
 mod capture;
+mod codec;
 mod cursor;
 mod error;
 mod input;
 
 pub use capture::{CaptureApi, CaptureConfig, CaptureState, WindowsCaptureSource};
+#[doc(hidden)]
+pub use codec::EncoderTransform;
+pub use codec::WindowsH264Encoder;
 pub use cursor::CursorSnapshot;
 pub use error::{BackendError, BackendErrorKind, BackendResult};
 pub use input::{InputInjector, MonitorBounds, SystemInputApi};

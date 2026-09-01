@@ -47,6 +47,12 @@ pub enum CodecError {
     FrameDimensionsMismatch,
     #[error("encoder is not configured")]
     NotConfigured,
+    #[error("encoder input frame is malformed or unsupported")]
+    InvalidFrame,
+    #[error("encoder backend is unavailable")]
+    BackendUnavailable,
+    #[error("encoder backend was lost")]
+    BackendLost,
 }
 
 pub trait VideoEncoder: Send {
