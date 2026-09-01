@@ -7,9 +7,7 @@ mod cursor;
 mod error;
 mod input;
 
-pub use capture::{
-    CaptureApi, CaptureConfig, CaptureFactory, CaptureSession, CaptureState, WindowsCaptureSource,
-};
+pub use capture::{CaptureApi, CaptureConfig, CaptureState, WindowsCaptureSource};
 pub use cursor::CursorSnapshot;
 pub use error::{BackendError, BackendErrorKind, BackendResult};
 pub use input::{InputInjector, MonitorBounds, SystemInputApi};
