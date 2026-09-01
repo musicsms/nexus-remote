@@ -6,6 +6,43 @@ use nexus_protocol::VideoPacketHeader;
 use nexus_transport::video::{encode_video_datagram, packetize_video_frame, seal_video_frame};
 use thiserror::Error;
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use nexus_capture::SyntheticCaptureSource;
+    use nexus_codec::{CodecError, EncodedFrame};
+    use nexus_transport::video::decode_video_datagram;
+
+    #[test]
+    fn packet_headers_use_encoded_frame_metadata() {
+        let mut streamer =
+            HostVideoStreamer::new(SyntheticCaptureSource::new(2, 2, 30), [9; 32], 2, 2).unwrap();
+        let encoded = EncodedFrame {
+            frame_id: 77,
+            timestamp_us: 123_456,
+            keyframe: false,
+            data: Bytes::from_static(b"encoded"),
+        };
+
+        let datagrams = streamer.packetize_encoded_frame(encoded).unwrap();
+        let (header, _) = decode_video_datagram(&datagrams[0]).unwrap();
+        assert_eq!(header.frame_id, 77);
+        assert_eq!(header.timestamp_us, 123_456);
+    }
+
+    #[test]
+    fn output_pending_is_non_fatal_and_emits_no_packets() {
+        let mut streamer =
+            HostVideoStreamer::new(SyntheticCaptureSource::new(2, 2, 30), [9; 32], 2, 2).unwrap();
+
+        let packets = streamer
+            .packetize_encode_result(Err(CodecError::OutputPending))
+            .unwrap();
+        assert!(packets.is_empty());
+    }
+}
+
 /// Errors arising during host video streaming pipeline.
 #[derive(Debug, Error)]
 pub enum StreamerError {
@@ -35,7 +72,6 @@ pub struct HostVideoStreamer<C: CaptureSource> {
     queue: LatestFrameQueue<CapturedFrame>,
     aead_key: [u8; 32],
     nonce_seq: NonceSequence,
-    frame_id_counter: u64,
     codec_config_id: u32,
     stream_id: u8,
 }
@@ -65,7 +101,6 @@ impl<C: CaptureSource> HostVideoStreamer<C> {
             queue: LatestFrameQueue::new(),
             aead_key,
             nonce_seq: NonceSequence::new(1),
-            frame_id_counter: 1,
             codec_config_id: 1,
             stream_id: 1,
         })
@@ -85,13 +120,30 @@ impl<C: CaptureSource> HostVideoStreamer<C> {
             return Ok(Vec::new());
         };
 
-        let frame_id = self.frame_id_counter;
-        self.frame_id_counter = self.frame_id_counter.wrapping_add(1);
-
         // 3. Encode video frame
-        let timestamp_us = latest.timestamp_us;
-        let encoded = self.encoder.encode(latest)?;
+        let encoded = self.encoder.encode(latest);
+        self.packetize_encode_result(encoded)
+    }
 
+    fn packetize_encode_result(
+        &mut self,
+        encoded: Result<nexus_codec::EncodedFrame, nexus_codec::CodecError>,
+    ) -> Result<Vec<Vec<u8>>, StreamerError> {
+        let encoded = match encoded {
+            Ok(encoded) => encoded,
+            // An asynchronous hardware encoder may accept an input before its
+            // output is available. Keep the worker alive and wait for the next
+            // pump/encode call to retrieve it.
+            Err(nexus_codec::CodecError::OutputPending) => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        self.packetize_encoded_frame(encoded)
+    }
+
+    fn packetize_encoded_frame(
+        &mut self,
+        encoded: nexus_codec::EncodedFrame,
+    ) -> Result<Vec<Vec<u8>>, StreamerError> {
         // 4. Build base header
         let mut flags_val = 0u8;
         if encoded.keyframe {
@@ -102,11 +154,11 @@ impl<C: CaptureSource> HostVideoStreamer<C> {
             version: 1,
             flags: flags_val,
             stream_id: self.stream_id as u16,
-            frame_id: frame_id as u32,
+            frame_id: encoded.frame_id as u32,
             packet_id: 0,
             packet_count: 1,
             payload_len: 0,
-            timestamp_us,
+            timestamp_us: encoded.timestamp_us,
         };
 
         // 5. Seal encoded frame with ChaCha20-Poly1305 AEAD (ADR-025)
