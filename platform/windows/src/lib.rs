@@ -9,7 +9,8 @@ mod error;
 mod input;
 
 pub use capture::{CaptureApi, CaptureConfig, CaptureState, WindowsCaptureSource};
-#[doc(hidden)]
+#[cfg(feature = "test-support")]
+#[doc = "Deterministic encoder adapter enabled only by `test-support`."]
 pub use codec::EncoderTransform;
 pub use codec::WindowsH264Encoder;
 pub use cursor::CursorSnapshot;

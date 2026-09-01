@@ -1,3 +1,5 @@
+#![cfg(feature = "test-support")]
+
 use bytes::Bytes;
 use nexus_capture::{CapturedFrame, PixelFormat};
 use nexus_codec::{CodecError, CodecKind, EncodedFrame, EncoderConfig, VideoEncoder};

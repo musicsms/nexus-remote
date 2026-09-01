@@ -7,6 +7,11 @@ license.workspace = true
 [lib]
 path = "src/lib.rs"
 
+[features]
+# Explicit opt-in for deterministic adapters used by this crate's contract
+# tests. Production consumers cannot construct a simulated encoder by default.
+test-support = []
+
 [dependencies]
 bytes.workspace = true
 nexus-capture.workspace = true

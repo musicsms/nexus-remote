@@ -1,12 +1,276 @@
 use nexus_capture::{CapturedFrame, PixelFormat};
 use nexus_codec::{CodecError, EncodedFrame, EncoderConfig, VideoEncoder};
+#[cfg(any(windows, test))]
+use std::sync::mpsc::Receiver;
+#[cfg(any(windows, test))]
+use std::time::Duration;
+
+#[cfg(any(windows, test))]
+const MAX_ASYNC_INPUT_CREDITS: usize = 8;
+#[cfg(any(windows, test))]
+const MAX_PENDING_OUTPUT_EVENTS: usize = 8;
+#[cfg(any(windows, test))]
+const MFT_OUTPUT_NO_SAMPLE_STATUS: u32 = 0x300;
+
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AsyncPumpEvent {
+    NeedInput,
+    HaveOutput,
+    DrainComplete,
+}
+
+/// Bounded accounting for the asynchronous MFT event protocol.
+///
+/// Every `METransformNeedInput` event is one independent input credit.  A
+/// Boolean loses credits when a hardware MFT pipelines multiple requests,
+/// which can leave an idle hardware lane waiting forever.  Output events are
+/// accounted separately because an MFT can produce zero, one, or several
+/// samples between input requests.
+#[cfg(any(windows, test))]
+#[derive(Debug, Default)]
+struct AsyncPump {
+    input_credits: usize,
+    pending_output_events: usize,
+    drain_complete: bool,
+}
+
+#[cfg(any(windows, test))]
+impl AsyncPump {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn observe(&mut self, event: AsyncPumpEvent) -> Result<(), CodecError> {
+        match event {
+            AsyncPumpEvent::NeedInput => {
+                self.input_credits = self
+                    .input_credits
+                    .checked_add(1)
+                    .filter(|credits| *credits <= MAX_ASYNC_INPUT_CREDITS)
+                    .ok_or(CodecError::BackendLost)?;
+            }
+            AsyncPumpEvent::HaveOutput => {
+                self.pending_output_events = self
+                    .pending_output_events
+                    .checked_add(1)
+                    .filter(|events| *events <= MAX_PENDING_OUTPUT_EVENTS)
+                    .ok_or(CodecError::BackendLost)?;
+            }
+            AsyncPumpEvent::DrainComplete => self.drain_complete = true,
+        }
+        Ok(())
+    }
+
+    fn input_credits(&self) -> usize {
+        self.input_credits
+    }
+
+    #[cfg(test)]
+    fn pending_output_events(&self) -> usize {
+        self.pending_output_events
+    }
+
+    fn take_input_credit(&mut self) -> bool {
+        match self.input_credits.checked_sub(1) {
+            Some(credits) => {
+                self.input_credits = credits;
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn take_output_event(&mut self) -> bool {
+        match self.pending_output_events.checked_sub(1) {
+            Some(events) => {
+                self.pending_output_events = events;
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn take_drain_complete(&mut self) -> bool {
+        std::mem::take(&mut self.drain_complete)
+    }
+}
+
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OutputBufferSpec {
+    capacity: u32,
+    alignment: Option<u32>,
+}
+
+#[cfg(any(windows, test))]
+fn output_buffer_spec(cb_size: u32, cb_alignment: u32) -> Result<OutputBufferSpec, CodecError> {
+    if cb_size == 0 {
+        return Err(CodecError::BackendUnavailable);
+    }
+    Ok(OutputBufferSpec {
+        capacity: cb_size,
+        alignment: (cb_alignment != 0).then_some(cb_alignment),
+    })
+}
+
+#[cfg(any(windows, test))]
+fn output_sample_is_usable(output_status: u32, sample_len: Option<usize>) -> Option<usize> {
+    if output_status & MFT_OUTPUT_NO_SAMPLE_STATUS == MFT_OUTPUT_NO_SAMPLE_STATUS {
+        return None;
+    }
+    sample_len.filter(|length| *length != 0)
+}
+
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Copy)]
+struct Nv12Layout {
+    width: usize,
+    height: usize,
+    bgra_stride: usize,
+    bgra_len: usize,
+    y_len: usize,
+    output_len: usize,
+}
+
+#[cfg(any(windows, test))]
+impl Nv12Layout {
+    /// Validates every multiplication that bounds the CPU and mapped-D3D
+    /// copies.  Once constructed, `row < height` and `column < width` make
+    /// each `row * stride + column` offset strictly less than its checked
+    /// allocation length.
+    fn from_bgra_dimensions(width: u32, height: u32) -> Result<Self, CodecError> {
+        if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
+            return Err(CodecError::InvalidDimensions);
+        }
+        let width = usize::try_from(width).map_err(|_| CodecError::InvalidFrame)?;
+        let height = usize::try_from(height).map_err(|_| CodecError::InvalidFrame)?;
+        let bgra_stride = width.checked_mul(4).ok_or(CodecError::InvalidFrame)?;
+        let bgra_len = bgra_stride
+            .checked_mul(height)
+            .ok_or(CodecError::InvalidFrame)?;
+        let y_len = width.checked_mul(height).ok_or(CodecError::InvalidFrame)?;
+        let output_len = y_len
+            .checked_add(y_len / 2)
+            .ok_or(CodecError::InvalidFrame)?;
+        Ok(Self {
+            width,
+            height,
+            bgra_stride,
+            bgra_len,
+            y_len,
+            output_len,
+        })
+    }
+
+    fn bgra_offset(self, row: usize, column: usize) -> usize {
+        debug_assert!(row < self.height);
+        debug_assert!(column < self.width);
+        row * self.bgra_stride + column * 4
+    }
+
+    fn nv12_offset(self, row: usize, column: usize) -> usize {
+        debug_assert!(row < self.height);
+        debug_assert!(column < self.width);
+        row * self.width + column
+    }
+}
+
+#[cfg(any(windows, test))]
+fn receive_response<T>(
+    receiver: &Receiver<Result<T, CodecError>>,
+    timeout: Duration,
+) -> Result<T, CodecError> {
+    receiver
+        .recv_timeout(timeout)
+        .unwrap_or(Err(CodecError::BackendLost))
+}
+
+#[cfg(any(windows, test))]
+fn h264_access_unit(
+    sequence_header: &[u8],
+    access_unit: &[u8],
+    keyframe: bool,
+) -> Result<Vec<u8>, CodecError> {
+    if access_unit.is_empty() {
+        return Err(CodecError::BackendUnavailable);
+    }
+    if !keyframe {
+        return Ok(access_unit.to_vec());
+    }
+    if sequence_header.is_empty() {
+        return Err(CodecError::BackendUnavailable);
+    }
+    let capacity = sequence_header
+        .len()
+        .checked_add(access_unit.len())
+        .ok_or(CodecError::BackendUnavailable)?;
+    let mut complete_access_unit = Vec::with_capacity(capacity);
+    complete_access_unit.extend_from_slice(sequence_header);
+    complete_access_unit.extend_from_slice(access_unit);
+    Ok(complete_access_unit)
+}
+
+#[cfg(any(windows, test))]
+fn copy_pitched_nv12(
+    mapped: &[u8],
+    pitch: usize,
+    layout: Nv12Layout,
+) -> Result<Vec<u8>, CodecError> {
+    if pitch < layout.width {
+        return Err(CodecError::BackendLost);
+    }
+    let mapped_rows = layout
+        .height
+        .checked_add(layout.height / 2)
+        .ok_or(CodecError::BackendLost)?;
+    let required_len = pitch
+        .checked_mul(mapped_rows)
+        .ok_or(CodecError::BackendLost)?;
+    if mapped.len() < required_len {
+        return Err(CodecError::BackendLost);
+    }
+
+    let mut nv12 = vec![0_u8; layout.output_len];
+    for row in 0..layout.height {
+        let source_start = row * pitch;
+        let destination_start = row * layout.width;
+        nv12[destination_start..destination_start + layout.width]
+            .copy_from_slice(&mapped[source_start..source_start + layout.width]);
+    }
+    let uv_source_start = layout.height * pitch;
+    for row in 0..layout.height / 2 {
+        let source_start = uv_source_start + row * pitch;
+        let destination_start = layout.y_len + row * layout.width;
+        nv12[destination_start..destination_start + layout.width]
+            .copy_from_slice(&mapped[source_start..source_start + layout.width]);
+    }
+    Ok(nv12)
+}
 
 /// Portable adapter around the platform-owned encoder transform.
 ///
-/// This trait is public only to support deterministic contract tests. Native
-/// Windows objects remain private to this crate's Media Foundation worker.
-#[doc(hidden)]
+/// The trait is exposed only with the explicit `test-support` Cargo feature,
+/// so production consumers cannot replace the Media Foundation backend with a
+/// simulated transform. Native Windows objects remain private to this crate's
+/// worker.
+#[cfg(feature = "test-support")]
 pub trait EncoderTransform: Send {
+    fn configure(&mut self, config: EncoderConfig) -> Result<(), CodecError>;
+
+    fn encode(
+        &mut self,
+        frame: CapturedFrame,
+        force_keyframe: bool,
+    ) -> Result<EncodedFrame, CodecError>;
+
+    fn drain(&mut self) -> Result<(), CodecError>;
+
+    fn shutdown(&mut self);
+}
+
+#[cfg(not(feature = "test-support"))]
+trait EncoderTransform: Send {
     fn configure(&mut self, config: EncoderConfig) -> Result<(), CodecError>;
 
     fn encode(
@@ -22,42 +286,34 @@ pub trait EncoderTransform: Send {
 
 #[cfg(any(windows, test))]
 fn bgra_to_nv12(frame: &CapturedFrame) -> Result<Vec<u8>, CodecError> {
-    if frame.width == 0
-        || frame.height == 0
-        || !frame.width.is_multiple_of(2)
-        || !frame.height.is_multiple_of(2)
-    {
-        return Err(CodecError::InvalidDimensions);
-    }
     if frame.format != PixelFormat::Bgra8 || frame.validate().is_err() {
         return Err(CodecError::InvalidFrame);
     }
 
-    let width = frame.width as usize;
-    let height = frame.height as usize;
-    let y_len = width.checked_mul(height).ok_or(CodecError::InvalidFrame)?;
-    let output_len = y_len
-        .checked_add(y_len / 2)
-        .ok_or(CodecError::InvalidFrame)?;
-    let mut nv12 = vec![0_u8; output_len];
+    let layout = Nv12Layout::from_bgra_dimensions(frame.width, frame.height)?;
+    if frame.data.len() != layout.bgra_len {
+        return Err(CodecError::InvalidFrame);
+    }
+    let mut nv12 = vec![0_u8; layout.output_len];
 
-    for row in 0..height {
-        for column in 0..width {
-            let source = (row * width + column) * 4;
+    for row in 0..layout.height {
+        for column in 0..layout.width {
+            let source = layout.bgra_offset(row, column);
             let b = i32::from(frame.data[source]);
             let g = i32::from(frame.data[source + 1]);
             let r = i32::from(frame.data[source + 2]);
-            nv12[row * width + column] = clamp_byte(((66 * r + 129 * g + 25 * b + 128) >> 8) + 16);
+            nv12[layout.nv12_offset(row, column)] =
+                clamp_byte(((66 * r + 129 * g + 25 * b + 128) >> 8) + 16);
         }
     }
 
-    for row in (0..height).step_by(2) {
-        for column in (0..width).step_by(2) {
+    for row in (0..layout.height).step_by(2) {
+        for column in (0..layout.width).step_by(2) {
             let mut u_sum = 0_i32;
             let mut v_sum = 0_i32;
             for row_offset in 0..2 {
                 for column_offset in 0..2 {
-                    let source = ((row + row_offset) * width + column + column_offset) * 4;
+                    let source = layout.bgra_offset(row + row_offset, column + column_offset);
                     let b = i32::from(frame.data[source]);
                     let g = i32::from(frame.data[source + 1]);
                     let r = i32::from(frame.data[source + 2]);
@@ -65,7 +321,7 @@ fn bgra_to_nv12(frame: &CapturedFrame) -> Result<Vec<u8>, CodecError> {
                     v_sum += ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
                 }
             }
-            let destination = y_len + (row / 2) * width + column;
+            let destination = layout.y_len + (row / 2) * layout.width + column;
             nv12[destination] = clamp_byte(u_sum / 4);
             nv12[destination + 1] = clamp_byte(v_sum / 4);
         }
@@ -101,9 +357,11 @@ impl WindowsH264Encoder {
     pub fn new() -> Result<Self, CodecError> {
         #[cfg(windows)]
         {
-            Ok(Self::with_transform(
-                native::MediaFoundationTransform::start()?,
-            ))
+            Ok(Self {
+                config: None,
+                transform: Box::new(native::MediaFoundationTransform::start()?),
+                force_next_keyframe: false,
+            })
         }
         #[cfg(not(windows))]
         {
@@ -111,10 +369,10 @@ impl WindowsH264Encoder {
         }
     }
 
-    /// Creates an encoder around a portable transform adapter.
+    /// Creates an encoder around a portable test transform.
     ///
-    /// This constructor is public only to support deterministic contract tests.
-    #[doc(hidden)]
+    /// This test-only seam requires the explicit `test-support` Cargo feature.
+    #[cfg(feature = "test-support")]
     pub fn with_transform<T>(transform: T) -> Self
     where
         T: EncoderTransform + 'static,
@@ -129,14 +387,20 @@ impl WindowsH264Encoder {
 
 #[cfg(windows)]
 mod native {
-    use super::{bgra_to_nv12, EncoderTransform};
+    use super::{
+        bgra_to_nv12, copy_pitched_nv12, h264_access_unit, output_buffer_spec,
+        output_sample_is_usable, receive_response, AsyncPump, AsyncPumpEvent, EncoderTransform,
+        Nv12Layout,
+    };
     use bytes::Bytes;
-    use nexus_capture::CapturedFrame;
+    use nexus_capture::{CapturedFrame, PixelFormat};
     use nexus_codec::{CodecError, EncodedFrame, EncoderConfig};
+    use std::collections::VecDeque;
     use std::mem::ManuallyDrop;
     use std::ptr;
     use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
     use std::thread::{self, JoinHandle};
+    use std::time::{Duration, Instant};
     use windows::core::{Error as WindowsError, Interface, VARIANT};
     use windows::Win32::Foundation::{BOOL, E_FAIL, HMODULE};
     use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL};
@@ -162,21 +426,25 @@ mod native {
         IDXGIAdapter, DXGI_ERROR_DEVICE_HUNG, DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET,
     };
     use windows::Win32::Media::MediaFoundation::{
-        CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncVideoForceKeyFrame, ICodecAPI, IMFActivate,
-        IMFMediaBuffer, IMFMediaEventGenerator, IMFSample, IMFShutdown, IMFTransform,
-        METransformDrainComplete, METransformHaveOutput, METransformNeedInput, MFCreateMediaType,
-        MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video, MFSampleExtension_CleanPoint,
-        MFShutdown, MFStartup, MFTEnumEx, MFVideoFormat_H264, MFVideoFormat_NV12,
-        MFVideoInterlace_Progressive, MFSTARTUP_FULL, MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG,
-        MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER, MFT_MESSAGE_COMMAND_DRAIN,
-        MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
-        MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_START_OF_STREAM,
-        MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES,
-        MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MF_EVENT_FLAG_NONE,
-        MF_E_HW_MFT_FAILED_START_STREAMING, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_LOW_LATENCY,
+        eAVEncH264VProfile_ConstrainedBase, CODECAPI_AVEncCommonMeanBitRate,
+        CODECAPI_AVEncVideoForceKeyFrame, ICodecAPI, IMFActivate, IMFMediaBuffer,
+        IMFMediaEventGenerator, IMFSample, IMFShutdown, IMFTransform, METransformDrainComplete,
+        METransformHaveOutput, METransformNeedInput, MFCreateAlignedMemoryBuffer,
+        MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video,
+        MFSampleExtension_CleanPoint, MFShutdown, MFStartup, MFTEnumEx, MFVideoFormat_H264,
+        MFVideoFormat_NV12, MFVideoInterlace_Progressive, MFSTARTUP_FULL,
+        MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG, MFT_ENUM_FLAG_HARDWARE,
+        MFT_ENUM_FLAG_SORTANDFILTER, MFT_MESSAGE_COMMAND_DRAIN, MFT_MESSAGE_COMMAND_FLUSH,
+        MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM,
+        MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
+        MFT_OUTPUT_DATA_BUFFER_NO_SAMPLE, MFT_OUTPUT_STATUS_SAMPLE_READY,
+        MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES,
+        MFT_REGISTER_TYPE_INFO, MF_EVENT_FLAG_NO_WAIT, MF_E_HW_MFT_FAILED_START_STREAMING,
+        MF_E_NO_EVENTS_AVAILABLE, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_LOW_LATENCY,
         MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE,
-        MF_MT_MAJOR_TYPE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC,
-        MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION,
+        MF_MT_MAJOR_TYPE, MF_MT_MPEG2_PROFILE, MF_MT_MPEG_SEQUENCE_HEADER,
+        MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC, MF_TRANSFORM_ASYNC_UNLOCK,
+        MF_VERSION,
     };
     use windows::Win32::System::Com::{
         CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_MULTITHREADED,
@@ -193,6 +461,12 @@ mod native {
         Shutdown(SyncSender<()>),
     }
 
+    const STARTUP_TIMEOUT: Duration = Duration::from_secs(2);
+    const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+    const SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(500);
+    const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(2);
+    const MAX_PENDING_FRAMES: usize = 8;
+
     pub(super) struct MediaFoundationTransform {
         command_tx: Option<SyncSender<WorkerCommand>>,
         worker: Option<JoinHandle<()>>,
@@ -207,48 +481,71 @@ mod native {
                 .spawn(move || worker_main(command_rx, startup_tx))
                 .map_err(|_| CodecError::BackendUnavailable)?;
 
-            match startup_rx.recv() {
+            match startup_rx.recv_timeout(STARTUP_TIMEOUT) {
                 Ok(Ok(())) => Ok(Self {
                     command_tx: Some(command_tx),
                     worker: Some(worker),
                 }),
                 Ok(Err(error)) => {
-                    let _ = worker.join();
+                    drop(worker);
                     Err(error)
                 }
                 Err(_) => {
-                    let _ = worker.join();
+                    // A driver can stall during MFStartup or transform activation.
+                    // Never join that worker here: dropping the handle detaches a
+                    // stuck native thread so encoder construction remains bounded.
+                    drop(worker);
                     Err(CodecError::BackendUnavailable)
                 }
             }
         }
 
-        fn send(&self, command: WorkerCommand) -> Result<(), CodecError> {
-            self.command_tx
+        fn request<T>(
+            &mut self,
+            build_command: impl FnOnce(SyncSender<Result<T, CodecError>>) -> WorkerCommand,
+        ) -> Result<T, CodecError> {
+            let (response_tx, response_rx) = sync_channel(1);
+            let command = build_command(response_tx);
+            let send_result = self
+                .command_tx
                 .as_ref()
                 .ok_or(CodecError::BackendLost)?
-                .send(command)
-                .map_err(|_| CodecError::BackendLost)
+                .try_send(command);
+            if send_result.is_err() {
+                self.command_tx.take();
+                return Err(CodecError::BackendLost);
+            }
+            let response = receive_response(&response_rx, REQUEST_TIMEOUT);
+            if response.is_err() {
+                self.command_tx.take();
+            }
+            response
         }
 
         fn stop_worker(&mut self) {
-            let Some(sender) = self.command_tx.take() else {
-                return;
-            };
-            let (response_tx, response_rx) = sync_channel(1);
-            let _ = sender.send(WorkerCommand::Shutdown(response_tx));
-            let _ = response_rx.recv();
+            if let Some(sender) = self.command_tx.take() {
+                let (response_tx, response_rx) = sync_channel(1);
+                if sender
+                    .try_send(WorkerCommand::Shutdown(response_tx))
+                    .is_ok()
+                {
+                    let _ = response_rx.recv_timeout(SHUTDOWN_TIMEOUT);
+                }
+            }
             if let Some(worker) = self.worker.take() {
-                let _ = worker.join();
+                // `JoinHandle::join` itself has no timeout. It is called only
+                // after the worker is already finished; a stalled MFT is
+                // detached instead of making Drop hang.
+                if worker.is_finished() {
+                    let _ = worker.join();
+                }
             }
         }
     }
 
     impl EncoderTransform for MediaFoundationTransform {
         fn configure(&mut self, config: EncoderConfig) -> Result<(), CodecError> {
-            let (response_tx, response_rx) = sync_channel(1);
-            self.send(WorkerCommand::Configure(config, response_tx))?;
-            response_rx.recv().unwrap_or(Err(CodecError::BackendLost))
+            self.request(|response| WorkerCommand::Configure(config, response))
         }
 
         fn encode(
@@ -256,15 +553,11 @@ mod native {
             frame: CapturedFrame,
             force_keyframe: bool,
         ) -> Result<EncodedFrame, CodecError> {
-            let (response_tx, response_rx) = sync_channel(1);
-            self.send(WorkerCommand::Encode(frame, force_keyframe, response_tx))?;
-            response_rx.recv().unwrap_or(Err(CodecError::BackendLost))
+            self.request(|response| WorkerCommand::Encode(frame, force_keyframe, response))
         }
 
         fn drain(&mut self) -> Result<(), CodecError> {
-            let (response_tx, response_rx) = sync_channel(1);
-            self.send(WorkerCommand::Drain(response_tx))?;
-            response_rx.recv().unwrap_or(Err(CodecError::BackendLost))
+            self.request(WorkerCommand::Drain)
         }
 
         fn shutdown(&mut self) {
@@ -349,10 +642,31 @@ mod native {
         transform: Option<IMFTransform>,
         event_generator: Option<IMFMediaEventGenerator>,
         is_async: bool,
-        async_input_ready: bool,
+        async_pump: AsyncPump,
         config: Option<EncoderConfig>,
         converter: Option<Nv12Converter>,
+        sequence_header: Option<Vec<u8>>,
+        pending_inputs: VecDeque<PendingInput>,
+        pending_outputs: VecDeque<EncodedFrame>,
         media_foundation_started: bool,
+    }
+
+    struct PendingInput {
+        frame_id: u64,
+        timestamp_us: u64,
+        timestamp_hns: i64,
+        forced_keyframe: bool,
+    }
+
+    struct NativeOutput {
+        timestamp_hns: Option<i64>,
+        keyframe: bool,
+        data: Vec<u8>,
+    }
+
+    struct OutputPoll {
+        output: Option<NativeOutput>,
+        more_output: bool,
     }
 
     impl NativeEncoder {
@@ -368,9 +682,12 @@ mod native {
                         transform: Some(transform),
                         event_generator,
                         is_async: false,
-                        async_input_ready: false,
+                        async_pump: AsyncPump::new(),
                         config: None,
                         converter: None,
+                        sequence_header: None,
+                        pending_inputs: VecDeque::new(),
+                        pending_outputs: VecDeque::new(),
                         media_foundation_started: true,
                     })
                 }
@@ -425,10 +742,17 @@ mod native {
                 .map_err(map_windows_error)?;
             unsafe { transform.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0) }
                 .map_err(map_windows_error)?;
+
+            let negotiated_output_type =
+                unsafe { transform.GetOutputCurrentType(0) }.map_err(map_windows_error)?;
+            let sequence_header = sequence_header_from_type(&negotiated_output_type)?;
             self.converter = Some(Nv12Converter::new(&config));
             self.config = Some(config);
             self.is_async = is_async;
-            self.async_input_ready = !is_async;
+            self.async_pump = AsyncPump::new();
+            self.sequence_header = Some(sequence_header);
+            self.pending_inputs.clear();
+            self.pending_outputs.clear();
             Ok(())
         }
 
@@ -439,10 +763,9 @@ mod native {
         ) -> Result<EncodedFrame, CodecError> {
             let config = self.config.ok_or(CodecError::NotConfigured)?;
             let transform = self.transform()?.clone();
-            if self.is_async && !self.async_input_ready {
-                self.wait_for_event(METransformNeedInput.0 as u32)?;
+            if self.is_async {
+                self.wait_for_input_credit(&config)?;
             }
-            self.async_input_ready = false;
 
             if force_keyframe {
                 force_keyframe_on_transform(&transform)?;
@@ -456,52 +779,161 @@ mod native {
             // SAFETY: The sample owns a complete NV12 buffer and timestamps are
             // expressed in Media Foundation's 100-nanosecond units.
             unsafe { transform.ProcessInput(0, &input, 0) }.map_err(map_windows_error)?;
-
-            if self.is_async {
-                self.wait_for_event(METransformHaveOutput.0 as u32)?;
+            if self.is_async && !self.async_pump.take_input_credit() {
+                return Err(CodecError::BackendLost);
             }
-            let (data, keyframe) = self
-                .take_output(&config)?
-                .ok_or(CodecError::BackendUnavailable)?;
-            Ok(EncodedFrame {
+            self.queue_input(PendingInput {
                 frame_id: frame.frame_id,
                 timestamp_us: frame.timestamp_us,
-                keyframe,
-                data: Bytes::from(data),
-            })
+                timestamp_hns: frame
+                    .timestamp_us
+                    .checked_mul(10)
+                    .and_then(|value| i64::try_from(value).ok())
+                    .ok_or(CodecError::InvalidFrame)?,
+                forced_keyframe: force_keyframe,
+            })?;
+
+            if self.is_async {
+                self.wait_for_pending_output(&config)
+            } else {
+                self.collect_synchronous_output(&config)?;
+                self.pending_outputs
+                    .pop_front()
+                    .ok_or(CodecError::BackendUnavailable)
+            }
         }
 
-        fn wait_for_event(&mut self, expected: u32) -> Result<(), CodecError> {
+        fn wait_for_input_credit(&mut self, config: &EncoderConfig) -> Result<(), CodecError> {
+            let deadline = Instant::now() + REQUEST_TIMEOUT;
+            loop {
+                self.poll_async_events(config)?;
+                if self.async_pump.input_credits() != 0 {
+                    return Ok(());
+                }
+                if Instant::now() >= deadline {
+                    return Err(CodecError::BackendLost);
+                }
+                thread::sleep(EVENT_POLL_INTERVAL);
+            }
+        }
+
+        fn wait_for_pending_output(
+            &mut self,
+            config: &EncoderConfig,
+        ) -> Result<EncodedFrame, CodecError> {
+            let deadline = Instant::now() + REQUEST_TIMEOUT;
+            loop {
+                if let Some(output) = self.pending_outputs.pop_front() {
+                    return Ok(output);
+                }
+                self.poll_async_events(config)?;
+                if Instant::now() >= deadline {
+                    return Err(CodecError::BackendLost);
+                }
+                thread::sleep(EVENT_POLL_INTERVAL);
+            }
+        }
+
+        fn wait_for_drain_complete(&mut self, config: &EncoderConfig) -> Result<(), CodecError> {
+            let deadline = Instant::now() + REQUEST_TIMEOUT;
+            loop {
+                self.poll_async_events(config)?;
+                if self.async_pump.take_drain_complete() {
+                    return Ok(());
+                }
+                if Instant::now() >= deadline {
+                    return Err(CodecError::BackendLost);
+                }
+                thread::sleep(EVENT_POLL_INTERVAL);
+            }
+        }
+
+        fn poll_async_events(&mut self, config: &EncoderConfig) -> Result<(), CodecError> {
             let generator = self
                 .event_generator
                 .as_ref()
                 .ok_or(CodecError::BackendUnavailable)?
                 .clone();
             loop {
-                // SAFETY: Blocking event retrieval occurs only on the dedicated
-                // encoder worker, never on an async runtime thread.
-                let event =
-                    unsafe { generator.GetEvent(MF_EVENT_FLAG_NONE) }.map_err(map_windows_error)?;
+                // SAFETY: MF_EVENT_FLAG_NO_WAIT guarantees this polling call
+                // never blocks the worker. The deadline in each caller bounds
+                // a driver that never queues another event.
+                let event = match unsafe { generator.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
+                    Ok(event) => event,
+                    Err(error) if error.code() == MF_E_NO_EVENTS_AVAILABLE => return Ok(()),
+                    Err(error) => return Err(map_windows_error(error)),
+                };
                 let status = unsafe { event.GetStatus() }.map_err(map_windows_error)?;
                 status.ok().map_err(|_| classify_hresult(status.0))?;
                 let event_type = unsafe { event.GetType() }.map_err(map_windows_error)?;
                 if event_type == METransformNeedInput.0 as u32 {
-                    self.async_input_ready = true;
-                }
-                if event_type == expected {
-                    return Ok(());
-                }
-                if event_type == METransformHaveOutput.0 as u32 {
-                    let config = self.config.ok_or(CodecError::NotConfigured)?;
-                    let _ = self.take_output(&config)?;
+                    self.async_pump.observe(AsyncPumpEvent::NeedInput)?;
+                } else if event_type == METransformHaveOutput.0 as u32 {
+                    self.async_pump.observe(AsyncPumpEvent::HaveOutput)?;
+                    self.collect_async_output(config)?;
+                } else if event_type == METransformDrainComplete.0 as u32 {
+                    self.async_pump.observe(AsyncPumpEvent::DrainComplete)?;
                 }
             }
         }
 
-        fn take_output(
-            &self,
-            config: &EncoderConfig,
-        ) -> Result<Option<(Vec<u8>, bool)>, CodecError> {
+        fn collect_async_output(&mut self, config: &EncoderConfig) -> Result<(), CodecError> {
+            if !self.async_pump.take_output_event() {
+                return Err(CodecError::BackendLost);
+            }
+            self.collect_synchronous_output(config)
+        }
+
+        fn collect_synchronous_output(&mut self, config: &EncoderConfig) -> Result<(), CodecError> {
+            for _ in 0..MAX_PENDING_FRAMES {
+                let poll = self.take_output(config)?;
+                if let Some(output) = poll.output {
+                    self.queue_output(output)?;
+                }
+                if !poll.more_output {
+                    return Ok(());
+                }
+            }
+            Err(CodecError::BackendLost)
+        }
+
+        fn queue_input(&mut self, input: PendingInput) -> Result<(), CodecError> {
+            if self.pending_inputs.len() == MAX_PENDING_FRAMES {
+                return Err(CodecError::BackendLost);
+            }
+            self.pending_inputs.push_back(input);
+            Ok(())
+        }
+
+        fn queue_output(&mut self, output: NativeOutput) -> Result<(), CodecError> {
+            let input_index = output
+                .timestamp_hns
+                .and_then(|timestamp| {
+                    self.pending_inputs
+                        .iter()
+                        .position(|input| input.timestamp_hns == timestamp)
+                })
+                .unwrap_or(0);
+            let input = self
+                .pending_inputs
+                .remove(input_index)
+                .ok_or(CodecError::BackendLost)?;
+            if input.forced_keyframe && !output.keyframe {
+                return Err(CodecError::BackendUnavailable);
+            }
+            if self.pending_outputs.len() == MAX_PENDING_FRAMES {
+                return Err(CodecError::BackendLost);
+            }
+            self.pending_outputs.push_back(EncodedFrame {
+                frame_id: input.frame_id,
+                timestamp_us: input.timestamp_us,
+                keyframe: output.keyframe,
+                data: Bytes::from(output.data),
+            });
+            Ok(())
+        }
+
+        fn take_output(&self, _config: &EncoderConfig) -> Result<OutputPoll, CodecError> {
             let transform = self.transform()?;
             let stream_info =
                 unsafe { transform.GetOutputStreamInfo(0) }.map_err(map_windows_error)?;
@@ -512,15 +944,16 @@ mod native {
             let sample = if transform_provides_sample {
                 None
             } else {
-                let raw_size = config
-                    .width
-                    .checked_mul(config.height)
-                    .and_then(|pixels| pixels.checked_mul(4))
-                    .ok_or(CodecError::InvalidDimensions)?;
-                let capacity = stream_info.cbSize.max(raw_size);
+                let buffer_spec = output_buffer_spec(stream_info.cbSize, stream_info.cbAlignment)?;
                 let sample = unsafe { MFCreateSample() }.map_err(map_windows_error)?;
-                let buffer =
-                    unsafe { MFCreateMemoryBuffer(capacity) }.map_err(map_windows_error)?;
+                let buffer = match buffer_spec.alignment {
+                    Some(alignment) => {
+                        unsafe { MFCreateAlignedMemoryBuffer(buffer_spec.capacity, alignment) }
+                            .map_err(map_windows_error)?
+                    }
+                    None => unsafe { MFCreateMemoryBuffer(buffer_spec.capacity) }
+                        .map_err(map_windows_error)?,
+                };
                 unsafe { sample.AddBuffer(&buffer) }.map_err(map_windows_error)?;
                 Some(sample)
             };
@@ -541,15 +974,51 @@ mod native {
             drop(events);
             match result {
                 Ok(()) => {
-                    let sample = sample.ok_or(CodecError::BackendUnavailable)?;
+                    let more_output = status & MFT_OUTPUT_STATUS_SAMPLE_READY.0 as u32 != 0;
+                    if output.dwStatus & MFT_OUTPUT_DATA_BUFFER_NO_SAMPLE.0 as u32
+                        == MFT_OUTPUT_DATA_BUFFER_NO_SAMPLE.0 as u32
+                    {
+                        return Ok(OutputPoll {
+                            output: None,
+                            more_output,
+                        });
+                    }
+                    let Some(sample) = sample else {
+                        return Ok(OutputPoll {
+                            output: None,
+                            more_output,
+                        });
+                    };
                     let keyframe = unsafe { sample.GetUINT32(&MFSampleExtension_CleanPoint) }
                         .unwrap_or(0)
                         != 0;
                     let buffer =
                         unsafe { sample.ConvertToContiguousBuffer() }.map_err(map_windows_error)?;
-                    Ok(Some((copy_buffer(&buffer)?, keyframe)))
+                    let data = copy_buffer(&buffer)?;
+                    if output_sample_is_usable(output.dwStatus, Some(data.len())).is_none() {
+                        return Ok(OutputPoll {
+                            output: None,
+                            more_output,
+                        });
+                    }
+                    let sequence_header = self
+                        .sequence_header
+                        .as_deref()
+                        .ok_or(CodecError::BackendUnavailable)?;
+                    let data = h264_access_unit(sequence_header, &data, keyframe)?;
+                    Ok(OutputPoll {
+                        output: Some(NativeOutput {
+                            timestamp_hns: unsafe { sample.GetSampleTime() }.ok(),
+                            keyframe,
+                            data,
+                        }),
+                        more_output,
+                    })
                 }
-                Err(error) if error.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => Ok(None),
+                Err(error) if error.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => Ok(OutputPoll {
+                    output: None,
+                    more_output: false,
+                }),
                 Err(error) => Err(map_windows_error(error)),
             }
         }
@@ -559,29 +1028,42 @@ mod native {
                 return Ok(());
             }
             let transform = self.transform()?.clone();
-            // SAFETY: These messages close the configured input stream before
-            // draining delayed output and flushing transform state.
-            unsafe { transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0) }
-                .map_err(map_windows_error)?;
-            unsafe { transform.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0) }
-                .map_err(map_windows_error)?;
-            if self.is_async {
-                self.wait_for_event(METransformDrainComplete.0 as u32)?;
-            } else {
-                let config = self.config.ok_or(CodecError::NotConfigured)?;
-                while self.take_output(&config)?.is_some() {}
-            }
-            unsafe { transform.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0) }
-                .map_err(map_windows_error)?;
+            let config = self.config.ok_or(CodecError::NotConfigured)?;
+            let result = (|| {
+                // SAFETY: These messages close the configured input stream
+                // before draining delayed output and flushing transform state.
+                unsafe { transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0) }
+                    .map_err(map_windows_error)?;
+                unsafe { transform.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0) }
+                    .map_err(map_windows_error)?;
+                if self.is_async {
+                    self.wait_for_drain_complete(&config)?;
+                } else {
+                    self.collect_synchronous_output(&config)?;
+                }
+                unsafe { transform.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0) }
+                    .map_err(map_windows_error)
+            })();
             self.config = None;
-            self.converter = None;
+            self.converter.take();
             self.is_async = false;
-            self.async_input_ready = false;
-            Ok(())
+            self.async_pump = AsyncPump::new();
+            self.sequence_header = None;
+            self.pending_inputs.clear();
+            self.pending_outputs.clear();
+            result
         }
 
         fn shutdown(&mut self) {
             let _ = self.drain();
+            // Drain can fail when a driver is already lost. Release the CPU/GPU
+            // converter before COM apartment teardown regardless, because it
+            // owns D3D interfaces created on this worker.
+            self.converter.take();
+            self.config = None;
+            self.sequence_header = None;
+            self.pending_inputs.clear();
+            self.pending_outputs.clear();
             if let Some(transform) = self.transform.as_ref() {
                 if let Ok(shutdown) = transform.cast::<IMFShutdown>() {
                     let _ = unsafe { shutdown.Shutdown() };
@@ -679,8 +1161,44 @@ mod native {
         if compressed {
             unsafe { media_type.SetUINT32(&MF_MT_AVG_BITRATE, config.bitrate_bps) }
                 .map_err(map_windows_error)?;
+            // Constrained baseline avoids decoder-side CABAC and B-frame
+            // requirements for the first remote-desktop operating point. A
+            // hardware MFT that cannot negotiate it fails closed at SetOutputType.
+            unsafe {
+                media_type.SetUINT32(
+                    &MF_MT_MPEG2_PROFILE,
+                    eAVEncH264VProfile_ConstrainedBase.0 as u32,
+                )
+            }
+            .map_err(map_windows_error)?;
         }
         Ok(media_type)
+    }
+
+    fn sequence_header_from_type(
+        media_type: &windows::Win32::Media::MediaFoundation::IMFMediaType,
+    ) -> Result<Vec<u8>, CodecError> {
+        let size = unsafe { media_type.GetBlobSize(&MF_MT_MPEG_SEQUENCE_HEADER) }
+            .map_err(|_| CodecError::BackendUnavailable)?;
+        if size == 0 {
+            return Err(CodecError::BackendUnavailable);
+        }
+        let mut sequence_header = vec![0_u8; size as usize];
+        let mut actual_size = 0_u32;
+        unsafe {
+            media_type.GetBlob(
+                &MF_MT_MPEG_SEQUENCE_HEADER,
+                &mut sequence_header,
+                Some(&mut actual_size),
+            )
+        }
+        .map_err(|_| CodecError::BackendUnavailable)?;
+        sequence_header.truncate(actual_size as usize);
+        if sequence_header.is_empty() || !sequence_header.windows(3).any(|bytes| bytes == [0, 0, 1])
+        {
+            return Err(CodecError::BackendUnavailable);
+        }
+        Ok(sequence_header)
     }
 
     fn force_keyframe_on_transform(transform: &IMFTransform) -> Result<(), CodecError> {
@@ -697,6 +1215,10 @@ mod native {
         frame: &CapturedFrame,
         config: &EncoderConfig,
     ) -> Result<IMFSample, CodecError> {
+        let layout = Nv12Layout::from_bgra_dimensions(config.width, config.height)?;
+        if nv12.len() != layout.output_len {
+            return Err(CodecError::InvalidFrame);
+        }
         let buffer_len = u32::try_from(nv12.len()).map_err(|_| CodecError::InvalidFrame)?;
         let buffer = unsafe { MFCreateMemoryBuffer(buffer_len) }.map_err(map_windows_error)?;
         let mut destination = ptr::null_mut();
@@ -893,10 +1415,18 @@ mod native {
         }
 
         fn convert(&mut self, frame: &CapturedFrame) -> Result<Vec<u8>, CodecError> {
-            let row_pitch = self
-                .width
-                .checked_mul(4)
-                .ok_or(CodecError::InvalidDimensions)?;
+            if frame.width != self.width || frame.height != self.height {
+                return Err(CodecError::FrameDimensionsMismatch);
+            }
+            if frame.format != PixelFormat::Bgra8 || frame.validate().is_err() {
+                return Err(CodecError::InvalidFrame);
+            }
+            let layout = Nv12Layout::from_bgra_dimensions(self.width, self.height)?;
+            if frame.data.len() != layout.bgra_len {
+                return Err(CodecError::InvalidFrame);
+            }
+            let row_pitch =
+                u32::try_from(layout.bgra_stride).map_err(|_| CodecError::InvalidFrame)?;
             unsafe {
                 self.immediate.UpdateSubresource(
                     &self.input_texture,
@@ -985,29 +1515,25 @@ mod native {
         width: u32,
         height: u32,
     ) -> Result<Vec<u8>, CodecError> {
-        if mapped.pData.is_null() || mapped.RowPitch < width {
+        let layout = Nv12Layout::from_bgra_dimensions(width, height)?;
+        let pitch = usize::try_from(mapped.RowPitch).map_err(|_| CodecError::BackendLost)?;
+        if mapped.pData.is_null() || pitch < layout.width {
             return Err(CodecError::BackendLost);
         }
-        let width = width as usize;
-        let height = height as usize;
-        let y_len = width
-            .checked_mul(height)
-            .ok_or(CodecError::InvalidDimensions)?;
-        let mut nv12 = vec![0_u8; y_len + y_len / 2];
-        let pitch = mapped.RowPitch as usize;
-        let source = mapped.pData.cast::<u8>();
-        for row in 0..height {
-            let source_row = unsafe { std::slice::from_raw_parts(source.add(row * pitch), width) };
-            nv12[row * width..(row + 1) * width].copy_from_slice(source_row);
-        }
-        let source_uv = unsafe { source.add(height * pitch) };
-        for row in 0..height / 2 {
-            let source_row =
-                unsafe { std::slice::from_raw_parts(source_uv.add(row * pitch), width) };
-            let destination = y_len + row * width;
-            nv12[destination..destination + width].copy_from_slice(source_row);
-        }
-        Ok(nv12)
+        let mapped_rows = layout
+            .height
+            .checked_add(layout.height / 2)
+            .ok_or(CodecError::BackendLost)?;
+        let mapped_len = pitch
+            .checked_mul(mapped_rows)
+            .ok_or(CodecError::BackendLost)?;
+        // SAFETY: `staging_texture` is created as an NV12 texture with this
+        // checked width/height. A successful D3D11 Map exposes exactly one Y
+        // plane plus one half-height UV plane, each with `RowPitch` bytes per
+        // row. `mapped_len` is their checked total, and `copy_pitched_nv12`
+        // verifies every row range before indexing the resulting slice.
+        let source = unsafe { std::slice::from_raw_parts(mapped.pData.cast::<u8>(), mapped_len) };
+        copy_pitched_nv12(source, pitch, layout)
     }
 
     fn copy_buffer(buffer: &IMFMediaBuffer) -> Result<Vec<u8>, CodecError> {
@@ -1099,6 +1625,8 @@ impl Drop for WindowsH264Encoder {
 mod tests {
     use super::*;
     use bytes::Bytes;
+    use std::sync::mpsc::sync_channel;
+    use std::time::Duration;
 
     #[test]
     fn cpu_nv12_conversion_uses_checked_planes_and_two_by_two_chroma() {
@@ -1115,5 +1643,89 @@ mod tests {
         let frame = CapturedFrame::new_bgra(1, 2, 1, 2, Bytes::from_static(&[0; 8])).unwrap();
 
         assert_eq!(bgra_to_nv12(&frame), Err(CodecError::InvalidDimensions));
+    }
+
+    #[test]
+    fn async_pump_preserves_each_need_input_credit_before_output_arrives() {
+        let mut pump = AsyncPump::new();
+
+        pump.observe(AsyncPumpEvent::NeedInput).unwrap();
+        pump.observe(AsyncPumpEvent::NeedInput).unwrap();
+        pump.observe(AsyncPumpEvent::HaveOutput).unwrap();
+        pump.observe(AsyncPumpEvent::DrainComplete).unwrap();
+
+        assert_eq!(pump.input_credits(), 2);
+        assert_eq!(pump.pending_output_events(), 1);
+        assert!(pump.take_input_credit());
+        assert!(pump.take_input_credit());
+        assert!(!pump.take_input_credit());
+        assert!(pump.take_output_event());
+        assert!(pump.take_drain_complete());
+    }
+
+    #[test]
+    fn output_buffer_spec_preserves_mft_size_and_alignment() {
+        assert_eq!(
+            output_buffer_spec(4_096, 64),
+            Ok(OutputBufferSpec {
+                capacity: 4_096,
+                alignment: Some(64),
+            })
+        );
+    }
+
+    #[test]
+    fn output_without_a_sample_is_not_emitted() {
+        assert_eq!(output_sample_is_usable(0x300, Some(5)), None);
+        assert_eq!(output_sample_is_usable(0, Some(0)), None);
+        assert_eq!(output_sample_is_usable(0, Some(5)), Some(5));
+    }
+
+    #[test]
+    fn keyframes_are_prefixed_with_the_negotiated_annex_b_sequence_header() {
+        let sequence_header = [0, 0, 0, 1, 0x67, 0, 0, 0, 1, 0x68];
+        let access_unit = [0, 0, 0, 1, 0x65, 0x88];
+
+        assert_eq!(
+            h264_access_unit(&sequence_header, &access_unit, true).unwrap(),
+            [sequence_header.as_slice(), access_unit.as_slice()].concat()
+        );
+        assert_eq!(
+            h264_access_unit(&sequence_header, &access_unit, false).unwrap(),
+            access_unit
+        );
+        assert_eq!(
+            h264_access_unit(&[], &access_unit, true),
+            Err(CodecError::BackendUnavailable)
+        );
+    }
+
+    #[test]
+    fn padded_nv12_rows_copy_only_the_valid_y_and_uv_bytes() {
+        let layout = Nv12Layout::from_bgra_dimensions(2, 2).unwrap();
+        let mapped = [1, 2, 99, 99, 3, 4, 99, 99, 5, 6, 99, 99];
+
+        assert_eq!(
+            copy_pitched_nv12(&mapped, 4, layout).unwrap(),
+            vec![1, 2, 3, 4, 5, 6]
+        );
+    }
+
+    #[test]
+    fn nv12_layout_rejects_source_size_overflow_before_indexing() {
+        assert!(matches!(
+            Nv12Layout::from_bgra_dimensions(u32::MAX - 1, u32::MAX - 1),
+            Err(CodecError::InvalidFrame)
+        ));
+    }
+
+    #[test]
+    fn response_wait_returns_backend_lost_when_the_worker_does_not_reply() {
+        let (_sender, receiver) = sync_channel::<Result<(), CodecError>>(1);
+
+        assert_eq!(
+            receive_response(&receiver, Duration::ZERO),
+            Err(CodecError::BackendLost)
+        );
     }
 }
