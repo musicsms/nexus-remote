@@ -53,14 +53,13 @@ pub enum CodecError {
     BackendUnavailable,
     #[error("encoder backend was lost")]
     BackendLost,
+    #[error("encoder accepted the input but has no output available yet")]
+    OutputPending,
 }
 
 pub trait VideoEncoder: Send {
     fn configure(&mut self, config: EncoderConfig) -> Result<(), CodecError>;
-    /// Submits one captured frame and returns every access unit made available
-    /// by this pump cycle. Hardware encoders may legally return no output
-    /// until later inputs arrive, or several delayed outputs at once.
-    fn encode(&mut self, frame: CapturedFrame) -> Result<Vec<EncodedFrame>, CodecError>;
+    fn encode(&mut self, frame: CapturedFrame) -> Result<EncodedFrame, CodecError>;
     fn request_keyframe(&mut self) -> Result<(), CodecError>;
     fn reconfigure(&mut self, config: EncoderConfig) -> Result<(), CodecError>;
 }

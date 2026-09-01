@@ -2,7 +2,7 @@
 
 use bytes::Bytes;
 use nexus_capture::CapturedFrame;
-use nexus_codec::{CodecKind, EncoderConfig, VideoEncoder};
+use nexus_codec::{CodecError, CodecKind, EncoderConfig, VideoEncoder};
 use platform_windows::WindowsH264Encoder;
 
 #[test]
@@ -19,7 +19,7 @@ fn media_foundation_encodes_a_deterministic_bgra_frame() {
         })
         .expect("H.264 encoder must configure");
     let pixels: Vec<u8> = (0_u8..=255).cycle().take(64 * 64 * 4).collect();
-    let mut outputs = Vec::new();
+    let mut output = None;
     for frame_id in 1..=8 {
         let frame = CapturedFrame::new_bgra(
             frame_id,
@@ -29,15 +29,16 @@ fn media_foundation_encodes_a_deterministic_bgra_frame() {
             Bytes::from(pixels.clone()),
         )
         .unwrap();
-        outputs.extend(encoder.encode(frame).expect("BGRA frame must encode"));
-        if !outputs.is_empty() {
-            break;
+        match encoder.encode(frame) {
+            Ok(encoded) => {
+                output = Some(encoded);
+                break;
+            }
+            Err(CodecError::OutputPending) => {}
+            Err(error) => panic!("BGRA frame must encode: {error}"),
         }
     }
-    let output = outputs
-        .into_iter()
-        .next()
-        .expect("the MFT must emit an H.264 access unit after bounded pumping");
+    let output = output.expect("the MFT must emit an H.264 access unit after bounded pumping");
 
     assert!(output.keyframe, "the first output must be a keyframe");
     assert!(

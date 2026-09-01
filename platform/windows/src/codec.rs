@@ -227,6 +227,11 @@ fn clear_converter_after_drain<T>(
     result
 }
 
+#[cfg(any(windows, test))]
+fn response_requires_worker_shutdown<T>(response: &Result<T, CodecError>) -> bool {
+    response.is_err() && !matches!(response, Err(CodecError::OutputPending))
+}
+
 /// Owns the native worker's `JoinHandle` after a bounded caller timeout.
 ///
 /// A reaper holds and joins the handle on a small Rust thread. The caller can
@@ -425,7 +430,7 @@ trait EncoderTransform: Send {
         &mut self,
         frame: CapturedFrame,
         force_keyframe: bool,
-    ) -> Result<Vec<EncodedFrame>, CodecError>;
+    ) -> Result<EncodedFrame, CodecError>;
 
     fn drain(&mut self) -> Result<(), CodecError>;
 
@@ -535,8 +540,8 @@ mod native {
     use super::{
         bgra_to_nv12, clear_converter_after_drain, collect_output_polls, copy_pitched_nv12,
         h264_access_unit, output_buffer_spec, output_requires_retry, output_sample_is_usable,
-        receive_response, AsyncInputScheduler, AsyncPumpEvent, EncoderTransform, Nv12Layout,
-        OutputPoll, WorkerLifecycle,
+        receive_response, response_requires_worker_shutdown, AsyncInputScheduler, AsyncPumpEvent,
+        EncoderTransform, Nv12Layout, OutputPoll, WorkerLifecycle,
     };
     use bytes::Bytes;
     use nexus_capture::{CapturedFrame, PixelFormat};
@@ -603,7 +608,7 @@ mod native {
         Encode(
             CapturedFrame,
             bool,
-            SyncSender<Result<Vec<EncodedFrame>, CodecError>>,
+            SyncSender<Result<EncodedFrame, CodecError>>,
         ),
         Drain(SyncSender<Result<(), CodecError>>),
         Shutdown(SyncSender<()>),
@@ -665,7 +670,7 @@ mod native {
                 return Err(CodecError::BackendLost);
             }
             let response = receive_response(&response_rx, REQUEST_TIMEOUT);
-            if response.is_err() {
+            if response_requires_worker_shutdown(&response) {
                 self.command_tx.take();
             }
             response
@@ -694,7 +699,7 @@ mod native {
             &mut self,
             frame: CapturedFrame,
             force_keyframe: bool,
-        ) -> Result<Vec<EncodedFrame>, CodecError> {
+        ) -> Result<EncodedFrame, CodecError> {
             self.request(|response| WorkerCommand::Encode(frame, force_keyframe, response))
         }
 
@@ -912,7 +917,7 @@ mod native {
             &mut self,
             frame: CapturedFrame,
             force_keyframe: bool,
-        ) -> Result<Vec<EncodedFrame>, CodecError> {
+        ) -> Result<EncodedFrame, CodecError> {
             let config = self.config.ok_or(CodecError::NotConfigured)?;
             let nv12 = self
                 .converter
@@ -937,7 +942,7 @@ mod native {
                     input: pending_input,
                 })?;
                 self.pump_async(&config)?;
-                Ok(self.take_pending_outputs())
+                self.take_pending_output()
             } else {
                 let transform = self.transform()?.clone();
                 if force_keyframe {
@@ -948,7 +953,7 @@ mod native {
                 unsafe { transform.ProcessInput(0, &input, 0) }.map_err(map_windows_error)?;
                 self.queue_input(pending_input)?;
                 self.collect_synchronous_output(&config)?;
-                Ok(self.take_pending_outputs())
+                self.take_pending_output()
             }
         }
 
@@ -982,8 +987,10 @@ mod native {
             self.poll_async_events(config)
         }
 
-        fn take_pending_outputs(&mut self) -> Vec<EncodedFrame> {
-            self.pending_outputs.drain(..).collect()
+        fn take_pending_output(&mut self) -> Result<EncodedFrame, CodecError> {
+            self.pending_outputs
+                .pop_front()
+                .ok_or(CodecError::OutputPending)
         }
 
         fn wait_for_drain_complete(&mut self, config: &EncoderConfig) -> Result<(), CodecError> {
@@ -1729,7 +1736,7 @@ impl VideoEncoder for WindowsH264Encoder {
         Ok(())
     }
 
-    fn encode(&mut self, frame: CapturedFrame) -> Result<Vec<EncodedFrame>, CodecError> {
+    fn encode(&mut self, frame: CapturedFrame) -> Result<EncodedFrame, CodecError> {
         let config = self.config.ok_or(CodecError::NotConfigured)?;
         if frame.width != config.width || frame.height != config.height {
             return Err(CodecError::FrameDimensionsMismatch);
@@ -1738,9 +1745,19 @@ impl VideoEncoder for WindowsH264Encoder {
             return Err(CodecError::InvalidFrame);
         }
 
-        let output = self.transform.encode(frame, self.force_next_keyframe)?;
-        self.force_next_keyframe = false;
-        Ok(output)
+        match self.transform.encode(frame, self.force_next_keyframe) {
+            Ok(output) => {
+                self.force_next_keyframe = false;
+                Ok(output)
+            }
+            Err(CodecError::OutputPending) => {
+                // The async worker accepted the input and queued it behind a
+                // valid MFT credit; the next call may return its delayed output.
+                self.force_next_keyframe = false;
+                Err(CodecError::OutputPending)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn request_keyframe(&mut self) -> Result<(), CodecError> {
@@ -1792,7 +1809,7 @@ mod tests {
 
     struct RecordingTransform {
         calls: Arc<Mutex<Vec<TransformCall>>>,
-        output_batches: VecDeque<Vec<EncodedFrame>>,
+        outputs: VecDeque<Result<EncodedFrame, CodecError>>,
         fail_configure_call: Option<usize>,
         configure_count: usize,
     }
@@ -1814,19 +1831,19 @@ mod tests {
             &mut self,
             frame: CapturedFrame,
             force_keyframe: bool,
-        ) -> Result<Vec<EncodedFrame>, CodecError> {
+        ) -> Result<EncodedFrame, CodecError> {
             self.calls.lock().unwrap().push(TransformCall::Encode {
                 frame_id: frame.frame_id,
                 force_keyframe,
             });
-            Ok(self.output_batches.pop_front().unwrap_or_else(|| {
-                vec![EncodedFrame {
+            self.outputs.pop_front().unwrap_or_else(|| {
+                Ok(EncodedFrame {
                     frame_id: frame.frame_id,
                     timestamp_us: frame.timestamp_us,
                     keyframe: force_keyframe,
                     data: Bytes::from_static(&[0, 0, 0, 1, 0x65]),
-                }]
-            }))
+                })
+            })
         }
 
         fn drain(&mut self) -> Result<(), CodecError> {
@@ -1861,13 +1878,13 @@ mod tests {
     }
 
     fn encoder(
-        output_batches: VecDeque<Vec<EncodedFrame>>,
+        outputs: VecDeque<Result<EncodedFrame, CodecError>>,
         fail_configure_call: Option<usize>,
     ) -> (WindowsH264Encoder, Arc<Mutex<Vec<TransformCall>>>) {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let transform = RecordingTransform {
             calls: Arc::clone(&calls),
-            output_batches,
+            outputs,
             fail_configure_call,
             configure_count: 0,
         };
@@ -1886,6 +1903,98 @@ mod tests {
     }
 
     #[test]
+    fn default_contract_requires_configuration_before_encoding() {
+        let (mut encoder, calls) = encoder(VecDeque::new(), None);
+
+        assert_eq!(
+            encoder.encode(frame(1, 64, 64)),
+            Err(CodecError::NotConfigured)
+        );
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn default_contract_rejects_dimension_mismatches_before_transform_calls() {
+        let (mut encoder, calls) = encoder(VecDeque::new(), None);
+        encoder.configure(config(64, 64, 1_000_000)).unwrap();
+
+        assert_eq!(
+            encoder.encode(frame(1, 32, 64)),
+            Err(CodecError::FrameDimensionsMismatch)
+        );
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &[TransformCall::Configure(config(64, 64, 1_000_000))]
+        );
+    }
+
+    #[test]
+    fn default_contract_rejects_malformed_frames_before_transform_calls() {
+        let (mut encoder, calls) = encoder(VecDeque::new(), None);
+        encoder.configure(config(64, 64, 1_000_000)).unwrap();
+        let malformed = CapturedFrame {
+            data: Bytes::new(),
+            ..frame(1, 64, 64)
+        };
+
+        assert_eq!(encoder.encode(malformed), Err(CodecError::InvalidFrame));
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &[TransformCall::Configure(config(64, 64, 1_000_000))]
+        );
+    }
+
+    #[test]
+    fn default_contract_explicit_keyframe_request_affects_only_next_input() {
+        let (mut encoder, calls) = encoder(VecDeque::new(), None);
+        encoder.configure(config(64, 64, 1_000_000)).unwrap();
+
+        assert!(encoder.encode(frame(1, 64, 64)).unwrap().keyframe);
+        assert!(!encoder.encode(frame(2, 64, 64)).unwrap().keyframe);
+        encoder.request_keyframe().unwrap();
+        assert!(encoder.encode(frame(3, 64, 64)).unwrap().keyframe);
+        assert!(!encoder.encode(frame(4, 64, 64)).unwrap().keyframe);
+
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &[
+                TransformCall::Configure(config(64, 64, 1_000_000)),
+                TransformCall::Encode {
+                    frame_id: 1,
+                    force_keyframe: true,
+                },
+                TransformCall::Encode {
+                    frame_id: 2,
+                    force_keyframe: false,
+                },
+                TransformCall::Encode {
+                    frame_id: 3,
+                    force_keyframe: true,
+                },
+                TransformCall::Encode {
+                    frame_id: 4,
+                    force_keyframe: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn default_contract_bitrate_only_reconfiguration_preserves_keyframe_cadence() {
+        let (mut encoder, _calls) = encoder(VecDeque::new(), None);
+        encoder.configure(config(64, 64, 1_000_000)).unwrap();
+
+        assert!(encoder.encode(frame(1, 64, 64)).unwrap().keyframe);
+        assert!(!encoder.encode(frame(2, 64, 64)).unwrap().keyframe);
+
+        encoder.reconfigure(config(64, 64, 2_000_000)).unwrap();
+
+        assert!(!encoder.encode(frame(3, 64, 64)).unwrap().keyframe);
+        encoder.request_keyframe().unwrap();
+        assert!(encoder.encode(frame(4, 64, 64)).unwrap().keyframe);
+    }
+
+    #[test]
     fn private_state_machine_returns_no_output_until_the_transform_has_one() {
         let delayed = EncodedFrame {
             frame_id: 1,
@@ -1893,12 +2002,17 @@ mod tests {
             keyframe: true,
             data: Bytes::from_static(&[0, 0, 0, 1, 0x65]),
         };
-        let (mut encoder, calls) =
-            encoder(VecDeque::from([Vec::new(), vec![delayed.clone()]]), None);
+        let (mut encoder, calls) = encoder(
+            VecDeque::from([Err(CodecError::OutputPending), Ok(delayed.clone())]),
+            None,
+        );
         encoder.configure(config(64, 64, 1_000_000)).unwrap();
 
-        assert!(encoder.encode(frame(1, 64, 64)).unwrap().is_empty());
-        assert_eq!(encoder.encode(frame(2, 64, 64)).unwrap(), vec![delayed]);
+        assert_eq!(
+            encoder.encode(frame(1, 64, 64)),
+            Err(CodecError::OutputPending)
+        );
+        assert_eq!(encoder.encode(frame(2, 64, 64)).unwrap(), delayed);
         assert_eq!(
             calls.lock().unwrap().as_slice(),
             &[
@@ -1922,10 +2036,9 @@ mod tests {
         encoder.encode(frame(1, 64, 64)).unwrap();
 
         encoder.reconfigure(config(128, 64, 2_000_000)).unwrap();
-        let outputs = encoder.encode(frame(2, 128, 64)).unwrap();
+        let output = encoder.encode(frame(2, 128, 64)).unwrap();
 
-        assert_eq!(outputs.len(), 1);
-        assert!(outputs[0].keyframe);
+        assert!(output.keyframe);
         assert_eq!(
             calls.lock().unwrap().as_slice(),
             &[
@@ -1984,6 +2097,15 @@ mod tests {
         );
     }
 
+    #[cfg(not(windows))]
+    #[test]
+    fn default_contract_native_constructor_fails_closed_off_windows() {
+        assert_eq!(
+            WindowsH264Encoder::new().unwrap_err(),
+            CodecError::BackendUnavailable
+        );
+    }
+
     #[test]
     fn cpu_nv12_conversion_uses_checked_planes_and_two_by_two_chroma() {
         let black = CapturedFrame::new_bgra(1, 2, 2, 2, Bytes::from_static(&[0; 16])).unwrap();
@@ -2036,6 +2158,48 @@ mod tests {
         assert!(scheduler.take_output_event());
         scheduler.observe(AsyncPumpEvent::DrainComplete).unwrap();
         assert!(scheduler.take_drain_complete());
+    }
+
+    #[test]
+    fn async_encode_commands_submit_multiple_inputs_before_delayed_output() {
+        let mut scheduler = AsyncInputScheduler::new();
+        let mut submitted = Vec::new();
+        let mut pending_outputs = VecDeque::new();
+
+        // The MFT grants two credits before producing any output. Each encode
+        // command must make use of a credit and return promptly instead of
+        // waiting for a one-to-one output response.
+        scheduler.observe(AsyncPumpEvent::NeedInput).unwrap();
+        scheduler.observe(AsyncPumpEvent::NeedInput).unwrap();
+
+        for frame_id in [1_u64, 2] {
+            scheduler.enqueue(frame_id).unwrap();
+            while let Some(ready) = scheduler.take_ready_input() {
+                submitted.push(ready);
+            }
+            assert_eq!(
+                pending_outputs.pop_front().ok_or(CodecError::OutputPending),
+                Err(CodecError::OutputPending)
+            );
+        }
+
+        assert_eq!(submitted, vec![1, 2]);
+
+        // A delayed MFT output is collected by a later command. The oldest
+        // queued output is returned as that command's single-frame result.
+        scheduler.observe(AsyncPumpEvent::HaveOutput).unwrap();
+        assert!(scheduler.take_output_event());
+        pending_outputs.push_back(1_u64);
+        assert_eq!(pending_outputs.pop_front(), Some(1));
+    }
+
+    #[test]
+    fn pending_output_does_not_close_the_worker_request_channel() {
+        let pending: Result<(), CodecError> = Err(CodecError::OutputPending);
+        let lost: Result<(), CodecError> = Err(CodecError::BackendLost);
+
+        assert!(!response_requires_worker_shutdown(&pending));
+        assert!(response_requires_worker_shutdown(&lost));
     }
 
     #[test]
