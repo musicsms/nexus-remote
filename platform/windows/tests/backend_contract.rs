@@ -1,3 +1,5 @@
+#[cfg(not(windows))]
+use platform_windows::WindowsCursorSource;
 use platform_windows::{BackendErrorKind, CursorSnapshot};
 
 fn cursor() -> CursorSnapshot {
@@ -37,5 +39,16 @@ fn cursor_rejects_rgba_payload_with_wrong_length() {
     assert_eq!(
         snapshot.validate().unwrap_err().kind(),
         BackendErrorKind::CursorPayloadLength
+    );
+}
+
+#[cfg(not(windows))]
+#[test]
+fn system_cursor_snapshot_fails_closed_off_windows() {
+    let mut cursor = WindowsCursorSource::system();
+
+    assert_eq!(
+        cursor.snapshot().unwrap_err().kind(),
+        BackendErrorKind::UnsupportedPlatform
     );
 }

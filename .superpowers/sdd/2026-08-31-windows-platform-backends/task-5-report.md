@@ -2,10 +2,17 @@
 
 ## Status
 
-Implemented the Windows H.264 encoder lifecycle with deterministic portable
-contracts and a compile-checked native Media Foundation boundary. The native
-path fails closed when unavailable; no software or simulated encoder is
-reported as Media Foundation success.
+Implemented the Windows H.264 encoder lifecycle with private deterministic
+unit contracts and a compile-checked native Media Foundation boundary. The
+native path fails closed when unavailable; no software or simulated encoder
+is reported as Media Foundation success. The public `VideoEncoder` API still
+returns one `EncodedFrame` per successful call; `CodecError::OutputPending`
+means an accepted asynchronous input has no output available yet.
+
+The chronological fix-round evidence below contains historical commands and
+test counts. Current validation uses the default private `codec.rs` unit tests:
+there is no exported transform seam, `codec_contract` integration target, or
+`test-support` feature in the current tree.
 
 ## TDD Evidence
 
@@ -14,7 +21,7 @@ reported as Media Foundation success.
 Command:
 
 ```text
-cargo test -p platform-windows --test codec_contract configuration
+cargo test -p platform-windows --lib codec::tests configuration
 ```
 
 Observed failure:
@@ -28,10 +35,9 @@ This was the expected absence failure before the encoder boundary existed.
 
 ### Configuration GREEN
 
-The same focused command passed the initial four configuration tests after the
-minimal state boundary was implemented. The final fresh run passed eight tests
-matching the `configuration` filter (including reconfiguration-named tests),
-with zero failures.
+The same focused private codec-unit test passed after the minimal state
+boundary was implemented. Current verification intentionally does not record
+an obsolete filtered-test count.
 
 Covered behavior:
 
@@ -50,7 +56,7 @@ minimal portable error and validation.
 Command:
 
 ```text
-cargo test -p platform-windows --test codec_contract keyframe
+cargo test -p platform-windows --lib codec::tests keyframe
 ```
 
 Observed result before transition logic:
@@ -71,7 +77,7 @@ their state was introduced during the minimal configuration implementation.
 
 ### Keyframe and Reconfiguration GREEN
 
-The same focused command passed all five tests after implementing validation,
+The same focused private codec-unit test passed after implementing validation,
 unavailable intermediate state, drain-before-configure ordering, conditional
 dimension forcing, and commit-after-success.
 
@@ -124,17 +130,14 @@ at this boundary:
 - `BackendUnavailable`
 - `BackendLost`
 
-The transform seam uses only portable types. It is documentation-hidden and
-exported solely so the integration contract can use a deterministic recording
-adapter; all Windows interfaces remain inside the private `cfg(windows)`
-module.
+The deterministic recording transform and all Windows interfaces are private
+to `codec.rs`; no transform test seam is exported from the platform crate.
 
 ## Files
 
 - `crates/nexus-codec/src/types.rs`
 - `platform/windows/src/codec.rs`
 - `platform/windows/src/lib.rs`
-- `platform/windows/tests/codec_contract.rs`
 - `platform/windows/tests/windows_codec_smoke.rs`
 
 ## Fresh Verification
@@ -142,8 +145,7 @@ module.
 All commands completed successfully:
 
 ```text
-cargo test -p platform-windows --test codec_contract configuration
-cargo test -p platform-windows --test codec_contract keyframe
+cargo test -p platform-windows --lib codec::tests
 cargo test -p nexus-codec -p platform-windows
 cargo clippy -p nexus-codec -p platform-windows --all-targets -- -D warnings
 cargo fmt --all -- --check
@@ -211,9 +213,9 @@ cargo clippy -p platform-windows --all-targets --target x86_64-pc-windows-gnu --
 git diff --check
 ```
 
-Focused final package results included 8 `nexus-codec` unit tests, 41 Windows
-unit tests, 12 codec contract tests, 5 other Windows contract tests, and zero
-failures. The entire workspace test command also completed with zero failures.
+Focused package suites completed with zero failures. Exact counts are omitted
+because the old codec-contract target and its historical counts no longer
+exist; the entire workspace test command also completed with zero failures.
 
 ## Self-Review
 
@@ -331,9 +333,9 @@ cargo clippy -p platform-windows --all-targets --target x86_64-pc-windows-gnu --
 git diff --check
 ```
 
-The package run passed 8 `nexus-codec` unit tests, 48 Windows crate unit
-tests, 12 codec-contract tests, 5 other Windows contract tests, and no
-failures. The full workspace test command passed with no failures.
+That historical package run passed with no failures. Its exact count and the
+retired codec-contract target are intentionally not presented as current
+validation; the full workspace test command also passed with no failures.
 
 ### Self-Review
 
@@ -417,7 +419,7 @@ cargo test -p platform-windows --lib codec::tests
 59 passed; 0 failed
 
 cargo test -p nexus-codec -p platform-windows
-8 nexus-codec tests, 59 Windows unit tests, 5 Windows contracts; 0 failures
+historical package suite passed with no failures
 ```
 
 The scheduler regression queues two inputs, supplies two NeedInput credits,
@@ -537,3 +539,15 @@ metadata preservation and non-fatal pending output.
 
 Fresh verification passed: desktop-host tests, codec/platform tests, workspace
 build, workspace clippy, Windows GNU check/clippy, formatting, and diff check.
+
+## Final Fix Wave (2026-09-02)
+
+The streamer now rejects an `EncodedFrame.frame_id` that cannot fit the
+protocol's `u32` wire header instead of silently narrowing it. The regression
+uses `u32::MAX + 1` and receives `StreamerError::FrameIdOutOfRange`.
+`CodecError::OutputPending` remains explicitly non-fatal: it emits no
+datagrams for that cycle, while every other codec error still propagates.
+
+The final wave reran formatting, the workspace build/test/clippy gates, GNU
+Windows target check/clippy, and `git diff --check`; all passed. Live Media
+Foundation execution remains an ignored interactive-Windows smoke test.

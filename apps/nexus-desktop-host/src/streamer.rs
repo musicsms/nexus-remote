@@ -41,6 +41,23 @@ mod tests {
             .unwrap();
         assert!(packets.is_empty());
     }
+
+    #[test]
+    fn packetization_rejects_frame_ids_that_do_not_fit_the_wire_header() {
+        let mut streamer =
+            HostVideoStreamer::new(SyntheticCaptureSource::new(2, 2, 30), [9; 32], 2, 2).unwrap();
+        let encoded = EncodedFrame {
+            frame_id: u64::from(u32::MAX) + 1,
+            timestamp_us: 123_456,
+            keyframe: false,
+            data: Bytes::from_static(b"encoded"),
+        };
+
+        assert!(matches!(
+            streamer.packetize_encoded_frame(encoded),
+            Err(StreamerError::FrameIdOutOfRange { frame_id }) if frame_id == u64::from(u32::MAX) + 1
+        ));
+    }
 }
 
 /// Errors arising during host video streaming pipeline.
@@ -60,6 +77,9 @@ pub enum StreamerError {
 
     #[error("Datagram encode error: {0}")]
     Datagram(#[from] nexus_transport::video::VideoDatagramError),
+
+    #[error("encoded frame ID {frame_id} exceeds the u32 wire-header range")]
+    FrameIdOutOfRange { frame_id: u64 },
 
     #[error("Channel closed")]
     ChannelClosed,
@@ -150,11 +170,15 @@ impl<C: CaptureSource> HostVideoStreamer<C> {
             flags_val |= flags::KEYFRAME;
         }
 
+        let frame_id =
+            u32::try_from(encoded.frame_id).map_err(|_| StreamerError::FrameIdOutOfRange {
+                frame_id: encoded.frame_id,
+            })?;
         let base_header = VideoPacketHeader {
             version: 1,
             flags: flags_val,
             stream_id: self.stream_id as u16,
-            frame_id: encoded.frame_id as u32,
+            frame_id,
             packet_id: 0,
             packet_count: 1,
             payload_len: 0,

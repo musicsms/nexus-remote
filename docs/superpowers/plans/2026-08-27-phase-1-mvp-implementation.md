@@ -55,7 +55,7 @@ W3 Windows agent/service ───────┘             │
 - [x] Compare DirectComposition/Win32 renderer options; record the selected client stack in ADR-027.
 - [x] Scaffold platform crate with `cfg(windows)` implementations and non-Windows compile stubs that return `UnsupportedPlatform`.
 - [x] Verify Linux workspace checks and GNU Windows-target test compilation: on 2026-09-02, `cargo fmt --all -- --check`, `cargo build --workspace`, `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo check -p platform-windows --target x86_64-pc-windows-gnu --tests` exited zero. The MSVC target was not installed, and live Windows hardware remains unverified.
-- [x] Update status to mark `platform/windows/` scaffolded and the ADRs done.
+- [x] Update status to mark `platform/windows/` **In progress** and the ADRs done.
 - [x] Run `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo fmt --all -- --check`.
 - [x] Commit: `feat(platform): scaffold Windows Phase 1 backends` (evidenced by commits `fde86ab`, `bcff411`, and `40f7946`; this fix round remains a documentation amendment).
 
@@ -91,7 +91,7 @@ W3 Windows agent/service ───────┘             │
 
 - **Implemented contracts:** the fresh Linux workspace build, tests, formatting, and lint checks above passed, including deterministic platform-backend contract tests.
 - **Cross-compiled native code:** `x86_64-pc-windows-gnu` is installed and the platform crate's test targets compile with it. `x86_64-pc-windows-msvc` is not installed, so this audit did not verify that target.
-- **Live Windows evidence:** unavailable. The ignored `windows_capture_smoke` and `windows_codec_smoke` tests require an interactive Windows desktop and Media Foundation hardware/driver support; they were not executed here. Therefore no WGC/DXGI API selection, frame dimensions, capture duration, encoder backend, access-unit size, encoder duration, or input-injection result is recorded. The codec smoke also currently emits no backend/timing/access-unit telemetry, so that output must be added before it can satisfy the measurement record when Windows hardware becomes available.
+- **Live Windows evidence:** unavailable. The ignored `windows_capture_smoke`, `windows_codec_smoke`, and `windows_input_cursor_smoke` tests require an interactive Windows desktop; capture/codec also require compatible Graphics Capture and Media Foundation hardware/driver support. They were not executed here. Therefore no WGC/DXGI API selection, frame dimensions, capture duration, encoder backend, access-unit size, encoder duration, cursor-capture result, or controlled `SendInput` result is recorded. The codec smoke also currently emits no backend/timing/access-unit telemetry, so that output must be added before it can satisfy the measurement record when Windows hardware becomes available.
 - **Phase result:** Phase 1 remains **In progress**. The real host/client/service/full-relay acceptance path and its interactive Windows hardware evidence remain unmet.
 
 ### Task 3: Complete Desktop-Host Runtime, Agent IPC, Service Runner, and Respawn

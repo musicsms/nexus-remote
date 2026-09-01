@@ -1,11 +1,21 @@
 use nexus_capture::{CaptureSource, CapturedFrame};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::{BackendError, BackendErrorKind, BackendResult};
 
 const DEFAULT_CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
+
+// `windows` 0.58 represents a successful COM call with a null interface as
+// `Error::empty()`. Its storage uses a nonzero niche represented by the
+// big-endian bytes of `S_OK`; current `Error::code()` normalizes that to zero.
+// Accept both forms at the native boundary so a projection-layout change
+// cannot turn ordinary pool exhaustion into a native failure.
+#[cfg(any(windows, test))]
+const WGC_EMPTY_INTERFACE_SENTINEL: i32 = i32::from_be_bytes(*b"S_OK");
 
 /// Windows capture APIs supported by the backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,8 +65,98 @@ pub struct WindowsCaptureSource {
     state: CaptureState,
     command_tx: Option<SyncSender<CaptureCommand>>,
     response_rx: Receiver<CaptureResponse>,
-    native_thread: Option<JoinHandle<()>>,
+    lifecycle: Arc<WorkerLifecycle>,
     control_timeout: Duration,
+}
+
+/// Retains ownership of a capture worker until it has been joined.
+///
+/// A caller can time out while a native driver is still in progress. In that
+/// case a named reaper owns the `JoinHandle`, preserving eventual COM and GPU
+/// cleanup without blocking the caller indefinitely.
+#[derive(Debug)]
+struct WorkerLifecycle {
+    worker: Mutex<Option<JoinHandle<()>>>,
+    reaping: AtomicBool,
+    finished: AtomicBool,
+}
+
+impl WorkerLifecycle {
+    fn new(worker: JoinHandle<()>) -> Arc<Self> {
+        Arc::new(Self {
+            worker: Mutex::new(Some(worker)),
+            reaping: AtomicBool::new(false),
+            finished: AtomicBool::new(false),
+        })
+    }
+
+    fn join_before(self: &Arc<Self>, deadline: Instant) -> BackendResult<()> {
+        let worker = self
+            .worker
+            .lock()
+            .expect("capture worker lifecycle lock poisoned")
+            .take();
+        let Some(worker) = worker else {
+            return Ok(());
+        };
+
+        while !worker.is_finished() {
+            let wait = match remaining(deadline) {
+                Ok(wait) => wait,
+                Err(error) => {
+                    *self
+                        .worker
+                        .lock()
+                        .expect("capture worker lifecycle lock poisoned") = Some(worker);
+                    self.reap_in_background();
+                    return Err(error);
+                }
+            };
+            thread::sleep(wait.min(Duration::from_millis(1)));
+        }
+
+        worker
+            .join()
+            .map_err(|_| BackendError::new(BackendErrorKind::NativeFailure))?;
+        self.finished.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    fn reap_in_background(self: &Arc<Self>) {
+        if self.reaping.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let lifecycle = Arc::clone(self);
+        if thread::Builder::new()
+            .name("nexus-windows-capture-reaper".to_owned())
+            .spawn(move || lifecycle.join_owned_worker())
+            .is_err()
+        {
+            self.reaping.store(false, Ordering::Release);
+        }
+    }
+
+    fn join_owned_worker(&self) {
+        let worker = self
+            .worker
+            .lock()
+            .expect("capture worker lifecycle lock poisoned")
+            .take();
+        if let Some(worker) = worker {
+            let _ = worker.join();
+        }
+        self.finished.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    fn reaping(&self) -> bool {
+        self.reaping.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    fn finished(&self) -> bool {
+        self.finished.load(Ordering::Acquire)
+    }
 }
 
 impl std::fmt::Debug for WindowsCaptureSource {
@@ -95,18 +195,26 @@ impl WindowsCaptureSource {
             .name("nexus-windows-capture".to_owned())
             .spawn(move || worker_main(config, factory, command_rx, response_tx))
             .map_err(|_| BackendErrorKind::InitializationFailed)?;
+        let lifecycle = WorkerLifecycle::new(native_thread);
 
         match response_rx.recv_timeout(control_timeout) {
             Ok(CaptureResponse::Started(Ok(api))) => Ok(Self {
                 state: CaptureState::Running(api),
                 command_tx: Some(command_tx),
                 response_rx,
-                native_thread: Some(native_thread),
+                lifecycle,
                 control_timeout,
             }),
-            Ok(CaptureResponse::Started(Err(error))) => Err(error),
-            Err(RecvTimeoutError::Timeout) => Err(BackendErrorKind::Timeout.into()),
+            Ok(CaptureResponse::Started(Err(error))) => {
+                lifecycle.reap_in_background();
+                Err(error)
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                lifecycle.reap_in_background();
+                Err(BackendErrorKind::Timeout.into())
+            }
             Ok(_) | Err(RecvTimeoutError::Disconnected) => {
+                lifecycle.reap_in_background();
                 Err(BackendErrorKind::InitializationFailed.into())
             }
         }
@@ -152,21 +260,13 @@ impl WindowsCaptureSource {
     }
 
     fn join_before(&mut self, deadline: Instant) -> BackendResult<()> {
-        let Some(handle) = self.native_thread.take() else {
-            return Ok(());
-        };
-        while !handle.is_finished() {
-            let wait = remaining(deadline)?;
-            thread::sleep(wait.min(Duration::from_millis(1)));
-        }
-        handle
-            .join()
-            .map_err(|_| BackendErrorKind::NativeFailure.into())
+        self.lifecycle.join_before(deadline)
     }
 
     fn transition_to_stopped(&mut self) {
         self.state = CaptureState::Stopped;
         self.command_tx.take();
+        self.lifecycle.reap_in_background();
     }
 }
 
@@ -220,14 +320,13 @@ impl CaptureSource for WindowsCaptureSource {
 
 impl Drop for WindowsCaptureSource {
     fn drop(&mut self) {
-        if self.state == CaptureState::Stopped {
-            return;
+        if self.state != CaptureState::Stopped {
+            self.state = CaptureState::Stopped;
+            if let Some(sender) = self.command_tx.take() {
+                let _ = sender.try_send(CaptureCommand::Stop);
+            }
         }
-        self.state = CaptureState::Stopped;
-        if let Some(sender) = self.command_tx.take() {
-            let _ = sender.try_send(CaptureCommand::Stop);
-        }
-        let _ = self.native_thread.take();
+        self.lifecycle.reap_in_background();
     }
 }
 
@@ -458,11 +557,17 @@ fn classify_windows_error_code(code: i32, fallback: BackendErrorKind) -> Backend
     }
 }
 
+#[cfg(any(windows, test))]
+fn is_wgc_pool_empty_error_code(code: i32) -> bool {
+    code == 0 || code == WGC_EMPTY_INTERFACE_SENTINEL
+}
+
 #[cfg(windows)]
 mod native {
     use super::{
         classify_windows_error_code, copy_bgra_rows, drain_newest_available_frame,
-        finish_acquired_frame, BackendError, BackendErrorKind, BackendResult, CaptureSession,
+        finish_acquired_frame, is_wgc_pool_empty_error_code, BackendError, BackendErrorKind,
+        BackendResult, CaptureSession,
     };
     use bytes::Bytes;
     use nexus_capture::{CapturedFrame, PixelFormat};
@@ -825,7 +930,7 @@ mod native {
                     notifications,
                     || match self.frame_pool.TryGetNextFrame() {
                         Ok(frame) => Ok(Some(frame)),
-                        Err(error) if error.code().0 == 0 => Ok(None),
+                        Err(error) if is_wgc_pool_empty_error_code(error.code().0) => Ok(None),
                         Err(_error) if self.closed.load(Ordering::Acquire) => {
                             Err(BackendErrorKind::DeviceLost.into())
                         }
@@ -1378,8 +1483,16 @@ mod tests {
         }
     }
 
+    fn wait_for_worker_reap(lifecycle: &WorkerLifecycle) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !lifecycle.finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(lifecycle.finished(), "worker was not eventually joined");
+    }
+
     #[test]
-    fn stop_timeout_detaches_a_stalled_native_thread() {
+    fn stop_timeout_retains_native_worker_for_background_reap() {
         let mut source = WindowsCaptureSource::start_with_factory_and_timeout(
             CaptureConfig::default(),
             SlowStopFactory {
@@ -1395,10 +1508,12 @@ mod tests {
         assert_eq!(error.kind(), BackendErrorKind::Timeout);
         assert!(started.elapsed() < Duration::from_millis(150));
         assert_eq!(source.state(), CaptureState::Stopped);
+        assert!(source.lifecycle.reaping());
+        wait_for_worker_reap(&source.lifecycle);
     }
 
     #[test]
-    fn drop_never_waits_for_native_session_cleanup() {
+    fn drop_returns_promptly_and_retains_native_worker_for_background_reap() {
         let source = WindowsCaptureSource::start_with_factory_and_timeout(
             CaptureConfig::default(),
             SlowStopFactory {
@@ -1407,11 +1522,14 @@ mod tests {
             Duration::from_millis(20),
         )
         .unwrap();
+        let lifecycle = Arc::clone(&source.lifecycle);
         let started = Instant::now();
 
         drop(source);
 
         assert!(started.elapsed() < Duration::from_millis(150));
+        assert!(lifecycle.reaping());
+        wait_for_worker_reap(&lifecycle);
     }
 
     struct SlowFrameFactory {
@@ -1551,6 +1669,38 @@ mod tests {
         let newest = drain_newest_available_frame(
             1,
             || Ok(available.pop_front().unwrap()),
+            |frame| {
+                discarded.push(frame);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(newest, 2);
+        assert_eq!(discarded, vec![1]);
+    }
+
+    #[test]
+    fn frame_drain_recognizes_the_projection_empty_interface_sentinel() {
+        // windows-result stores `Error::empty()` with the nonzero `S_OK`
+        // niche sentinel. The target-only windows crate is intentionally not
+        // linked into Linux unit tests, so simulate the generated projection's
+        // raw empty-interface representation directly here. The public
+        // accessor path still supplies HRESULT(0), which remains accepted.
+        assert!(is_wgc_pool_empty_error_code(0));
+        assert!(is_wgc_pool_empty_error_code(WGC_EMPTY_INTERFACE_SENTINEL));
+
+        let mut available =
+            VecDeque::from([Ok(1_u64), Ok(2_u64), Err(i32::from_be_bytes(*b"S_OK"))]);
+        let mut discarded = Vec::new();
+
+        let newest = drain_newest_available_frame(
+            1,
+            || match available.pop_front().unwrap() {
+                Ok(frame) => Ok(Some(frame)),
+                Err(code) if is_wgc_pool_empty_error_code(code) => Ok(None),
+                Err(_) => Err(BackendErrorKind::NativeFailure.into()),
+            },
             |frame| {
                 discarded.push(frame);
                 Ok(())

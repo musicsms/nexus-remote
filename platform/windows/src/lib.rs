@@ -10,6 +10,6 @@ mod input;
 
 pub use capture::{CaptureApi, CaptureConfig, CaptureState, WindowsCaptureSource};
 pub use codec::WindowsH264Encoder;
-pub use cursor::CursorSnapshot;
+pub use cursor::{CursorSnapshot, WindowsCursorSource};
 pub use error::{BackendError, BackendErrorKind, BackendResult};
 pub use input::{InputInjector, MonitorBounds, SystemInputApi};
