@@ -17,7 +17,7 @@ Status legend: **Not started** (path/doc does not exist yet) · **Scaffolded**
 progress** (real implementation underway, not feature-complete) · **Done**
 (meets the relevant Definition of Done / exit condition in the spec).
 
-Last audited: 2026-08-31.
+Last audited: 2026-09-02.
 
 ---
 
@@ -26,7 +26,7 @@ Last audited: 2026-08-31.
 | Phase | Scope | Exit condition | Status |
 |---|---|---|---|
 | Phase 0 — Foundation | Workspace, CI, protocol crate, QUIC PoC, Windows capture PoC, H.264 encoder PoC | Capture a Windows desktop and stream frames between two local processes | **Done for OS-independent foundation** — protocol, capture/queue, software codec, crypto, fragmentation/reassembly, and QUIC loopback are verified end-to-end in `phase0_e2e_pipeline`; live Windows Graphics Capture/DXGI and hardware H.264 remain Phase 1 platform work |
-| Phase 1 — MVP v0.1 | Windows host/client, minimal nexusd, enrollment, relay-only QUIC, H.264 1080p60, input, cursor, reconnect, telemetry overlay | User can enroll a host + client and control it over the Internet through a relay | **In progress** — SQLite persistence and Windows backend/API scaffolding are complete; real Windows hardware/session acceptance remains unverified |
+| Phase 1 — MVP v0.1 | Windows host/client, minimal nexusd, enrollment, relay-only QUIC, H.264 1080p60, input, cursor, reconnect, telemetry overlay | User can enroll a host + client and control it over the Internet through a relay | **In progress** — SQLite persistence, portable Windows-backend contracts, and Windows-native source implementations are present. Fresh Linux workspace checks and GNU Windows-target test compilation pass; MSVC-target compilation and interactive Windows WGC/DXGI/Media Foundation/input evidence remain unverified, as do the client/service/full-relay exit conditions. |
 | Phase 2 — v0.2 Connectivity | Candidate discovery, hole punching, P2P QUIC, adaptive bitrate, clipboard text | P2P succeeds on common NATs, falls back to relay | Not started |
 | Phase 3 — v0.3 Productization | File transfer, audio, recording, RBAC, audit UI/API, signed updates | — | Not started |
 | Phase 4 — v0.5 Enterprise | OIDC, SAML, WebAuthn, access requests, device labels, ABAC | — | Not started |
@@ -78,7 +78,7 @@ repo yet.
 
 | Path | Purpose (Spec) | Status |
 |---|---|---|
-| `platform/windows/` | Windows-specific OS/codec bindings | **Scaffolded** — backend traits, fail-closed non-Windows stubs, and Phase 1 API-selection ADRs; native WGC/DXGI/Media Foundation implementations remain next |
+| `platform/windows/` | Windows-specific OS/codec bindings | **In progress** — portable capture/codec/input/cursor contracts and cfg-gated WGC→DXGI capture selection, DXGI capture, Media Foundation H.264, and SendInput source implementations are present. Linux contract tests and `x86_64-pc-windows-gnu` `--tests` compilation pass; the installed toolchain lacks the MSVC target, and no interactive Windows hardware has verified WGC/DXGI capture, Media Foundation encoding, or input injection. |
 | `platform/macos/` | macOS-specific bindings (Phase 5) | Not started |
 | `platform/linux/` | Linux-specific bindings (Phase 5) | Not started |
 | `proto/` | Protobuf schemas (Section 33) | Scaffolded — `proto/nexus.proto` defines the Phase 0 session, input, monitor, cursor, and capability messages (package `nexus.protocol.v1`), compiled into `nexus-protocol` by `build.rs` via `prost-build` |
