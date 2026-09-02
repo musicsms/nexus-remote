@@ -97,17 +97,13 @@ pub(crate) fn validate_frame(frame: &DecodedFrameJob) -> Result<(), RenderQueueE
 }
 
 #[cfg(windows)]
-pub(crate) fn native_renderer_smoke() -> Result<(), crate::decoder::DecoderError> {
-    let mut renderer = native::D3D11Renderer::start()?;
-    renderer.present(crate::decoder::DecodedSurface {
-        frame_id: 0,
-        timestamp_us: 0,
-        keyframe: true,
-        width: 2,
-        height: 2,
-        format: crate::decoder::SurfaceFormat::Rgba8,
-        bytes: vec![0; 16],
-    })
+pub(crate) fn native_renderer_smoke(
+    hwnd: isize,
+    surface: crate::decoder::DecodedSurface,
+) -> Result<(), crate::decoder::DecoderError> {
+    let mut renderer =
+        native::D3D11Renderer::start_for_window(windows::Win32::Foundation::HWND(hwnd))?;
+    renderer.present(surface)
 }
 
 #[cfg(windows)]
@@ -133,8 +129,8 @@ pub(crate) mod native {
         DXGI_RATIONAL, DXGI_SAMPLE_DESC,
     };
     use windows::Win32::Graphics::Dxgi::{
-        IDXGISwapChain, DXGI_SWAP_CHAIN_DESC, DXGI_SWAP_EFFECT_DISCARD,
-        DXGI_USAGE_RENDER_TARGET_OUTPUT,
+        IDXGISwapChain, DXGI_PRESENT, DXGI_SWAP_CHAIN_DESC, DXGI_SWAP_CHAIN_FLAG,
+        DXGI_SWAP_EFFECT_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT,
     };
 
     const COMMAND_TIMEOUT: Duration = Duration::from_millis(250);
@@ -288,6 +284,7 @@ pub(crate) mod native {
             return;
         };
         let _ = started.send(Ok(()));
+        let mut presentation_size = None;
 
         while let Ok(command) = receiver.recv() {
             match command {
@@ -296,7 +293,13 @@ pub(crate) mod native {
                     // checked by the decoder.  The actual HWND/swap-chain
                     // attachment is deliberately deferred to the window task;
                     // keeping the device here prevents it crossing Tokio.
-                    let result = upload_surface(&device, &context, swap_chain.as_ref(), &surface);
+                    let result = upload_surface(
+                        &device,
+                        &context,
+                        swap_chain.as_ref(),
+                        &mut presentation_size,
+                        &surface,
+                    );
                     let _ = reply.send(result);
                 }
                 RendererCommand::Shutdown(reply) => {
@@ -314,25 +317,24 @@ pub(crate) mod native {
         device: &ID3D11Device,
         context: &ID3D11DeviceContext,
         swap_chain: Option<&IDXGISwapChain>,
+        presentation_size: &mut Option<(u32, u32)>,
         surface: &DecodedSurface,
     ) -> Result<(), DecoderError> {
         surface.validate()?;
-        let mut converted = None;
         let (bytes, format, row_pitch) = match (surface.format, swap_chain.is_some()) {
-            (SurfaceFormat::Nv12, true) => {
-                converted = Some(nv12_to_bgra(surface)?);
-                (
-                    converted.as_deref().expect("converted surface exists"),
-                    DXGI_FORMAT_B8G8R8A8_UNORM,
-                    surface
-                        .width
-                        .checked_mul(4)
-                        .ok_or(DecoderError::InvalidDimensions)?,
-                )
+            (SurfaceFormat::Nv12, true) => (
+                nv12_to_bgra(surface)?,
+                DXGI_FORMAT_B8G8R8A8_UNORM,
+                surface
+                    .width
+                    .checked_mul(4)
+                    .ok_or(DecoderError::InvalidDimensions)?,
+            ),
+            (SurfaceFormat::Nv12, false) => {
+                (surface.bytes.clone(), DXGI_FORMAT_NV12, surface.width)
             }
-            (SurfaceFormat::Nv12, false) => (&surface.bytes, DXGI_FORMAT_NV12, surface.width),
             (SurfaceFormat::Rgba8, true) => (
-                &surface.bytes,
+                rgba_to_bgra(surface)?,
                 DXGI_FORMAT_B8G8R8A8_UNORM,
                 surface
                     .width
@@ -340,7 +342,7 @@ pub(crate) mod native {
                     .ok_or(DecoderError::InvalidDimensions)?,
             ),
             (SurfaceFormat::Rgba8, false) => (
-                &surface.bytes,
+                surface.bytes.clone(),
                 DXGI_FORMAT_R8G8B8A8_UNORM,
                 surface
                     .width
@@ -375,12 +377,57 @@ pub(crate) mod native {
             context.UpdateSubresource(&texture, 0, None, bytes.as_ptr().cast(), row_pitch, 0)
         };
         if let Some(swap_chain) = swap_chain {
-            let back_buffer: ID3D11Texture2D =
+            let requested_size = (surface.width, surface.height);
+            if *presentation_size != Some(requested_size) {
+                // SAFETY: this worker exclusively owns the swap chain and has
+                // released all backbuffer references before resizing it.
+                unsafe {
+                    swap_chain.ResizeBuffers(
+                        0,
+                        surface.width,
+                        surface.height,
+                        DXGI_FORMAT_B8G8R8A8_UNORM,
+                        DXGI_SWAP_CHAIN_FLAG(0),
+                    )
+                }
+                .map_err(|_| DecoderError::BackendLost)?;
+                *presentation_size = Some(requested_size);
+            }
+            let mut back_buffer: ID3D11Texture2D =
                 unsafe { swap_chain.GetBuffer(0) }.map_err(|_| DecoderError::BackendLost)?;
+            // The window may have been resized independently of the decoded
+            // stream since the last frame.  `presentation_size` is only a
+            // cache, so verify the actual back-buffer dimensions immediately
+            // before CopyResource; that API requires identical extents.
+            let back_buffer_desc = unsafe { back_buffer.GetDesc() };
+            if (back_buffer_desc.Width, back_buffer_desc.Height) != requested_size {
+                drop(back_buffer);
+                unsafe {
+                    swap_chain.ResizeBuffers(
+                        0,
+                        surface.width,
+                        surface.height,
+                        DXGI_FORMAT_B8G8R8A8_UNORM,
+                        DXGI_SWAP_CHAIN_FLAG(0),
+                    )
+                }
+                .map_err(|_| DecoderError::BackendLost)?;
+                *presentation_size = Some(requested_size);
+                back_buffer =
+                    unsafe { swap_chain.GetBuffer(0) }.map_err(|_| DecoderError::BackendLost)?;
+            }
+            let back_buffer_desc = unsafe { back_buffer.GetDesc() };
+            if (back_buffer_desc.Width, back_buffer_desc.Height) != requested_size
+                || back_buffer_desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM
+            {
+                return Err(DecoderError::BackendLost);
+            }
             // SAFETY: both textures are owned by this D3D11 device and the
-            // swap-chain path normalizes decoded NV12 to its BGRA backbuffer.
+            // swap-chain path normalizes decoded surfaces to a BGRA texture
+            // with the same dimensions as the backbuffer.
             unsafe { context.CopyResource(&back_buffer, &texture) };
-            unsafe { swap_chain.Present(1, 0) }.map_err(|_| DecoderError::BackendLost)?;
+            unsafe { swap_chain.Present(1, DXGI_PRESENT(0)) }
+                .map_err(|_| DecoderError::BackendLost)?;
         }
         Ok(())
     }
@@ -415,6 +462,17 @@ pub(crate) mod native {
                 bgra[dst + 2] = red.clamp(0, 255) as u8;
                 bgra[dst + 3] = 255;
             }
+        }
+        Ok(bgra)
+    }
+
+    fn rgba_to_bgra(surface: &DecodedSurface) -> Result<Vec<u8>, DecoderError> {
+        let mut bgra = Vec::with_capacity(surface.bytes.len());
+        for rgba in surface.bytes.chunks_exact(4) {
+            bgra.extend_from_slice(&[rgba[2], rgba[1], rgba[0], rgba[3]]);
+        }
+        if bgra.len() != surface.bytes.len() {
+            return Err(DecoderError::InvalidSurface);
         }
         Ok(bgra)
     }

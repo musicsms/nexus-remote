@@ -13,11 +13,10 @@ pub use receiver::{
 };
 pub use renderer::{RenderQueue, RenderQueueError};
 
-/// Starts the private Media Foundation and D3D11 adapters, then uploads one
-/// synthetic decoded surface. It is only an interactive Windows smoke check;
-/// the authenticated receiver-to-decoder flow is covered by the loopback task.
+/// Decodes an already authenticated H.264 job and presents it to the explicit
+/// interactive HWND. This is Windows-only smoke plumbing, not a portable UI.
 #[cfg(windows)]
-pub fn interactive_windows_media_smoke() -> Result<(), String> {
-    decoder::native_decoder_smoke().map_err(|error| error.to_string())?;
-    renderer::native_renderer_smoke().map_err(|error| error.to_string())
+pub fn interactive_windows_media_smoke(hwnd: isize, job: DecodedFrameJob) -> Result<(), String> {
+    let surface = decoder::native_decoder_smoke(job).map_err(|error| error.to_string())?;
+    renderer::native_renderer_smoke(hwnd, surface).map_err(|error| error.to_string())
 }

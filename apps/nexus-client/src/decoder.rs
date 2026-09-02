@@ -429,6 +429,9 @@ pub(crate) mod native {
             for _ in 0..MAX_OUTPUTS_PER_SUBMISSION {
                 let (sample, more_output) = self.take_one_output()?;
                 let Some(sample) = sample else {
+                    if more_output {
+                        continue;
+                    }
                     return Ok(());
                 };
                 let timestamp_hns =
@@ -485,9 +488,15 @@ pub(crate) mod native {
             let sample = if transform_provides_sample {
                 None
             } else {
-                let expected = nv12_len(self.width, self.height)?;
-                let capacity = u32::try_from(expected.max(info.cbSize as usize))
-                    .map_err(|_| DecoderError::InvalidDimensions)?;
+                let expected = validated_nv12_len(self.width, self.height)?;
+                let announced =
+                    usize::try_from(info.cbSize).map_err(|_| DecoderError::InvalidDimensions)?;
+                let capacity = expected.max(announced);
+                if capacity > super::MAX_SURFACE_BYTES {
+                    return Err(DecoderError::InvalidSurface);
+                }
+                let capacity =
+                    u32::try_from(capacity).map_err(|_| DecoderError::InvalidDimensions)?;
                 let sample = unsafe { MFCreateSample() }.map_err(|_| DecoderError::BackendLost)?;
                 let buffer = unsafe { MFCreateMemoryBuffer(capacity) }
                     .map_err(|_| DecoderError::BackendLost)?;
@@ -511,9 +520,10 @@ pub(crate) mod native {
             let events = unsafe { ManuallyDrop::take(&mut output.pEvents) };
             drop(events);
             match result {
-                Ok(()) if output.dwStatus & MFT_OUTPUT_DATA_BUFFER_NO_SAMPLE.0 as u32 != 0 => {
-                    Ok((None, false))
-                }
+                Ok(()) if output.dwStatus & MFT_OUTPUT_DATA_BUFFER_NO_SAMPLE.0 as u32 != 0 => Ok((
+                    None,
+                    output.dwStatus & MFT_OUTPUT_DATA_BUFFER_INCOMPLETE.0 as u32 != 0,
+                )),
                 Ok(()) => Ok((
                     sample,
                     output.dwStatus & MFT_OUTPUT_DATA_BUFFER_INCOMPLETE.0 as u32 != 0,
@@ -695,11 +705,33 @@ pub(crate) mod native {
         height: u32,
     ) -> Result<(Vec<u8>, usize), DecoderError> {
         let width_usize = usize::try_from(width).map_err(|_| DecoderError::InvalidDimensions)?;
+        let max_length = usize::try_from(
+            unsafe { buffer.GetMaxLength() }.map_err(|_| DecoderError::BackendLost)?,
+        )
+        .map_err(|_| DecoderError::InvalidSurface)?;
+        if max_length > super::MAX_SURFACE_BYTES {
+            return Err(DecoderError::InvalidSurface);
+        }
+        let actual_length = usize::try_from(
+            unsafe { buffer.GetCurrentLength() }.map_err(|_| DecoderError::BackendLost)?,
+        )
+        .map_err(|_| DecoderError::InvalidSurface)?;
+        if actual_length > max_length {
+            return Err(DecoderError::InvalidSurface);
+        }
         let rows = usize::try_from(height)
             .ok()
             .and_then(|height| height.checked_add(height / 2))
             .ok_or(DecoderError::InvalidDimensions)?;
         if let Ok(buffer_2d) = buffer.cast::<IMF2DBuffer>() {
+            let contiguous_length = usize::try_from(
+                unsafe { buffer_2d.GetContiguousLength() }
+                    .map_err(|_| DecoderError::BackendLost)?,
+            )
+            .map_err(|_| DecoderError::InvalidSurface)?;
+            if contiguous_length > max_length {
+                return Err(DecoderError::InvalidSurface);
+            }
             let mut source = ptr::null_mut();
             let mut signed_pitch = 0_i32;
             unsafe { buffer_2d.Lock2D(&mut source, &mut signed_pitch) }
@@ -716,6 +748,13 @@ pub(crate) mod native {
                 let length = pitch
                     .checked_mul(rows)
                     .ok_or(DecoderError::InvalidDimensions)?;
+                let expected = validated_nv12_len(width, height)?;
+                if length > super::MAX_SURFACE_BYTES
+                    || length > contiguous_length
+                    || actual_length < expected
+                {
+                    return Err(DecoderError::InvalidSurface);
+                }
                 // SAFETY: Lock2D returned `source` with `pitch * rows` bytes
                 // for the negotiated NV12 surface; copying finishes before Unlock2D.
                 Ok((
@@ -727,9 +766,8 @@ pub(crate) mod native {
             unlock.map_err(|_| DecoderError::BackendLost)?;
             return result;
         }
-        let length = unsafe { buffer.GetCurrentLength() }.map_err(|_| DecoderError::BackendLost)?;
         let expected = validated_nv12_len(width, height)?;
-        if length as usize != expected {
+        if actual_length != expected {
             return Err(DecoderError::InvalidSurface);
         }
         let mut source = ptr::null_mut();
@@ -740,15 +778,14 @@ pub(crate) mod native {
         }
         // SAFETY: Media Foundation reports the current length for its live
         // locked buffer, and this worker copies it before Unlock.
-        let bytes = unsafe { std::slice::from_raw_parts(source, length as usize) }.to_vec();
+        let bytes = unsafe { std::slice::from_raw_parts(source, actual_length) }.to_vec();
         unsafe { buffer.Unlock() }.map_err(|_| DecoderError::BackendLost)?;
         Ok((bytes, width_usize))
     }
 }
 
 #[cfg(windows)]
-pub(crate) fn native_decoder_smoke() -> Result<(), DecoderError> {
-    let decoder = native::MediaFoundationDecoder::start(1_280, 720)?;
-    drop(decoder);
-    Ok(())
+pub(crate) fn native_decoder_smoke(job: DecodedFrameJob) -> Result<DecodedSurface, DecoderError> {
+    let mut decoder = native::MediaFoundationDecoder::start(1_280, 720)?;
+    decoder.decode(job)?.ok_or(DecoderError::BackendUnavailable)
 }
