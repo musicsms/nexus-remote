@@ -5,6 +5,8 @@ pub mod renderer;
 pub mod session;
 
 mod decoder;
+#[cfg(windows)]
+mod native_worker;
 
 pub use receiver::{
     ClientInputError, ClientInputSender, ClientReceiver, ClientReceiverError, DecodedFrameJob,

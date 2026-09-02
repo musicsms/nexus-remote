@@ -32,23 +32,7 @@ pub(crate) struct DecodedSurface {
 
 impl DecodedSurface {
     pub(crate) fn validate(&self) -> Result<(), DecoderError> {
-        if self.width == 0
-            || self.height == 0
-            || self.width > MAX_SURFACE_WIDTH
-            || self.height > MAX_SURFACE_HEIGHT
-            || !self.width.is_multiple_of(2)
-            || !self.height.is_multiple_of(2)
-        {
-            return Err(DecoderError::InvalidDimensions);
-        }
-        let pixels = usize::try_from(self.width)
-            .ok()
-            .and_then(|width| {
-                usize::try_from(self.height)
-                    .ok()
-                    .and_then(|height| width.checked_mul(height))
-            })
-            .ok_or(DecoderError::InvalidDimensions)?;
+        let pixels = validated_pixel_count(self.width, self.height)?;
         let expected = match self.format {
             SurfaceFormat::Nv12 => pixels.checked_add(pixels / 2),
             SurfaceFormat::Rgba8 => pixels.checked_mul(4),
@@ -59,6 +43,38 @@ impl DecodedSurface {
         }
         Ok(())
     }
+}
+
+fn validated_pixel_count(width: u32, height: u32) -> Result<usize, DecoderError> {
+    if width == 0
+        || height == 0
+        || width > MAX_SURFACE_WIDTH
+        || height > MAX_SURFACE_HEIGHT
+        || !width.is_multiple_of(2)
+        || !height.is_multiple_of(2)
+    {
+        return Err(DecoderError::InvalidDimensions);
+    }
+    let pixels = usize::try_from(width)
+        .ok()
+        .and_then(|width| {
+            usize::try_from(height)
+                .ok()
+                .and_then(|height| width.checked_mul(height))
+        })
+        .ok_or(DecoderError::InvalidDimensions)?;
+    Ok(pixels)
+}
+
+fn validated_nv12_len(width: u32, height: u32) -> Result<usize, DecoderError> {
+    let pixels = validated_pixel_count(width, height)?;
+    let bytes = pixels
+        .checked_add(pixels / 2)
+        .ok_or(DecoderError::InvalidDimensions)?;
+    if bytes > MAX_SURFACE_BYTES {
+        return Err(DecoderError::InvalidDimensions);
+    }
+    Ok(bytes)
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -83,12 +99,78 @@ pub(crate) trait FrameDecoder {
     fn decode(&mut self, job: DecodedFrameJob) -> Result<Option<DecodedSurface>, DecoderError>;
 }
 
-fn validate_decoder_job(job: &DecodedFrameJob) -> Result<(), DecoderError> {
-    validate_frame(job)?;
-    if !job.keyframe || !contains_h264_sequence_header(&job.access_unit) {
-        return Err(DecoderError::MissingSequenceHeader);
+/// Tracks the only stream transition that needs an H.264 sequence header:
+/// decoder initialization/recovery. Once initialized, ordinary inter frames
+/// remain valid decoder input.
+#[derive(Debug, Default)]
+struct DecoderGate {
+    initialized: bool,
+}
+
+impl DecoderGate {
+    fn accept(&mut self, job: &DecodedFrameJob) -> Result<(), DecoderError> {
+        validate_frame(job)?;
+        if !self.initialized {
+            if !job.keyframe || !contains_h264_sequence_header(&job.access_unit) {
+                return Err(DecoderError::MissingSequenceHeader);
+            }
+            self.initialized = true;
+        }
+        Ok(())
     }
-    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn job(keyframe: bool, access_unit: &[u8]) -> DecodedFrameJob {
+        DecodedFrameJob {
+            frame_id: 1,
+            timestamp_us: 1,
+            keyframe,
+            access_unit: access_unit.to_vec(),
+        }
+    }
+
+    #[test]
+    fn gate_requires_a_sequence_header_only_until_decoder_initialization() {
+        let mut gate = DecoderGate::default();
+
+        assert_eq!(
+            gate.accept(&job(false, b"inter")),
+            Err(DecoderError::MissingSequenceHeader)
+        );
+        assert!(gate.accept(&job(true, b"\0\0\0\x01\x67\x64")).is_ok());
+        assert!(gate.accept(&job(false, b"ordinary-inter-frame")).is_ok());
+    }
+
+    #[test]
+    fn surface_validation_rejects_dimensions_beyond_the_native_cap() {
+        let surface = DecodedSurface {
+            frame_id: 1,
+            timestamp_us: 1,
+            keyframe: true,
+            width: MAX_SURFACE_WIDTH + 2,
+            height: 2,
+            format: SurfaceFormat::Nv12,
+            bytes: vec![0; 3],
+        };
+
+        assert_eq!(surface.validate(), Err(DecoderError::InvalidDimensions));
+    }
+
+    #[test]
+    fn repacks_padded_nv12_rows_without_copying_padding() {
+        let padded = [
+            1, 2, 3, 4, 90, 90, 5, 6, 7, 8, 91, 91, 9, 10, 11, 12, 92, 92,
+        ];
+
+        assert_eq!(
+            repack_nv12(&padded, 6, 4, 2).unwrap(),
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        );
+    }
 }
 
 fn contains_h264_sequence_header(access_unit: &[u8]) -> bool {
@@ -97,38 +179,86 @@ fn contains_h264_sequence_header(access_unit: &[u8]) -> bool {
 }
 
 #[cfg(not(windows))]
-pub(crate) struct PlatformFrameDecoder;
+#[derive(Default)]
+pub(crate) struct PlatformFrameDecoder {
+    gate: DecoderGate,
+}
 
 #[cfg(not(windows))]
 impl FrameDecoder for PlatformFrameDecoder {
     fn decode(&mut self, job: DecodedFrameJob) -> Result<Option<DecodedSurface>, DecoderError> {
-        validate_decoder_job(&job)?;
+        self.gate.accept(&job)?;
         Err(DecoderError::BackendUnavailable)
     }
+}
+
+fn repack_nv12(
+    source: &[u8],
+    stride: usize,
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>, DecoderError> {
+    let pixels = validated_pixel_count(width, height)?;
+    let width = usize::try_from(width).map_err(|_| DecoderError::InvalidDimensions)?;
+    let height = usize::try_from(height).map_err(|_| DecoderError::InvalidDimensions)?;
+    if stride < width {
+        return Err(DecoderError::InvalidSurface);
+    }
+    let rows = height
+        .checked_add(height / 2)
+        .ok_or(DecoderError::InvalidDimensions)?;
+    let required = stride
+        .checked_mul(rows)
+        .ok_or(DecoderError::InvalidDimensions)?;
+    if source.len() < required {
+        return Err(DecoderError::InvalidSurface);
+    }
+    let output_len = pixels
+        .checked_add(pixels / 2)
+        .filter(|length| *length <= MAX_SURFACE_BYTES)
+        .ok_or(DecoderError::InvalidDimensions)?;
+    let mut packed = vec![0_u8; output_len];
+    for row in 0..height {
+        let src_start = row * stride;
+        let dst_start = row * width;
+        packed[dst_start..dst_start + width].copy_from_slice(&source[src_start..src_start + width]);
+    }
+    let source_uv = height * stride;
+    let destination_uv = pixels;
+    for row in 0..height / 2 {
+        let src_start = source_uv + row * stride;
+        let dst_start = destination_uv + row * width;
+        packed[dst_start..dst_start + width].copy_from_slice(&source[src_start..src_start + width]);
+    }
+    Ok(packed)
 }
 
 #[cfg(windows)]
 pub(crate) mod native {
     use super::{
-        contains_h264_sequence_header, validate_decoder_job, DecodedFrameJob, DecodedSurface,
-        DecoderError, FrameDecoder, SurfaceFormat,
+        repack_nv12, validated_nv12_len, validated_pixel_count, DecodedFrameJob, DecodedSurface,
+        DecoderError, DecoderGate, FrameDecoder, SurfaceFormat,
     };
+    use crate::native_worker::WorkerLifecycle;
+    use std::collections::VecDeque;
     use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
-    use std::thread::{self, JoinHandle};
-    use std::time::Duration;
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::{Duration, Instant};
     use std::{mem::ManuallyDrop, ptr};
     use windows::core::Interface;
     use windows::Win32::Media::MediaFoundation::{
-        IMFMediaBuffer, IMFShutdown, IMFTransform, MFCreateMediaType, MFCreateMemoryBuffer,
-        MFCreateSample, MFMediaType_Video, MFShutdown, MFStartup, MFTEnumEx, MFVideoFormat_H264,
-        MFVideoFormat_NV12, MFVideoInterlace_Progressive, MFSTARTUP_FULL,
+        IMF2DBuffer, IMFMediaBuffer, IMFShutdown, IMFTransform, MFCreateMediaType,
+        MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video, MFShutdown, MFStartup, MFTEnumEx,
+        MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoInterlace_Progressive, MFSTARTUP_FULL,
         MFT_CATEGORY_VIDEO_DECODER, MFT_ENUM_FLAG, MFT_ENUM_FLAG_SORTANDFILTER,
         MFT_ENUM_FLAG_SYNCMFT, MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
         MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
-        MFT_OUTPUT_DATA_BUFFER_NO_SAMPLE, MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES,
-        MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MF_E_TRANSFORM_NEED_MORE_INPUT,
-        MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_PIXEL_ASPECT_RATIO,
-        MF_MT_SUBTYPE, MF_VERSION,
+        MFT_OUTPUT_DATA_BUFFER_INCOMPLETE, MFT_OUTPUT_DATA_BUFFER_NO_SAMPLE,
+        MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES,
+        MFT_REGISTER_TYPE_INFO, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_MT_FRAME_SIZE,
+        MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE,
+        MF_VERSION,
     };
     use windows::Win32::System::Com::{
         CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_MULTITHREADED,
@@ -136,6 +266,7 @@ pub(crate) mod native {
 
     const STARTUP_TIMEOUT: Duration = Duration::from_secs(2);
     const REQUEST_TIMEOUT: Duration = Duration::from_millis(250);
+    const MAX_PENDING_DECODED_FRAMES: usize = 8;
 
     enum DecoderCommand {
         Decode(
@@ -149,28 +280,32 @@ pub(crate) mod native {
     /// the `nexus-client-decoder` worker.
     pub(super) struct MediaFoundationDecoder {
         commands: Option<SyncSender<DecoderCommand>>,
-        worker: Option<JoinHandle<()>>,
+        lifecycle: Arc<WorkerLifecycle>,
+        gate: DecoderGate,
     }
 
     impl MediaFoundationDecoder {
         pub(super) fn start(width: u32, height: u32) -> Result<Self, DecoderError> {
+            validated_nv12_len(width, height)?;
             let (commands, receiver) = sync_channel(1);
             let (started_tx, started_rx) = sync_channel(1);
             let worker = thread::Builder::new()
                 .name("nexus-client-decoder".to_owned())
                 .spawn(move || decoder_main(width, height, receiver, started_tx))
                 .map_err(|_| DecoderError::BackendUnavailable)?;
+            let lifecycle = WorkerLifecycle::new(worker);
             match started_rx.recv_timeout(STARTUP_TIMEOUT) {
                 Ok(Ok(())) => Ok(Self {
                     commands: Some(commands),
-                    worker: Some(worker),
+                    lifecycle,
+                    gate: DecoderGate::default(),
                 }),
                 Ok(Err(error)) => {
-                    let _ = worker.join();
+                    lifecycle.reap_in_background();
                     Err(error)
                 }
                 Err(_) => {
-                    drop(worker);
+                    lifecycle.reap_in_background();
                     Err(DecoderError::BackendUnavailable)
                 }
             }
@@ -182,15 +317,13 @@ pub(crate) mod native {
                 let _ = commands.try_send(DecoderCommand::Shutdown(reply_tx));
                 let _ = reply_rx.recv_timeout(REQUEST_TIMEOUT);
             }
-            if let Some(worker) = self.worker.take() {
-                let _ = worker.join();
-            }
+            self.lifecycle.join_before(Instant::now() + REQUEST_TIMEOUT);
         }
     }
 
     impl FrameDecoder for MediaFoundationDecoder {
         fn decode(&mut self, job: DecodedFrameJob) -> Result<Option<DecodedSurface>, DecoderError> {
-            validate_decoder_job(&job)?;
+            self.gate.accept(&job)?;
             let (reply_tx, reply_rx) = sync_channel(1);
             self.commands
                 .as_ref()
@@ -213,14 +346,22 @@ pub(crate) mod native {
         transform: IMFTransform,
         width: u32,
         height: u32,
+        gate: DecoderGate,
+        pending_inputs: VecDeque<PendingFrame>,
+        pending_surfaces: VecDeque<DecodedSurface>,
         media_foundation_started: bool,
+    }
+
+    struct PendingFrame {
+        frame_id: u32,
+        timestamp_us: u64,
+        timestamp_hns: i64,
+        keyframe: bool,
     }
 
     impl NativeDecoder {
         fn start(width: u32, height: u32) -> Result<Self, DecoderError> {
-            if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
-                return Err(DecoderError::InvalidDimensions);
-            }
+            validated_nv12_len(width, height)?;
             // SAFETY: paired with MFShutdown below on this worker thread.
             unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL) }
                 .map_err(|_| DecoderError::BackendUnavailable)?;
@@ -255,26 +396,86 @@ pub(crate) mod native {
                 transform,
                 width,
                 height,
+                gate: DecoderGate::default(),
+                pending_inputs: VecDeque::new(),
+                pending_surfaces: VecDeque::new(),
                 media_foundation_started: true,
             })
         }
 
         fn decode(&mut self, job: DecodedFrameJob) -> Result<Option<DecodedSurface>, DecoderError> {
-            if !job.keyframe || !contains_h264_sequence_header(&job.access_unit) {
-                return Err(DecoderError::MissingSequenceHeader);
-            }
+            self.gate.accept(&job)?;
             let sample = input_sample(&job)?;
+            let timestamp_hns = timestamp_hns(job.timestamp_us)?;
+            if self.pending_inputs.len() == MAX_PENDING_DECODED_FRAMES {
+                return Err(DecoderError::BackendLost);
+            }
             // SAFETY: this worker owns the transform; `sample` owns a complete
             // access unit and carries its source timestamp in MF time units.
             unsafe { self.transform.ProcessInput(0, &sample, 0) }
                 .map_err(|_| DecoderError::BackendLost)?;
-            self.take_output(&job)
+            self.pending_inputs.push_back(PendingFrame {
+                frame_id: job.frame_id,
+                timestamp_us: job.timestamp_us,
+                timestamp_hns,
+                keyframe: job.keyframe,
+            });
+            self.drain_outputs()?;
+            Ok(self.pending_surfaces.pop_front())
         }
 
-        fn take_output(
+        fn drain_outputs(&mut self) -> Result<(), DecoderError> {
+            const MAX_OUTPUTS_PER_SUBMISSION: usize = 8;
+            for _ in 0..MAX_OUTPUTS_PER_SUBMISSION {
+                let (sample, more_output) = self.take_one_output()?;
+                let Some(sample) = sample else {
+                    return Ok(());
+                };
+                let timestamp_hns =
+                    unsafe { sample.GetSampleTime() }.map_err(|_| DecoderError::BackendLost)?;
+                let metadata_index = self
+                    .pending_inputs
+                    .iter()
+                    .position(|pending| pending.timestamp_hns == timestamp_hns)
+                    .ok_or(DecoderError::BackendLost)?;
+                let metadata = self
+                    .pending_inputs
+                    .remove(metadata_index)
+                    .ok_or(DecoderError::BackendLost)?;
+                let buffer =
+                    unsafe { sample.GetBufferByIndex(0) }.map_err(|_| DecoderError::BackendLost)?;
+                let (bytes, stride) = copy_buffer_with_stride(&buffer, self.width, self.height)?;
+                let packed = repack_nv12(&bytes, stride, self.width, self.height)?;
+                let surface = DecodedSurface {
+                    frame_id: metadata.frame_id,
+                    timestamp_us: metadata.timestamp_us,
+                    keyframe: metadata.keyframe,
+                    width: self.width,
+                    height: self.height,
+                    format: SurfaceFormat::Nv12,
+                    bytes: packed,
+                };
+                surface.validate()?;
+                if self.pending_surfaces.len() == MAX_PENDING_DECODED_FRAMES {
+                    return Err(DecoderError::BackendLost);
+                }
+                self.pending_surfaces.push_back(surface);
+                if !more_output {
+                    return Ok(());
+                }
+            }
+            Err(DecoderError::BackendLost)
+        }
+
+        fn take_one_output(
             &mut self,
-            source: &DecodedFrameJob,
-        ) -> Result<Option<DecodedSurface>, DecoderError> {
+        ) -> Result<
+            (
+                Option<windows::Win32::Media::MediaFoundation::IMFSample>,
+                bool,
+            ),
+            DecoderError,
+        > {
             let info = unsafe { self.transform.GetOutputStreamInfo(0) }
                 .map_err(|_| DecoderError::BackendLost)?;
             let transform_provides_sample = info.dwFlags
@@ -311,34 +512,13 @@ pub(crate) mod native {
             drop(events);
             match result {
                 Ok(()) if output.dwStatus & MFT_OUTPUT_DATA_BUFFER_NO_SAMPLE.0 as u32 != 0 => {
-                    Ok(None)
+                    Ok((None, false))
                 }
-                Ok(()) => {
-                    let sample = sample.ok_or(DecoderError::BackendLost)?;
-                    let buffer = unsafe { sample.ConvertToContiguousBuffer() }
-                        .map_err(|_| DecoderError::BackendLost)?;
-                    let mut bytes = copy_buffer(&buffer)?;
-                    let expected = nv12_len(self.width, self.height)?;
-                    if bytes.len() < expected {
-                        return Err(DecoderError::InvalidSurface);
-                    }
-                    // ConvertToContiguousBuffer may retain row padding.  The
-                    // renderer contract is tightly packed NV12, so do not let
-                    // padding cross the private media boundary.
-                    bytes.truncate(expected);
-                    let surface = DecodedSurface {
-                        frame_id: source.frame_id,
-                        timestamp_us: source.timestamp_us,
-                        keyframe: source.keyframe,
-                        width: self.width,
-                        height: self.height,
-                        format: SurfaceFormat::Nv12,
-                        bytes,
-                    };
-                    surface.validate()?;
-                    Ok(Some(surface))
-                }
-                Err(error) if error.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => Ok(None),
+                Ok(()) => Ok((
+                    sample,
+                    output.dwStatus & MFT_OUTPUT_DATA_BUFFER_INCOMPLETE.0 as u32 != 0,
+                )),
+                Err(error) if error.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => Ok((None, false)),
                 Err(_) => Err(DecoderError::BackendLost),
             }
         }
@@ -430,7 +610,15 @@ pub(crate) mod native {
         }
         let selected = unsafe {
             let items = std::slice::from_raw_parts_mut(activations, count as usize);
-            let selected = items.iter_mut().find_map(Option::take);
+            let mut selected = None;
+            for activation in items {
+                let activation = activation.take();
+                if selected.is_none() {
+                    selected = activation;
+                }
+                // Every unselected activation is dropped before its backing
+                // CoTaskMem allocation is released below.
+            }
             CoTaskMemFree(Some(activations.cast()));
             selected
         }
@@ -489,29 +677,61 @@ pub(crate) mod native {
         unsafe { buffer.SetCurrentLength(length) }.map_err(|_| DecoderError::BackendLost)?;
         let sample = unsafe { MFCreateSample() }.map_err(|_| DecoderError::BackendLost)?;
         unsafe { sample.AddBuffer(&buffer) }.map_err(|_| DecoderError::BackendLost)?;
-        let timestamp = job
-            .timestamp_us
-            .checked_mul(10)
-            .and_then(|value| i64::try_from(value).ok())
-            .ok_or(DecoderError::BackendLost)?;
+        let timestamp = timestamp_hns(job.timestamp_us)?;
         unsafe { sample.SetSampleTime(timestamp) }.map_err(|_| DecoderError::BackendLost)?;
         Ok(sample)
     }
 
-    fn nv12_len(width: u32, height: u32) -> Result<usize, DecoderError> {
-        usize::try_from(width)
-            .ok()
-            .and_then(|width| {
-                usize::try_from(height)
-                    .ok()
-                    .and_then(|height| width.checked_mul(height))
-            })
-            .and_then(|pixels| pixels.checked_add(pixels / 2))
-            .ok_or(DecoderError::InvalidDimensions)
+    fn timestamp_hns(timestamp_us: u64) -> Result<i64, DecoderError> {
+        timestamp_us
+            .checked_mul(10)
+            .and_then(|value| i64::try_from(value).ok())
+            .ok_or(DecoderError::BackendLost)
     }
 
-    fn copy_buffer(buffer: &IMFMediaBuffer) -> Result<Vec<u8>, DecoderError> {
+    fn copy_buffer_with_stride(
+        buffer: &IMFMediaBuffer,
+        width: u32,
+        height: u32,
+    ) -> Result<(Vec<u8>, usize), DecoderError> {
+        let width_usize = usize::try_from(width).map_err(|_| DecoderError::InvalidDimensions)?;
+        let rows = usize::try_from(height)
+            .ok()
+            .and_then(|height| height.checked_add(height / 2))
+            .ok_or(DecoderError::InvalidDimensions)?;
+        if let Ok(buffer_2d) = buffer.cast::<IMF2DBuffer>() {
+            let mut source = ptr::null_mut();
+            let mut signed_pitch = 0_i32;
+            unsafe { buffer_2d.Lock2D(&mut source, &mut signed_pitch) }
+                .map_err(|_| DecoderError::BackendLost)?;
+            let result = (|| {
+                if source.is_null() || signed_pitch < 0 {
+                    return Err(DecoderError::InvalidSurface);
+                }
+                let pitch =
+                    usize::try_from(signed_pitch).map_err(|_| DecoderError::InvalidSurface)?;
+                if pitch < width_usize {
+                    return Err(DecoderError::InvalidSurface);
+                }
+                let length = pitch
+                    .checked_mul(rows)
+                    .ok_or(DecoderError::InvalidDimensions)?;
+                // SAFETY: Lock2D returned `source` with `pitch * rows` bytes
+                // for the negotiated NV12 surface; copying finishes before Unlock2D.
+                Ok((
+                    unsafe { std::slice::from_raw_parts(source, length) }.to_vec(),
+                    pitch,
+                ))
+            })();
+            let unlock = unsafe { buffer_2d.Unlock2D() };
+            unlock.map_err(|_| DecoderError::BackendLost)?;
+            return result;
+        }
         let length = unsafe { buffer.GetCurrentLength() }.map_err(|_| DecoderError::BackendLost)?;
+        let expected = validated_nv12_len(width, height)?;
+        if length as usize != expected {
+            return Err(DecoderError::InvalidSurface);
+        }
         let mut source = ptr::null_mut();
         unsafe { buffer.Lock(&mut source, None, None) }.map_err(|_| DecoderError::BackendLost)?;
         if source.is_null() {
@@ -522,7 +742,7 @@ pub(crate) mod native {
         // locked buffer, and this worker copies it before Unlock.
         let bytes = unsafe { std::slice::from_raw_parts(source, length as usize) }.to_vec();
         unsafe { buffer.Unlock() }.map_err(|_| DecoderError::BackendLost)?;
-        Ok(bytes)
+        Ok((bytes, width_usize))
     }
 }
 

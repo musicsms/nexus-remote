@@ -115,17 +115,26 @@ pub(crate) mod native {
     //! Native renderer ownership lives exclusively on `nexus-client-renderer`.
 
     use super::super::decoder::{DecodedSurface, DecoderError, SurfaceFormat};
+    use crate::native_worker::WorkerLifecycle;
     use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
-    use std::thread::{self, JoinHandle};
-    use std::time::Duration;
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::{Duration, Instant};
     use windows::Win32::Foundation::HMODULE;
+    use windows::Win32::Foundation::{BOOL, HWND};
     use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
     use windows::Win32::Graphics::Direct3D11::{
-        D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-        D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+        D3D11CreateDevice, D3D11CreateDeviceAndSwapChain, ID3D11Device, ID3D11DeviceContext,
+        ID3D11Texture2D, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
+        D3D11_USAGE_DEFAULT,
     };
     use windows::Win32::Graphics::Dxgi::Common::{
-        DXGI_FORMAT_NV12, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC,
+        DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_MODE_DESC,
+        DXGI_RATIONAL, DXGI_SAMPLE_DESC,
+    };
+    use windows::Win32::Graphics::Dxgi::{
+        IDXGISwapChain, DXGI_SWAP_CHAIN_DESC, DXGI_SWAP_EFFECT_DISCARD,
+        DXGI_USAGE_RENDER_TARGET_OUTPUT,
     };
 
     const COMMAND_TIMEOUT: Duration = Duration::from_millis(250);
@@ -139,30 +148,39 @@ pub(crate) mod native {
     /// later; this task establishes the dedicated device-owning thread.
     pub(super) struct D3D11Renderer {
         commands: Option<SyncSender<RendererCommand>>,
-        worker: Option<JoinHandle<()>>,
+        lifecycle: Arc<WorkerLifecycle>,
     }
 
     impl D3D11Renderer {
         pub(super) fn start() -> Result<Self, DecoderError> {
+            Self::start_inner(None)
+        }
+
+        /// Task 4 supplies the HWND owned by its message-loop thread. This
+        /// creates a real D3D11 swap chain and keeps it on the renderer worker.
+        pub(super) fn start_for_window(hwnd: HWND) -> Result<Self, DecoderError> {
+            Self::start_inner(Some(hwnd))
+        }
+
+        fn start_inner(hwnd: Option<HWND>) -> Result<Self, DecoderError> {
             let (commands, receiver) = sync_channel(1);
             let (started_tx, started_rx) = sync_channel(1);
             let worker = thread::Builder::new()
                 .name("nexus-client-renderer".to_owned())
-                .spawn(move || renderer_main(receiver, started_tx))
+                .spawn(move || renderer_main(receiver, started_tx, hwnd))
                 .map_err(|_| DecoderError::BackendUnavailable)?;
+            let lifecycle = WorkerLifecycle::new(worker);
             match started_rx.recv_timeout(COMMAND_TIMEOUT) {
                 Ok(Ok(())) => Ok(Self {
                     commands: Some(commands),
-                    worker: Some(worker),
+                    lifecycle,
                 }),
                 Ok(Err(error)) => {
-                    let _ = worker.join();
+                    lifecycle.reap_in_background();
                     Err(error)
                 }
                 Err(_) => {
-                    // Joining here would make native startup unbounded.  The
-                    // worker owns no shared GPU handles before it signals ready.
-                    drop(worker);
+                    lifecycle.reap_in_background();
                     Err(DecoderError::BackendUnavailable)
                 }
             }
@@ -186,9 +204,7 @@ pub(crate) mod native {
                 let _ = commands.try_send(RendererCommand::Shutdown(reply_tx));
                 let _ = reply_rx.recv_timeout(COMMAND_TIMEOUT);
             }
-            if let Some(worker) = self.worker.take() {
-                let _ = worker.join();
-            }
+            self.lifecycle.join_before(Instant::now() + COMMAND_TIMEOUT);
         }
     }
 
@@ -201,31 +217,73 @@ pub(crate) mod native {
     fn renderer_main(
         receiver: Receiver<RendererCommand>,
         started: SyncSender<Result<(), DecoderError>>,
+        hwnd: Option<HWND>,
     ) {
         let mut feature_level = Default::default();
         let mut device = None;
         let mut context = None;
         // SAFETY: this dedicated thread owns the created D3D11 interfaces and
         // passes valid out-pointers for the documented D3D11CreateDevice call.
-        let init = unsafe {
-            D3D11CreateDevice(
-                None,
-                D3D_DRIVER_TYPE_HARDWARE,
-                HMODULE::default(),
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                None,
-                D3D11_SDK_VERSION,
-                Some(&mut device),
-                Some(&mut feature_level),
-                Some(&mut context),
-            )
+        let mut swap_chain = None;
+        let init = if let Some(hwnd) = hwnd {
+            let descriptor = DXGI_SWAP_CHAIN_DESC {
+                BufferDesc: DXGI_MODE_DESC {
+                    Width: 0,
+                    Height: 0,
+                    RefreshRate: DXGI_RATIONAL {
+                        Numerator: 0,
+                        Denominator: 1,
+                    },
+                    Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    ..Default::default()
+                },
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
+                BufferCount: 2,
+                OutputWindow: hwnd,
+                Windowed: BOOL(1),
+                SwapEffect: DXGI_SWAP_EFFECT_DISCARD,
+                Flags: 0,
+            };
+            unsafe {
+                D3D11CreateDeviceAndSwapChain(
+                    None,
+                    D3D_DRIVER_TYPE_HARDWARE,
+                    HMODULE::default(),
+                    D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                    None,
+                    D3D11_SDK_VERSION,
+                    Some(&descriptor),
+                    Some(&mut swap_chain),
+                    Some(&mut device),
+                    Some(&mut feature_level),
+                    Some(&mut context),
+                )
+            }
+        } else {
+            unsafe {
+                D3D11CreateDevice(
+                    None,
+                    D3D_DRIVER_TYPE_HARDWARE,
+                    HMODULE::default(),
+                    D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                    None,
+                    D3D11_SDK_VERSION,
+                    Some(&mut device),
+                    Some(&mut feature_level),
+                    Some(&mut context),
+                )
+            }
         }
         .map_err(|_| DecoderError::BackendUnavailable)
         .and_then(|_| match (device, context) {
-            (Some(device), Some(context)) => Ok((device, context)),
+            (Some(device), Some(context)) => Ok((device, context, swap_chain)),
             _ => Err(DecoderError::BackendUnavailable),
         });
-        let Ok((device, context)) = init else {
+        let Ok((device, context, swap_chain)) = init else {
             let _ = started.send(Err(DecoderError::BackendUnavailable));
             return;
         };
@@ -238,7 +296,7 @@ pub(crate) mod native {
                     // checked by the decoder.  The actual HWND/swap-chain
                     // attachment is deliberately deferred to the window task;
                     // keeping the device here prevents it crossing Tokio.
-                    let result = upload_surface(&device, &context, &surface);
+                    let result = upload_surface(&device, &context, swap_chain.as_ref(), &surface);
                     let _ = reply.send(result);
                 }
                 RendererCommand::Shutdown(reply) => {
@@ -255,12 +313,34 @@ pub(crate) mod native {
     fn upload_surface(
         device: &ID3D11Device,
         context: &ID3D11DeviceContext,
+        swap_chain: Option<&IDXGISwapChain>,
         surface: &DecodedSurface,
     ) -> Result<(), DecoderError> {
         surface.validate()?;
-        let (format, row_pitch) = match surface.format {
-            SurfaceFormat::Nv12 => (DXGI_FORMAT_NV12, surface.width),
-            SurfaceFormat::Rgba8 => (
+        let mut converted = None;
+        let (bytes, format, row_pitch) = match (surface.format, swap_chain.is_some()) {
+            (SurfaceFormat::Nv12, true) => {
+                converted = Some(nv12_to_bgra(surface)?);
+                (
+                    converted.as_deref().expect("converted surface exists"),
+                    DXGI_FORMAT_B8G8R8A8_UNORM,
+                    surface
+                        .width
+                        .checked_mul(4)
+                        .ok_or(DecoderError::InvalidDimensions)?,
+                )
+            }
+            (SurfaceFormat::Nv12, false) => (&surface.bytes, DXGI_FORMAT_NV12, surface.width),
+            (SurfaceFormat::Rgba8, true) => (
+                &surface.bytes,
+                DXGI_FORMAT_B8G8R8A8_UNORM,
+                surface
+                    .width
+                    .checked_mul(4)
+                    .ok_or(DecoderError::InvalidDimensions)?,
+            ),
+            (SurfaceFormat::Rgba8, false) => (
+                &surface.bytes,
                 DXGI_FORMAT_R8G8B8A8_UNORM,
                 surface
                     .width
@@ -289,18 +369,53 @@ pub(crate) mod native {
         unsafe { device.CreateTexture2D(&descriptor, None, Some(&mut texture)) }
             .map_err(|_| DecoderError::BackendLost)?;
         let texture = texture.ok_or(DecoderError::BackendLost)?;
-        // SAFETY: `surface.bytes` remains alive for the call and validation
-        // proved its tight row pitch matches the selected texture format.
+        // SAFETY: `bytes` remains alive for the call and validation proved its
+        // tight row pitch matches the selected texture format.
         unsafe {
-            context.UpdateSubresource(
-                &texture,
-                0,
-                None,
-                surface.bytes.as_ptr().cast(),
-                row_pitch,
-                0,
-            )
+            context.UpdateSubresource(&texture, 0, None, bytes.as_ptr().cast(), row_pitch, 0)
         };
+        if let Some(swap_chain) = swap_chain {
+            let back_buffer: ID3D11Texture2D =
+                unsafe { swap_chain.GetBuffer(0) }.map_err(|_| DecoderError::BackendLost)?;
+            // SAFETY: both textures are owned by this D3D11 device and the
+            // swap-chain path normalizes decoded NV12 to its BGRA backbuffer.
+            unsafe { context.CopyResource(&back_buffer, &texture) };
+            unsafe { swap_chain.Present(1, 0) }.map_err(|_| DecoderError::BackendLost)?;
+        }
         Ok(())
+    }
+
+    fn nv12_to_bgra(surface: &DecodedSurface) -> Result<Vec<u8>, DecoderError> {
+        let width = usize::try_from(surface.width).map_err(|_| DecoderError::InvalidDimensions)?;
+        let height =
+            usize::try_from(surface.height).map_err(|_| DecoderError::InvalidDimensions)?;
+        let y_len = width
+            .checked_mul(height)
+            .ok_or(DecoderError::InvalidDimensions)?;
+        let mut bgra = vec![
+            0_u8;
+            y_len
+                .checked_mul(4)
+                .ok_or(DecoderError::InvalidDimensions)?
+        ];
+        for y in 0..height {
+            for x in 0..width {
+                let luma = i32::from(surface.bytes[y * width + x])
+                    .saturating_sub(16)
+                    .max(0);
+                let chroma = y_len + (y / 2) * width + (x & !1);
+                let u = i32::from(surface.bytes[chroma]) - 128;
+                let v = i32::from(surface.bytes[chroma + 1]) - 128;
+                let red = (298 * luma + 409 * v + 128) >> 8;
+                let green = (298 * luma - 100 * u - 208 * v + 128) >> 8;
+                let blue = (298 * luma + 516 * u + 128) >> 8;
+                let dst = (y * width + x) * 4;
+                bgra[dst] = blue.clamp(0, 255) as u8;
+                bgra[dst + 1] = green.clamp(0, 255) as u8;
+                bgra[dst + 2] = red.clamp(0, 255) as u8;
+                bgra[dst + 3] = 255;
+            }
+        }
+        Ok(bgra)
     }
 }
