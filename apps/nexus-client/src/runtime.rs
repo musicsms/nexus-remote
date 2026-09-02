@@ -27,6 +27,35 @@ use thiserror::Error;
 const RUNTIME_POLL_INTERVAL: Duration = Duration::from_millis(2);
 const RECONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
+/// Cloneable cancellation signal for a running client runtime. `notify_one`
+/// retains a permit, so cancellation cannot be lost between the atomic check
+/// and registering a `Notify` waiter.
+#[derive(Clone)]
+pub struct RuntimeCancellation {
+    cancelled: Arc<AtomicBool>,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+pub type ShutdownHandle = RuntimeCancellation;
+
+impl RuntimeCancellation {
+    fn new() -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            notify: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.notify.notify_one();
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ClientConfigurationError {
     #[error("NEXUS_CLIENT_SERVER is required (for example 127.0.0.1:4433)")]
@@ -262,6 +291,11 @@ struct PendingNativeJob {
 }
 
 #[cfg(windows)]
+fn stale_native_job(job_generation: u64, current_generation: u64, worker_generation: u64) -> bool {
+    job_generation < current_generation || job_generation < worker_generation
+}
+
+#[cfg(windows)]
 impl NativePipeline {
     fn start(
         window: &WindowController,
@@ -274,7 +308,7 @@ impl NativePipeline {
         let generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let worker_pending = Arc::clone(&pending);
-        let worker_generation = Arc::clone(&generation);
+        let shared_generation = Arc::clone(&generation);
         let worker_stop = Arc::clone(&stop);
         let (error_tx, errors) = mpsc::sync_channel(1);
         let (started_tx, started_rx) = mpsc::sync_channel(1);
@@ -298,6 +332,7 @@ impl NativePipeline {
                         }
                     };
                 let _ = started_tx.send(Ok(()));
+                let mut worker_generation = 0_u64;
                 loop {
                     let pending_job = {
                         let (lock, wake) = &*worker_pending;
@@ -317,18 +352,22 @@ impl NativePipeline {
                         break;
                     };
                     let job_generation = pending_job.generation;
-                    if job_generation
-                        != worker_generation.load(std::sync::atomic::Ordering::Acquire)
-                    {
+                    let current_generation =
+                        shared_generation.load(std::sync::atomic::Ordering::Acquire);
+                    if stale_native_job(job_generation, current_generation, worker_generation) {
+                        continue;
+                    }
+                    if job_generation > worker_generation {
                         if let Err(error) = decoder.reset() {
                             let _ = error_tx.try_send(error);
                             break;
                         }
+                        worker_generation = job_generation;
                     }
                     match decoder.decode(pending_job.job) {
                         Ok(Some(surface)) => {
                             if job_generation
-                                == worker_generation.load(std::sync::atomic::Ordering::Acquire)
+                                == shared_generation.load(std::sync::atomic::Ordering::Acquire)
                             {
                                 if let Err(error) = renderer.present(surface) {
                                     let _ = error_tx.try_send(error);
@@ -337,6 +376,11 @@ impl NativePipeline {
                             }
                         }
                         Ok(None) => {}
+                        Err(crate::decoder::DecoderError::MissingSequenceHeader) => {
+                            // A reconnect starts a new continuity epoch. Drop
+                            // deltas until the host supplies a keyframe; this
+                            // is expected recovery, not a dead decoder.
+                        }
                         Err(error) => {
                             let _ = error_tx.try_send(error);
                             break;
@@ -495,6 +539,8 @@ mod native_pipeline_tests {
         pipeline.reset_for_reconnect().unwrap();
         assert!(pending.0.lock().unwrap().is_none());
         assert_eq!(generation.load(Ordering::Acquire), 1);
+        assert!(stale_native_job(0, 1, 0));
+        assert!(!stale_native_job(1, 1, 0));
     }
 }
 
@@ -511,8 +557,7 @@ pub struct ClientRuntime {
     sent_input_messages: u64,
     latest_frame: Option<crate::DecodedFrameJob>,
     pipeline: NativePipeline,
-    cancel: Arc<AtomicBool>,
-    cancel_notify: Arc<tokio::sync::Notify>,
+    cancellation: RuntimeCancellation,
     shutdown: bool,
 }
 
@@ -609,8 +654,13 @@ impl ClientRuntime {
         let nonce_domain = parse_env("NEXUS_CLIENT_NONCE_DOMAIN")?;
         let mut runtime =
             Self::connect(&endpoint, connect_config, session, frame_key, nonce_domain).await?;
+        let cancellation = runtime.shutdown_handle();
         let summary = loop {
             let summary = runtime.run().await;
+            if cancellation.is_cancelled() && matches!(&summary, Err(ClientRuntimeError::Shutdown))
+            {
+                break summary;
+            }
             if runtime.session_state() != ClientState::Reconnecting {
                 break summary;
             }
@@ -695,7 +745,7 @@ impl ClientRuntime {
         }
         let retry_interval = retry_interval.max(Duration::from_millis(1));
         loop {
-            if self.cancel.load(Ordering::Acquire) {
+            if self.cancellation.is_cancelled() {
                 return Err(ClientRuntimeError::Shutdown);
             }
             match self.reconnect_attempt(endpoint, server, server_name).await {
@@ -707,7 +757,7 @@ impl ClientRuntime {
                     }
                     tokio::select! {
                         _ = tokio::time::sleep(retry_interval) => {}
-                        _ = self.cancel_notify.notified() => return Err(ClientRuntimeError::Shutdown),
+                        _ = self.cancellation.notify.notified() => return Err(ClientRuntimeError::Shutdown),
                     }
                 }
             }
@@ -720,7 +770,7 @@ impl ClientRuntime {
         server: SocketAddr,
         server_name: &str,
     ) -> Result<(), ClientRuntimeError> {
-        if self.cancel.load(Ordering::Acquire) {
+        if self.cancellation.is_cancelled() {
             return Err(ClientRuntimeError::Shutdown);
         }
         let now = self.session.clock().now();
@@ -738,7 +788,7 @@ impl ClientRuntime {
         };
         let connection = match tokio::select! {
             connection = connecting => connection,
-            _ = self.cancel_notify.notified() => return Err(ClientRuntimeError::Shutdown),
+            _ = self.cancellation.notify.notified() => return Err(ClientRuntimeError::Shutdown),
         } {
             Ok(connection) => connection,
             Err(error) => {
@@ -782,8 +832,7 @@ impl ClientRuntime {
         let pipeline = NativePipeline::start(&window, stream);
         #[cfg(windows)]
         let pipeline = pipeline?;
-        let cancel = Arc::new(AtomicBool::new(false));
-        let cancel_notify = Arc::new(tokio::sync::Notify::new());
+        let cancellation = RuntimeCancellation::new();
         Ok(Self {
             connection,
             session,
@@ -795,8 +844,7 @@ impl ClientRuntime {
             sent_input_messages: 0,
             latest_frame: None,
             pipeline,
-            cancel,
-            cancel_notify,
+            cancellation,
             shutdown: false,
         })
     }
@@ -833,19 +881,22 @@ impl ClientRuntime {
     /// resources; the notification makes reconnect and transport waits stop
     /// promptly instead of waiting for their retry/QUIC deadlines.
     pub fn request_shutdown(&self) {
-        self.cancel.store(true, Ordering::Release);
+        self.cancellation.cancel();
         self.connection
             .close(0u32.into(), b"client shutdown requested");
-        self.cancel_notify.notify_waiters();
+    }
+
+    pub fn shutdown_handle(&self) -> ShutdownHandle {
+        self.cancellation.clone()
     }
 
     pub async fn run(&mut self) -> Result<RuntimeSummary, ClientRuntimeError> {
-        if self.shutdown || self.cancel.load(Ordering::Acquire) {
+        if self.shutdown || self.cancellation.is_cancelled() {
             return Err(ClientRuntimeError::Shutdown);
         }
         loop {
             tokio::select! {
-                _ = self.cancel_notify.notified() => {
+                _ = self.cancellation.notify.notified() => {
                     self.fail_closed();
                     return Err(ClientRuntimeError::Shutdown);
                 }
@@ -860,7 +911,7 @@ impl ClientRuntime {
                             | quinn::ConnectionError::ApplicationClosed { .. }
                             | quinn::ConnectionError::Reset
                             | quinn::ConnectionError::LocallyClosed) => {
-                                if self.cancel.load(Ordering::Acquire) {
+                                if self.cancellation.is_cancelled() {
                                     self.fail_closed();
                                     return Err(ClientRuntimeError::Shutdown);
                                 }
@@ -978,8 +1029,7 @@ impl ClientRuntime {
     }
 
     fn fail_closed_with_deadline(&mut self, deadline: Instant) -> bool {
-        self.cancel.store(true, Ordering::Release);
-        self.cancel_notify.notify_waiters();
+        self.cancellation.cancel();
         let _ = self.session.expire();
         self.input.shutdown();
         self.render_queue.shutdown();

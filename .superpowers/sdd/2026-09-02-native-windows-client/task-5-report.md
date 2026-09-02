@@ -25,7 +25,7 @@
 ## Verification
 
 - `cargo fmt --all -- --check` — passed.
-- `cargo test -p nexus-client --all-targets` — passed (49 tests including the
+- `cargo test -p nexus-client --all-targets` — passed (51 tests including the
   loopback test; Windows-only smoke files compile to zero Linux tests).
 - `cargo clippy -p nexus-client --all-targets -- -D warnings` — passed.
 - `cargo check -p nexus-client --tests --target x86_64-pc-windows-gnu` — not
@@ -78,7 +78,7 @@ condition.
 ## Review fix verification
 
 - `cargo fmt --all -- --check` — passed.
-- `cargo test -p nexus-client --all-targets` — passed (49 tests).
+- `cargo test -p nexus-client --all-targets` — passed (51 tests).
 - `cargo clippy -p nexus-client --all-targets -- -D warnings` — passed.
 - `cargo build --workspace` — passed.
 - `cargo test --workspace` — passed.
@@ -114,3 +114,15 @@ condition.
 - Hex parsing checks ASCII and byte pairs before conversion, with malformed
   Unicode coverage; configured bootstrap absence is covered by an explicit
   fail-closed entrypoint test.
+
+## Review fix round 5
+
+- Native pipeline workers now maintain their own generation cursor. Jobs older
+  than the shared reconnect generation are discarded without resetting or
+  terminating the decoder; newer generations invoke the explicit decoder reset
+  and reject deltas until a keyframe arrives.
+- Exported cloneable `RuntimeCancellation`/`ShutdownHandle` backed by an atomic
+  flag and permit-retaining `Notify`, and retained the handle through the
+  configured run/reconnect path for prompt cancellation.
+- Added configured-entrypoint, malformed-Unicode, decoder-reset, and
+  generation/stale-job regression coverage; report count refreshed to 51.

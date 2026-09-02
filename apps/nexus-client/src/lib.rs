@@ -18,7 +18,7 @@ pub use receiver::{
 pub use renderer::{RenderQueue, RenderQueueError};
 pub use runtime::{
     ClientConfiguration, ClientConfigurationError, ClientConnectConfig, ClientRuntime,
-    ClientRuntimeError, RuntimeSummary, VideoStreamConfig,
+    ClientRuntimeError, RuntimeCancellation, RuntimeSummary, ShutdownHandle, VideoStreamConfig,
 };
 pub use window::{
     WindowCommand, WindowCommandSender, WindowConfig, WindowController, WindowError, WindowEvent,
