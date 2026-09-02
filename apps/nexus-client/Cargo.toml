@@ -19,3 +19,4 @@ tracing-subscriber.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 ed25519-dalek.workspace = true
+prost.workspace = true

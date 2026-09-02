@@ -1324,6 +1324,7 @@ dependencies = [
  "nexus-protocol",
  "nexus-session",
  "nexus-transport",
+ "prost",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
