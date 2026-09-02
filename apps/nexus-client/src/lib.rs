@@ -1,17 +1,23 @@
 //! Portable client lifecycle primitives.
 
+pub mod input;
 pub mod receiver;
 pub mod renderer;
 pub mod session;
+pub mod window;
 
 mod decoder;
 #[cfg(windows)]
 mod native_worker;
 
+pub use input::{InputController, InputControllerError, MAX_INPUT_RATE_PER_SECOND};
 pub use receiver::{
     ClientInputError, ClientInputSender, ClientReceiver, ClientReceiverError, DecodedFrameJob,
 };
 pub use renderer::{RenderQueue, RenderQueueError};
+pub use window::{
+    WindowCommand, WindowCommandSender, WindowConfig, WindowController, WindowError, WindowEvent,
+};
 
 /// Decodes an already authenticated H.264 job and presents it to the explicit
 /// interactive HWND. This is Windows-only smoke plumbing, not a portable UI.
