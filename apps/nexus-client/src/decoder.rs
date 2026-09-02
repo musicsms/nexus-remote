@@ -844,3 +844,24 @@ pub(crate) fn native_decoder_smoke(job: DecodedFrameJob) -> Result<DecodedSurfac
     let mut decoder = native::MediaFoundationDecoder::start(1_280, 720)?;
     decoder.decode(job)?.ok_or(DecoderError::BackendUnavailable)
 }
+
+#[cfg(windows)]
+pub(crate) struct NativeFrameDecoder {
+    inner: native::MediaFoundationDecoder,
+}
+
+#[cfg(windows)]
+impl NativeFrameDecoder {
+    pub(crate) fn start(width: u32, height: u32) -> Result<Self, DecoderError> {
+        Ok(Self {
+            inner: native::MediaFoundationDecoder::start(width, height)?,
+        })
+    }
+
+    pub(crate) fn decode(
+        &mut self,
+        job: DecodedFrameJob,
+    ) -> Result<Option<DecodedSurface>, DecoderError> {
+        self.inner.decode(job)
+    }
+}

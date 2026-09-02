@@ -25,7 +25,7 @@
 ## Verification
 
 - `cargo fmt --all -- --check` — passed.
-- `cargo test -p nexus-client --all-targets` — passed (36 tests including the
+- `cargo test -p nexus-client --all-targets` — passed (43 tests including the
   loopback test; Windows-only smoke files compile to zero Linux tests).
 - `cargo clippy -p nexus-client --all-targets -- -D warnings` — passed.
 - `cargo check -p nexus-client --tests --target x86_64-pc-windows-gnu` — not
@@ -38,3 +38,29 @@ The loopback test uses the existing self-signed QUIC endpoint helper and is
 not evidence of relay, MSVC, interactive Win32, D3D11, or Media Foundation
 behavior. Full host/client/service/relay acceptance remains a Phase 1 exit
 condition.
+
+## Review fix round 1
+
+- Runtime connection now validates `ClientSession` claims before opening the
+  endpoint, retains the stable session ID/state, rechecks active claims and
+  duration during pumping, and fails closed on authentication, expiry,
+  decoder, input, or window errors.
+- Native Windows runtime wiring owns persistent Media Foundation decoder and
+  D3D11 renderer adapters; non-Windows builds retain a portable handoff-only
+  pipeline because no native decoder exists there.
+- Render jobs use `WindowController::render_latest` and consume the shared
+  depth-one slot immediately, avoiding the FIFO command queue for video.
+- Added loopback coverage for pre-transport session rejection, expiry cleanup,
+  window-close cleanup, session identity, and a second-empty render drain.
+- Corrected status documentation to report the unavailable MinGW compiler
+  rather than claiming GNU-target evidence.
+
+## Review fix verification
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo test -p nexus-client --all-targets` — passed (43 tests).
+- `cargo clippy -p nexus-client --all-targets -- -D warnings` — passed.
+- `cargo build --workspace` — passed.
+- `cargo test --workspace` — passed.
+- `cargo check -p nexus-client --tests --target x86_64-pc-windows-gnu` —
+  remains blocked by the missing `x86_64-w64-mingw32-gcc` compiler.

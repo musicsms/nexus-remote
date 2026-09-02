@@ -107,6 +107,30 @@ pub(crate) fn native_renderer_smoke(
 }
 
 #[cfg(windows)]
+pub(crate) struct NativeFrameRenderer {
+    inner: native::D3D11Renderer,
+}
+
+#[cfg(windows)]
+impl NativeFrameRenderer {
+    pub(crate) fn start_for_native_handle(
+        handle: isize,
+    ) -> Result<Self, crate::decoder::DecoderError> {
+        let hwnd = windows::Win32::Foundation::HWND(handle as *mut core::ffi::c_void);
+        Ok(Self {
+            inner: native::D3D11Renderer::start_for_window(hwnd)?,
+        })
+    }
+
+    pub(crate) fn present(
+        &mut self,
+        surface: crate::decoder::DecodedSurface,
+    ) -> Result<(), crate::decoder::DecoderError> {
+        self.inner.present(surface)
+    }
+}
+
+#[cfg(windows)]
 pub(crate) mod native {
     //! Native renderer ownership lives exclusively on `nexus-client-renderer`.
 

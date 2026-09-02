@@ -1,4 +1,7 @@
-use nexus_client::{ClientRuntime, WindowEvent};
+use ed25519_dalek::{Signer, SigningKey};
+use nexus_client::session::{ClientState, ClientVerification, RelayTokenMetadata, SessionPolicy};
+use nexus_client::{ClientRuntime, ClientRuntimeError, WindowEvent};
+use nexus_common::{MockClock, UnixTimestamp};
 use nexus_crypto::NonceSequence;
 use nexus_input::InputEvent;
 use nexus_protocol::{video_packet, MonitorInfo, MouseMove, VideoPacketHeader};
@@ -21,6 +24,52 @@ fn monitor() -> MonitorInfo {
         height: 720,
         scale: 1.0,
     }
+}
+
+fn session(clock: MockClock) -> nexus_client::session::ClientSession {
+    let capability_key = SigningKey::from_bytes(&[1; 32]);
+    let relay_key = SigningKey::from_bytes(&[2; 32]);
+    let mut capability = nexus_protocol::SessionCapability {
+        version: 1,
+        issuer: "control-plane".into(),
+        session_id: "loopback-session".into(),
+        subject_user_id: "user".into(),
+        client_device_id: "client".into(),
+        target_device_id: "host".into(),
+        permissions: vec!["desktop.view".into()],
+        restrictions: vec![],
+        not_before: 100,
+        expires_at: 200,
+        nonce: vec![1],
+        agent_min_protocol: 1,
+        agent_max_protocol: 1,
+        client_ephemeral_public_key: vec![],
+        signature: vec![],
+    };
+    capability.signature = capability_key
+        .sign(&capability.signing_bytes())
+        .to_bytes()
+        .to_vec();
+    let mut token = RelayTokenMetadata {
+        relay_id: "relay".into(),
+        session_id: "loopback-session".into(),
+        client_device_id: "client".into(),
+        target_device_id: "host".into(),
+        expires_at: UnixTimestamp::from_secs(200),
+        signature: vec![],
+    };
+    token.signature = relay_key.sign(&token.signing_bytes()).to_bytes().to_vec();
+    nexus_client::session::ClientSession::new(
+        capability,
+        token,
+        clock,
+        SessionPolicy::new(Duration::from_secs(1_800), Duration::from_secs(60)).unwrap(),
+        ClientVerification {
+            capability_key: capability_key.verifying_key(),
+            relay_key: relay_key.verifying_key(),
+            relay_id: "relay".into(),
+        },
+    )
 }
 
 fn video_datagram() -> Vec<u8> {
@@ -63,12 +112,17 @@ async fn loopback_authenticates_video_and_emits_one_semantic_input() {
     });
 
     let client_endpoint = make_client_endpoint("127.0.0.1:0".parse().unwrap(), &cert).unwrap();
-    let connection = client_endpoint
-        .connect(server_addr, "localhost")
-        .unwrap()
-        .await
-        .unwrap();
-    let mut runtime = ClientRuntime::connect(connection, KEY, NONCE_DOMAIN, monitor()).unwrap();
+    let mut runtime = ClientRuntime::connect(
+        &client_endpoint,
+        server_addr,
+        "localhost",
+        session(MockClock::from_secs(100)),
+        KEY,
+        NONCE_DOMAIN,
+        monitor(),
+    )
+    .await
+    .unwrap();
     runtime
         .handle_window_event(WindowEvent::Focused(true))
         .unwrap();
@@ -87,6 +141,100 @@ async fn loopback_authenticates_video_and_emits_one_semantic_input() {
     assert_eq!(frame.timestamp_us, 123_456);
     assert!(frame.keyframe);
     assert_eq!(frame.access_unit, b"loopback-h264");
+    assert_eq!(runtime.drain_latest_frame(), None);
     assert_eq!(runtime.sent_input_count(), 1);
+    assert_eq!(runtime.session_id(), "loopback-session");
+    assert_eq!(runtime.session_state(), ClientState::Reconnecting);
+    runtime
+        .shutdown(std::time::Instant::now() + Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(runtime.session_state(), ClientState::Expired);
+    server_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn invalid_session_is_rejected_before_transport_connect() {
+    let server = make_server_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
+    let endpoint = make_client_endpoint("127.0.0.1:0".parse().unwrap(), &server.cert_der).unwrap();
+    let mut invalid = session(MockClock::from_secs(100));
+    invalid.expire().unwrap();
+    let result = ClientRuntime::connect(
+        &endpoint,
+        server.endpoint.local_addr().unwrap(),
+        "localhost",
+        invalid,
+        KEY,
+        NONCE_DOMAIN,
+        monitor(),
+    )
+    .await;
+    let error = match result {
+        Ok(_) => panic!("expired session must not connect"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, ClientRuntimeError::Session(_)));
+}
+
+#[tokio::test]
+async fn session_expiry_clears_runtime_handoffs() {
+    let server = make_server_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
+    let server_addr = server.endpoint.local_addr().unwrap();
+    let endpoint = make_client_endpoint("127.0.0.1:0".parse().unwrap(), &server.cert_der).unwrap();
+    let server_task = tokio::spawn(async move {
+        let incoming = server.endpoint.accept().await.unwrap();
+        let connection = incoming.await.unwrap();
+        connection.closed().await;
+    });
+    let clock = MockClock::from_secs(100);
+    let mut runtime = ClientRuntime::connect(
+        &endpoint,
+        server_addr,
+        "localhost",
+        session(clock.clone()),
+        KEY,
+        NONCE_DOMAIN,
+        monitor(),
+    )
+    .await
+    .unwrap();
+    clock.advance_secs(100);
+    let result = tokio::time::timeout(Duration::from_secs(1), runtime.run())
+        .await
+        .unwrap();
+    assert!(matches!(result, Err(ClientRuntimeError::Session(_))));
+    assert_eq!(runtime.session_state(), ClientState::Expired);
+    assert_eq!(runtime.drain_latest_frame(), None);
+    assert_eq!(runtime.sent_input_count(), 0);
+    let _ = runtime.shutdown(std::time::Instant::now() + Duration::from_secs(1));
+    server_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn window_close_terminates_and_clears_input_and_render_state() {
+    let server = make_server_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
+    let server_addr = server.endpoint.local_addr().unwrap();
+    let endpoint = make_client_endpoint("127.0.0.1:0".parse().unwrap(), &server.cert_der).unwrap();
+    let server_task = tokio::spawn(async move {
+        let incoming = server.endpoint.accept().await.unwrap();
+        let connection = incoming.await.unwrap();
+        connection.closed().await;
+    });
+    let mut runtime = ClientRuntime::connect(
+        &endpoint,
+        server_addr,
+        "localhost",
+        session(MockClock::from_secs(100)),
+        KEY,
+        NONCE_DOMAIN,
+        monitor(),
+    )
+    .await
+    .unwrap();
+    runtime
+        .handle_window_event(WindowEvent::Closed)
+        .expect_err("window close must terminate the runtime");
+    assert_eq!(runtime.session_state(), ClientState::Expired);
+    assert_eq!(runtime.drain_latest_frame(), None);
+    assert_eq!(runtime.sent_input_count(), 0);
     server_task.await.unwrap();
 }

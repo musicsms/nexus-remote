@@ -1,9 +1,6 @@
 //! Bounded orchestration for the native viewer/controller.
-//!
-//! Tokio owns only QUIC I/O and the short polling timer here.  Video jobs cross
-//! into the existing depth-one window/render handoff, while semantic input is
-//! encoded by the portable controller before it is sent as a QUIC datagram.
 
+use crate::session::{ClientError, ClientSession, ClientState};
 use crate::{
     ClientReceiver, ClientReceiverError, InputController, InputControllerError, RenderQueue,
     RenderQueueError, WindowCommand, WindowConfig, WindowController, WindowError, WindowEvent,
@@ -28,9 +25,6 @@ pub enum ClientConfigurationError {
     InvalidServerName,
 }
 
-/// Non-secret process configuration. Capability, relay token, session key,
-/// and certificate material are deliberately supplied by the authenticated
-/// session bootstrap rather than loaded from environment variables.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientConfiguration {
     pub server: SocketAddr,
@@ -67,6 +61,13 @@ pub enum ClientRuntimeError {
     RenderQueue(#[from] RenderQueueError),
     #[error("client transport closed: {0}")]
     Transport(#[from] quinn::ConnectionError),
+    #[error("client transport could not connect: {0}")]
+    Connect(#[from] quinn::ConnectError),
+    #[error("client session rejected the runtime operation: {0}")]
+    Session(#[from] ClientError),
+    #[cfg(windows)]
+    #[error("client decoder or renderer failed: {0}")]
+    Decoder(#[from] crate::decoder::DecoderError),
     #[error("client input datagram could not be sent: {0}")]
     SendDatagram(#[from] quinn::SendDatagramError),
     #[error("client runtime has already been shut down")]
@@ -75,17 +76,59 @@ pub enum ClientRuntimeError {
     ShutdownTimeout,
 }
 
-/// Result of a bounded runtime loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimeSummary {
     pub received_frames: u64,
     pub sent_input_messages: u64,
 }
 
-/// The portable owner of client network, receiver, render handoff, and input
-/// state. Native HWND/D3D/MF handles remain private to their worker modules.
+#[cfg(windows)]
+struct NativePipeline {
+    decoder: crate::decoder::NativeFrameDecoder,
+    renderer: crate::renderer::NativeFrameRenderer,
+}
+
+#[cfg(windows)]
+impl NativePipeline {
+    fn start(
+        window: &WindowController,
+        config: &WindowConfig,
+    ) -> Result<Self, crate::decoder::DecoderError> {
+        let handle = window
+            .native_handle()
+            .ok_or(crate::decoder::DecoderError::BackendUnavailable)?;
+        Ok(Self {
+            decoder: crate::decoder::NativeFrameDecoder::start(config.width, config.height)?,
+            renderer: crate::renderer::NativeFrameRenderer::start_for_native_handle(handle)?,
+        })
+    }
+
+    fn consume(&mut self, job: crate::DecodedFrameJob) -> Result<(), crate::decoder::DecoderError> {
+        if let Some(surface) = self.decoder.decode(job)? {
+            self.renderer.present(surface)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+#[derive(Default)]
+struct NativePipeline;
+
+#[cfg(not(windows))]
+impl NativePipeline {
+    fn start(_window: &WindowController, _config: &WindowConfig) -> Self {
+        Self
+    }
+
+    fn consume(&mut self, _job: crate::DecodedFrameJob) {}
+}
+
+/// Portable owner of client network, receiver, render handoff, input state,
+/// and authenticated session lifecycle. Native handles remain private.
 pub struct ClientRuntime {
     connection: Connection,
+    session: ClientSession,
     receiver: ClientReceiver,
     window: WindowController,
     render_queue: RenderQueue,
@@ -93,21 +136,45 @@ pub struct ClientRuntime {
     received_frames: u64,
     sent_input_messages: u64,
     latest_frame: Option<crate::DecodedFrameJob>,
+    pipeline: NativePipeline,
     shutdown: bool,
 }
 
 impl ClientRuntime {
-    /// Builds a runtime around an already authenticated QUIC connection.
-    /// Session capability/relay-token verification must happen before this
-    /// boundary is called by the control-plane connection owner.
-    pub fn connect(
-        connection: Connection,
+    /// Validates signed claims before opening a QUIC transport.
+    pub async fn connect(
+        endpoint: &quinn::Endpoint,
+        server: SocketAddr,
+        server_name: &str,
+        mut session: ClientSession,
         frame_key: [u8; 32],
         nonce_domain: u32,
         monitor: MonitorInfo,
     ) -> Result<Self, ClientRuntimeError> {
-        Self::connect_with_window(
+        let now = session.clock().now();
+        session.begin_connect(now)?;
+        let connecting = match endpoint.connect(server, server_name) {
+            Ok(connecting) => connecting,
+            Err(error) => {
+                let _ = session.expire();
+                return Err(ClientRuntimeError::Connect(error));
+            }
+        };
+        let connection = match connecting.await {
+            Ok(connection) => connection,
+            Err(error) => {
+                let _ = session.expire();
+                return Err(ClientRuntimeError::Transport(error));
+            }
+        };
+        if let Err(error) = session.connected(session.clock().now()) {
+            connection.close(0u32.into(), b"session rejected");
+            let _ = session.expire();
+            return Err(ClientRuntimeError::Session(error));
+        }
+        Self::build(
             connection,
+            session,
             frame_key,
             nonce_domain,
             monitor,
@@ -115,8 +182,9 @@ impl ClientRuntime {
         )
     }
 
-    pub fn connect_with_window(
+    fn build(
         connection: Connection,
+        session: ClientSession,
         frame_key: [u8; 32],
         nonce_domain: u32,
         monitor: MonitorInfo,
@@ -125,10 +193,14 @@ impl ClientRuntime {
         let mut receiver = ClientReceiver::new(frame_key, nonce_domain);
         receiver.set_cursor_monitor(monitor)?;
         let input = InputController::new(monitor)?;
-        let window = WindowController::start(window_config)?;
+        let window = WindowController::start(window_config.clone())?;
         let render_queue = window.render_queue();
+        let pipeline = NativePipeline::start(&window, &window_config);
+        #[cfg(windows)]
+        let pipeline = pipeline?;
         Ok(Self {
             connection,
+            session,
             receiver,
             window,
             render_queue,
@@ -136,54 +208,102 @@ impl ClientRuntime {
             received_frames: 0,
             sent_input_messages: 0,
             latest_frame: None,
+            pipeline,
             shutdown: false,
         })
+    }
+
+    pub fn session_id(&self) -> &str {
+        self.session.session_id()
+    }
+
+    pub fn session_state(&self) -> ClientState {
+        self.session.state()
     }
 
     pub fn handle_window_event(&mut self, event: WindowEvent) -> Result<(), ClientRuntimeError> {
         if self.shutdown {
             return Err(ClientRuntimeError::Shutdown);
         }
+        let closed = matches!(&event, WindowEvent::Closed);
         self.input.handle_window_event(event)?;
+        if closed {
+            self.fail_closed();
+            return Err(ClientRuntimeError::Shutdown);
+        }
         Ok(())
     }
 
-    /// Runs until the peer closes the QUIC connection or the runtime is shut
-    /// down. Every queue operation is non-blocking and bounded.
+    pub fn request_close(&self) -> Result<(), ClientRuntimeError> {
+        self.window
+            .try_send(WindowCommand::Close)
+            .map_err(ClientRuntimeError::Window)
+    }
+
     pub async fn run(&mut self) -> Result<RuntimeSummary, ClientRuntimeError> {
         if self.shutdown {
             return Err(ClientRuntimeError::Shutdown);
         }
-
         loop {
             tokio::select! {
                 datagram = self.connection.read_datagram() => {
+                    if let Err(error) = self.session.ensure_active(self.session.clock().now()).map_err(ClientRuntimeError::Session) {
+                        self.fail_closed();
+                        return Err(error);
+                    }
                     let bytes = match datagram {
                         Ok(bytes) => bytes,
-                        Err(
-                            quinn::ConnectionError::ConnectionClosed { .. }
+                        Err(quinn::ConnectionError::ConnectionClosed { .. }
                             | quinn::ConnectionError::ApplicationClosed { .. }
                             | quinn::ConnectionError::Reset
-                            | quinn::ConnectionError::LocallyClosed,
-                        ) => break,
-                        Err(error) => return Err(ClientRuntimeError::Transport(error)),
+                            | quinn::ConnectionError::LocallyClosed) => {
+                                let now = self.session.clock().now();
+                                let _ = self.session.transport_lost(now);
+                                break;
+                            }
+                        Err(error) => {
+                            self.fail_closed();
+                            return Err(ClientRuntimeError::Transport(error));
+                        }
                     };
-                    self.receiver.accept_datagram(&bytes)?;
+                    if let Err(error) = self.receiver.accept_datagram(&bytes) {
+                        self.fail_closed();
+                        return Err(ClientRuntimeError::Receiver(error));
+                    }
                     if let Some(frame) = self.receiver.drain_latest_frame() {
                         self.latest_frame = Some(frame.clone());
-                        // Keep the window command boundary exercised for native
-                        // builds; the shared queue is the depth-one handoff.
-                        self.window.try_send(WindowCommand::Render(frame))?;
+                        if let Err(error) = self.window.render_latest(frame) {
+                            self.fail_closed();
+                            return Err(ClientRuntimeError::Window(error));
+                        }
+                        if let Some(render_job) = self.render_queue.take_latest() {
+                            #[cfg(windows)]
+                            if let Err(error) = self.pipeline.consume(render_job) {
+                                self.fail_closed();
+                                return Err(ClientRuntimeError::Decoder(error));
+                            }
+                            #[cfg(not(windows))]
+                            self.pipeline.consume(render_job);
+                        }
                         self.received_frames = self.received_frames.saturating_add(1);
                     }
                 }
                 _ = tokio::time::sleep(RUNTIME_POLL_INTERVAL) => {
-                    self.pump_window_events()?;
-                    self.pump_input()?;
+                    if let Err(error) = self.session.ensure_active(self.session.clock().now()).map_err(ClientRuntimeError::Session) {
+                        self.fail_closed();
+                        return Err(error);
+                    }
+                    if let Err(error) = self.pump_window_events() {
+                        self.fail_closed();
+                        return Err(error);
+                    }
+                    if let Err(error) = self.pump_input() {
+                        self.fail_closed();
+                        return Err(error);
+                    }
                 }
             }
         }
-
         Ok(RuntimeSummary {
             received_frames: self.received_frames,
             sent_input_messages: self.sent_input_messages,
@@ -192,6 +312,11 @@ impl ClientRuntime {
 
     fn pump_window_events(&mut self) -> Result<(), ClientRuntimeError> {
         while let Some(event) = self.window.try_next_event() {
+            if matches!(event, WindowEvent::Closed) {
+                self.input.handle_window_event(event)?;
+                self.fail_closed();
+                return Err(ClientRuntimeError::Shutdown);
+            }
             self.input.handle_window_event(event)?;
         }
         Ok(())
@@ -206,9 +331,7 @@ impl ClientRuntime {
     }
 
     pub fn drain_latest_frame(&mut self) -> Option<crate::DecodedFrameJob> {
-        self.latest_frame
-            .take()
-            .or_else(|| self.render_queue.take_latest())
+        self.latest_frame.take()
     }
 
     pub fn received_frame_count(&self) -> u64 {
@@ -219,21 +342,27 @@ impl ClientRuntime {
         self.sent_input_messages
     }
 
-    /// Requests transport closure and bounds native window teardown by the
-    /// caller's deadline. Native workers retain their own joinable reapers if
-    /// a driver call exceeds that deadline.
     pub fn shutdown(&mut self, deadline: Instant) -> Result<(), ClientRuntimeError> {
         if self.shutdown {
             return Ok(());
         }
-        self.shutdown = true;
-        self.input.shutdown();
-        self.render_queue.shutdown();
-        self.connection.close(0u32.into(), b"client shutdown");
+        self.fail_closed();
         self.window.shutdown(deadline).map_err(|error| match error {
             WindowError::ShutdownTimeout => ClientRuntimeError::ShutdownTimeout,
             other => ClientRuntimeError::Window(other),
         })
+    }
+
+    fn fail_closed(&mut self) {
+        let _ = self.session.expire();
+        self.input.shutdown();
+        self.render_queue.shutdown();
+        self.latest_frame = None;
+        self.connection.close(0u32.into(), b"client runtime closed");
+        self.shutdown = true;
+        let _ = self
+            .window
+            .shutdown(Instant::now() + Duration::from_millis(250));
     }
 }
 

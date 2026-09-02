@@ -266,6 +266,28 @@ impl WindowController {
         self.render_queue.clone()
     }
 
+    /// Replaces the pending render job directly in the depth-one handoff.
+    /// Network receive paths must use this instead of the FIFO command queue,
+    /// so a saturated window thread cannot retain stale frames.
+    pub fn render_latest(&self, frame: DecodedFrameJob) -> Result<(), WindowError> {
+        validate_command(
+            &WindowCommand::Render(frame.clone()),
+            self.max_render_payload,
+        )?;
+        self.render_queue
+            .push_latest(frame)
+            .map_err(|error| match error {
+                crate::renderer::RenderQueueError::AccessUnitTooLarge { .. } => {
+                    WindowError::RenderPayloadTooLarge
+                }
+                crate::renderer::RenderQueueError::Shutdown => WindowError::CommandClosed,
+                crate::renderer::RenderQueueError::EmptyAccessUnit
+                | crate::renderer::RenderQueueError::StateUnavailable => {
+                    WindowError::RenderPayloadTooLarge
+                }
+            })
+    }
+
     /// Returns the native window as an opaque integer for cfg(windows) smoke
     /// tooling. Core code never imports or stores an HWND type.
     pub fn native_handle(&self) -> Option<isize> {

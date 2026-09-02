@@ -116,6 +116,31 @@ impl ClientSession {
         self.state
     }
 
+    pub fn session_id(&self) -> &str {
+        &self.capability.session_id
+    }
+
+    /// Revalidates the signed claims and established-duration policy while a
+    /// connected runtime is pumping network/UI work.
+    pub fn ensure_active(&mut self, now: UnixTimestamp) -> Result<(), ClientError> {
+        if self.state == ClientState::Expired {
+            return Err(ClientError::Expired);
+        }
+        if self.state != ClientState::Connected {
+            return Err(ClientError::InvalidTransition {
+                from: self.state,
+                to: ClientState::Connected,
+            });
+        }
+        self.validate_claims(now)?;
+        if self.session_duration_expired(now) {
+            self.state = ClientState::Expired;
+            self.reconnect_deadline = None;
+            return Err(ClientError::Expired);
+        }
+        Ok(())
+    }
+
     pub fn begin_connect(&mut self, now: UnixTimestamp) -> Result<(), ClientError> {
         if self.state == ClientState::Expired {
             return Err(ClientError::Expired);
