@@ -11,9 +11,10 @@
   renderer workers named `nexus-client-decoder` and `nexus-client-renderer`.
   They own COM/MF/D3D objects, use bounded command/reply channels, validate an
   initial keyframe sequence header, and surface backend loss explicitly.
-- Added an ignored Windows-only smoke entrypoint that initializes both native
-  adapters and uploads one synthetic decoded surface. It is not presented as
-  evidence of GUI/GPU success on GNU/Linux.
+- Added an ignored Windows-only smoke entrypoint that authenticates a real
+  encoder-produced frame, decodes it through Media Foundation, and presents
+  it through D3D11. It is not presented as evidence of GUI/GPU success on
+  GNU/Linux.
 
 ## TDD evidence
 
@@ -38,9 +39,8 @@ replacement, and shutdown rejection.
 ## Follow-up boundary
 
 Task 4 owns the HWND and Task 5 owns the authenticated end-to-end runtime.
-The renderer currently creates its dedicated D3D11 device and upload texture;
-it deliberately does not create an HWND-bound swap chain before the window
-thread exists.
+The renderer creates its dedicated D3D11 device and upload texture, and can
+bind an HWND-owned swap chain once the window thread supplies the target.
 
 ## Fix round 1
 
@@ -62,9 +62,9 @@ thread exists.
 - Replaced the stale native `nv12_len` reference with the validated NV12
   length helper used by the portable surface contract.
 - Bounded MFT output-buffer allocation by the 64 MiB surface limit and
-  validated Media Foundation current/max/contiguous lengths before every
-  native slice. Padded `IMF2DBuffer` rows now require both a valid pitch and a
-  sufficient contiguous extent before repacking.
+  validated Media Foundation current/max lengths before native reads. Padded
+  `IMF2DBuffer` rows now use a bounded allocation extent from `Lock2DSize`,
+  while older buffers use a caller-owned contiguous copy.
 - Continued draining when Media Foundation reports `NO_SAMPLE | INCOMPLETE`
   so delayed output is not silently abandoned.
 - Made swap-chain presentation dimensions explicit: resize on decoded-size
@@ -88,7 +88,8 @@ thread exists.
 
 - Corrected the Windows 0.58 FFI calls: HWND values are converted to the
   pointer-backed handle type, `ID3D11Texture2D::GetDesc` receives an output
-  pointer, and `IDXGISwapChain::Present` checks its raw HRESULT.
+  pointer, and `IDXGISwapChain::Present` checks its raw HRESULT with the
+  Windows result API.
 - Replaced the invalid mapped-buffer extent assumption. `IMF2DBuffer2` now
   uses `Lock2DSize` and validates the returned allocation base/length before
   reading padded rows; older `IMF2DBuffer` implementations use bounded

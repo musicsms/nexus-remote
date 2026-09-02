@@ -433,7 +433,7 @@ pub(crate) mod native {
             // with the same dimensions as the backbuffer.
             unsafe { context.CopyResource(&back_buffer, &texture) };
             let present_status = unsafe { swap_chain.Present(1, DXGI_PRESENT(0)) };
-            if present_status < 0 {
+            if present_status.is_err() {
                 return Err(DecoderError::BackendLost);
             }
         }
