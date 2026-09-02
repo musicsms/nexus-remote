@@ -25,7 +25,7 @@
 ## Verification
 
 - `cargo fmt --all -- --check` — passed.
-- `cargo test -p nexus-client --all-targets` — passed (47 tests including the
+- `cargo test -p nexus-client --all-targets` — passed (49 tests including the
   loopback test; Windows-only smoke files compile to zero Linux tests).
 - `cargo clippy -p nexus-client --all-targets -- -D warnings` — passed.
 - `cargo check -p nexus-client --tests --target x86_64-pc-windows-gnu` — not
@@ -78,7 +78,7 @@ condition.
 ## Review fix verification
 
 - `cargo fmt --all -- --check` — passed.
-- `cargo test -p nexus-client --all-targets` — passed (47 tests).
+- `cargo test -p nexus-client --all-targets` — passed (49 tests).
 - `cargo clippy -p nexus-client --all-targets -- -D warnings` — passed.
 - `cargo build --workspace` — passed.
 - `cargo test --workspace` — passed.
@@ -99,3 +99,18 @@ condition.
   then constructs `ClientRuntime::connect` and runs/shuts it down. No private
   identity key or browser credential is read.
 - Added reconnect-failure state coverage and decoder-gate reset coverage.
+
+## Review fix round 4
+
+- Reconnect generation changes now invoke the native Media Foundation decoder
+  reset command, flushing MFT pending input/output and resetting keyframe gate
+  state before the next post-gap job.
+- Configured runtime orchestration loops from `run()` through
+  `reconnect_with_retry()` after clean transport loss instead of shutting down
+  after the first connection.
+- Added shared cancellation notification so an owner can interrupt reconnect
+  sleeps and in-flight connect waits with `request_shutdown`, then perform the
+  bounded final worker join through `shutdown`.
+- Hex parsing checks ASCII and byte pairs before conversion, with malformed
+  Unicode coverage; configured bootstrap absence is covered by an explicit
+  fail-closed entrypoint test.

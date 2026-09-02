@@ -289,6 +289,7 @@ pub(crate) mod native {
             DecodedFrameJob,
             SyncSender<Result<Option<DecodedSurface>, DecoderError>>,
         ),
+        Reset(SyncSender<Result<(), DecoderError>>),
         Shutdown(SyncSender<()>),
     }
 
@@ -334,6 +335,19 @@ pub(crate) mod native {
                 let _ = reply_rx.recv_timeout(REQUEST_TIMEOUT);
             }
             self.lifecycle.join_before(Instant::now() + REQUEST_TIMEOUT);
+        }
+
+        pub(super) fn reset(&mut self) -> Result<(), DecoderError> {
+            self.gate.reset();
+            let (reply_tx, reply_rx) = sync_channel(1);
+            self.commands
+                .as_ref()
+                .ok_or(DecoderError::BackendLost)?
+                .try_send(DecoderCommand::Reset(reply_tx))
+                .map_err(|_| DecoderError::BackendLost)?;
+            reply_rx
+                .recv_timeout(REQUEST_TIMEOUT)
+                .map_err(|_| DecoderError::BackendLost)?
         }
     }
 
@@ -438,6 +452,15 @@ pub(crate) mod native {
             });
             self.drain_outputs()?;
             Ok(self.pending_surfaces.pop_front())
+        }
+
+        fn reset(&mut self) -> Result<(), DecoderError> {
+            unsafe { self.transform.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0) }
+                .map_err(|_| DecoderError::BackendLost)?;
+            self.pending_inputs.clear();
+            self.pending_surfaces.clear();
+            self.gate.reset();
+            Ok(())
         }
 
         fn drain_outputs(&mut self) -> Result<(), DecoderError> {
@@ -591,6 +614,9 @@ pub(crate) mod native {
             match command {
                 DecoderCommand::Decode(job, reply) => {
                     let _ = reply.send(decoder.decode(job));
+                }
+                DecoderCommand::Reset(reply) => {
+                    let _ = reply.send(decoder.reset());
                 }
                 DecoderCommand::Shutdown(reply) => {
                     decoder.shutdown();
@@ -878,5 +904,9 @@ impl NativeFrameDecoder {
         job: DecodedFrameJob,
     ) -> Result<Option<DecodedSurface>, DecoderError> {
         self.inner.decode(job)
+    }
+
+    pub(crate) fn reset(&mut self) -> Result<(), DecoderError> {
+        self.inner.reset()
     }
 }

@@ -16,6 +16,10 @@ use quinn::Connection;
 use rustls::pki_types::CertificateDer;
 use std::{
     net::SocketAddr,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 use thiserror::Error;
@@ -72,20 +76,80 @@ where
 }
 
 fn read_hex_env(name: &str) -> Result<Vec<u8>, ClientRuntimeError> {
-    let value = required_env(name)?;
-    if value.len() % 2 != 0 {
+    decode_hex(name, &required_env(name)?)
+}
+
+fn decode_hex(name: &str, value: &str) -> Result<Vec<u8>, ClientRuntimeError> {
+    let bytes = value.as_bytes();
+    if !value.is_ascii() {
+        return Err(ClientRuntimeError::InvalidBootstrap(format!(
+            "{name} must contain ASCII hexadecimal digits"
+        )));
+    }
+    if !bytes.len().is_multiple_of(2) {
         return Err(ClientRuntimeError::InvalidBootstrap(format!(
             "{name} must contain an even number of hexadecimal digits"
         )));
     }
-    (0..value.len())
-        .step_by(2)
-        .map(|index| {
-            u8::from_str_radix(&value[index..index + 2], 16).map_err(|_| {
+    bytes
+        .chunks(2)
+        .map(|pair| {
+            let pair = std::str::from_utf8(pair).expect("ASCII input is valid UTF-8");
+            u8::from_str_radix(pair, 16).map_err(|_| {
                 ClientRuntimeError::InvalidBootstrap(format!("{name} is not hexadecimal"))
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod bootstrap_tests {
+    use super::{decode_hex, ClientConfiguration, ClientRuntime, ClientRuntimeError};
+
+    #[test]
+    fn malformed_unicode_hex_is_rejected_without_panicking() {
+        assert!(matches!(
+            decode_hex("FRAME_KEY", "é1"),
+            Err(ClientRuntimeError::InvalidBootstrap(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn configured_entrypoint_fails_closed_without_authenticated_bootstrap() {
+        let bootstrap_names = [
+            "NEXUS_CLIENT_SERVER_CERT_DER",
+            "NEXUS_CLIENT_CAPABILITY_HEX",
+            "NEXUS_CLIENT_CAPABILITY_VERIFYING_KEY_HEX",
+            "NEXUS_CLIENT_RELAY_ID",
+            "NEXUS_CLIENT_RELAY_SESSION_ID",
+            "NEXUS_CLIENT_RELAY_CLIENT_DEVICE_ID",
+            "NEXUS_CLIENT_RELAY_TARGET_DEVICE_ID",
+            "NEXUS_CLIENT_RELAY_EXPIRES_AT",
+            "NEXUS_CLIENT_RELAY_SIGNATURE_HEX",
+            "NEXUS_CLIENT_RELAY_VERIFYING_KEY_HEX",
+            "NEXUS_CLIENT_FRAME_KEY_HEX",
+            "NEXUS_CLIENT_NONCE_DOMAIN",
+            "NEXUS_CLIENT_MONITOR_WIDTH",
+            "NEXUS_CLIENT_MONITOR_HEIGHT",
+            "NEXUS_CLIENT_STREAM_WIDTH",
+            "NEXUS_CLIENT_STREAM_HEIGHT",
+        ];
+        if bootstrap_names
+            .iter()
+            .any(|name| std::env::var_os(name).is_some())
+        {
+            return;
+        }
+        let result = ClientRuntime::run_configured(ClientConfiguration {
+            server: "127.0.0.1:4433".parse().unwrap(),
+            server_name: "localhost".to_owned(),
+        })
+        .await;
+        assert!(matches!(
+            result,
+            Err(ClientRuntimeError::SessionBootstrapRequired)
+        ));
+    }
 }
 
 fn read_fixed_hex_env<const N: usize>(name: &str) -> Result<[u8; N], ClientRuntimeError> {
@@ -178,7 +242,7 @@ impl VideoStreamConfig {
 }
 
 #[cfg(windows)]
-use std::sync::{mpsc, Arc, Condvar, Mutex};
+use std::sync::{mpsc, Condvar, Mutex};
 #[cfg(windows)]
 use std::thread::{self, JoinHandle};
 
@@ -256,13 +320,9 @@ impl NativePipeline {
                     if job_generation
                         != worker_generation.load(std::sync::atomic::Ordering::Acquire)
                     {
-                        match crate::decoder::NativeFrameDecoder::start(stream.width, stream.height)
-                        {
-                            Ok(next_decoder) => decoder = next_decoder,
-                            Err(error) => {
-                                let _ = error_tx.try_send(error);
-                                break;
-                            }
+                        if let Err(error) = decoder.reset() {
+                            let _ = error_tx.try_send(error);
+                            break;
                         }
                     }
                     match decoder.decode(pending_job.job) {
@@ -405,6 +465,39 @@ impl NativePipeline {
     }
 }
 
+#[cfg(all(test, windows))]
+mod native_pipeline_tests {
+    use super::*;
+    use std::sync::atomic::AtomicU64;
+
+    #[test]
+    fn reconnect_reset_clears_pending_job_and_advances_generation() {
+        let pending = Arc::new((Mutex::new(None), Condvar::new()));
+        let generation = Arc::new(AtomicU64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (_, errors) = mpsc::sync_channel(1);
+        let mut pipeline = NativePipeline {
+            pending: Arc::clone(&pending),
+            generation: Arc::clone(&generation),
+            stop,
+            errors,
+            worker: None,
+        };
+        pipeline
+            .submit(crate::DecodedFrameJob {
+                frame_id: 1,
+                timestamp_us: 1,
+                keyframe: true,
+                access_unit: vec![1],
+            })
+            .unwrap();
+        assert!(pending.0.lock().unwrap().is_some());
+        pipeline.reset_for_reconnect().unwrap();
+        assert!(pending.0.lock().unwrap().is_none());
+        assert_eq!(generation.load(Ordering::Acquire), 1);
+    }
+}
+
 /// Portable owner of client network, receiver, render handoff, input state,
 /// and authenticated session lifecycle. Native handles remain private.
 pub struct ClientRuntime {
@@ -418,6 +511,8 @@ pub struct ClientRuntime {
     sent_input_messages: u64,
     latest_frame: Option<crate::DecodedFrameJob>,
     pipeline: NativePipeline,
+    cancel: Arc<AtomicBool>,
+    cancel_notify: Arc<tokio::sync::Notify>,
     shutdown: bool,
 }
 
@@ -425,9 +520,11 @@ impl ClientRuntime {
     /// Enters the production runtime from the validated endpoint configuration.
     ///
     /// The control plane owns the authenticated capability, relay metadata,
-    /// peer certificate, and frame key.  Since those values are deliberately
-    /// not read from the process environment, this boundary reports the
-    /// missing bootstrap instead of manufacturing an unauthenticated session.
+    /// peer certificate, and frame key. These are accepted only through the
+    /// explicit bootstrap environment contract below; private identity keys
+    /// and browser credentials are never loaded by this entrypoint. When the
+    /// contract is absent, the boundary fails closed instead of manufacturing
+    /// an unauthenticated session.
     pub async fn run_configured(
         configuration: ClientConfiguration,
     ) -> Result<RuntimeSummary, ClientRuntimeError> {
@@ -497,9 +594,11 @@ impl ClientRuntime {
             height: parse_env("NEXUS_CLIENT_MONITOR_HEIGHT")?,
             scale: 1.0,
         };
+        let server = configuration.server;
+        let server_name = configuration.server_name.clone();
         let connect_config = ClientConnectConfig {
-            server: configuration.server,
-            server_name: configuration.server_name,
+            server,
+            server_name: server_name.clone(),
             monitor,
             stream: VideoStreamConfig::new(
                 parse_env("NEXUS_CLIENT_STREAM_WIDTH")?,
@@ -510,7 +609,15 @@ impl ClientRuntime {
         let nonce_domain = parse_env("NEXUS_CLIENT_NONCE_DOMAIN")?;
         let mut runtime =
             Self::connect(&endpoint, connect_config, session, frame_key, nonce_domain).await?;
-        let summary = runtime.run().await;
+        let summary = loop {
+            let summary = runtime.run().await;
+            if runtime.session_state() != ClientState::Reconnecting {
+                break summary;
+            }
+            runtime
+                .reconnect_with_retry(&endpoint, server, &server_name, RECONNECT_RETRY_INTERVAL)
+                .await?;
+        };
         let shutdown_result = runtime.shutdown(Instant::now() + Duration::from_secs(1));
         match (summary, shutdown_result) {
             (Err(error), _) => Err(error),
@@ -586,7 +693,11 @@ impl ClientRuntime {
         if self.shutdown {
             return Err(ClientRuntimeError::Shutdown);
         }
+        let retry_interval = retry_interval.max(Duration::from_millis(1));
         loop {
+            if self.cancel.load(Ordering::Acquire) {
+                return Err(ClientRuntimeError::Shutdown);
+            }
             match self.reconnect_attempt(endpoint, server, server_name).await {
                 Ok(()) => return Ok(()),
                 Err(error) => {
@@ -594,7 +705,10 @@ impl ClientRuntime {
                         self.fail_closed();
                         return Err(error);
                     }
-                    tokio::time::sleep(retry_interval).await;
+                    tokio::select! {
+                        _ = tokio::time::sleep(retry_interval) => {}
+                        _ = self.cancel_notify.notified() => return Err(ClientRuntimeError::Shutdown),
+                    }
                 }
             }
         }
@@ -606,6 +720,9 @@ impl ClientRuntime {
         server: SocketAddr,
         server_name: &str,
     ) -> Result<(), ClientRuntimeError> {
+        if self.cancel.load(Ordering::Acquire) {
+            return Err(ClientRuntimeError::Shutdown);
+        }
         let now = self.session.clock().now();
         if let Err(error) = self.session.begin_connect(now) {
             return Err(ClientRuntimeError::Session(error));
@@ -619,7 +736,10 @@ impl ClientRuntime {
                 return Err(ClientRuntimeError::Connect(error));
             }
         };
-        let connection = match connecting.await {
+        let connection = match tokio::select! {
+            connection = connecting => connection,
+            _ = self.cancel_notify.notified() => return Err(ClientRuntimeError::Shutdown),
+        } {
             Ok(connection) => connection,
             Err(error) => {
                 self.session
@@ -662,6 +782,8 @@ impl ClientRuntime {
         let pipeline = NativePipeline::start(&window, stream);
         #[cfg(windows)]
         let pipeline = pipeline?;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_notify = Arc::new(tokio::sync::Notify::new());
         Ok(Self {
             connection,
             session,
@@ -673,6 +795,8 @@ impl ClientRuntime {
             sent_input_messages: 0,
             latest_frame: None,
             pipeline,
+            cancel,
+            cancel_notify,
             shutdown: false,
         })
     }
@@ -704,12 +828,27 @@ impl ClientRuntime {
             .map_err(ClientRuntimeError::Window)
     }
 
+    /// Requests cancellation from another task or thread. The owner should
+    /// subsequently call [`Self::shutdown`] to join workers and release all
+    /// resources; the notification makes reconnect and transport waits stop
+    /// promptly instead of waiting for their retry/QUIC deadlines.
+    pub fn request_shutdown(&self) {
+        self.cancel.store(true, Ordering::Release);
+        self.connection
+            .close(0u32.into(), b"client shutdown requested");
+        self.cancel_notify.notify_waiters();
+    }
+
     pub async fn run(&mut self) -> Result<RuntimeSummary, ClientRuntimeError> {
-        if self.shutdown {
+        if self.shutdown || self.cancel.load(Ordering::Acquire) {
             return Err(ClientRuntimeError::Shutdown);
         }
         loop {
             tokio::select! {
+                _ = self.cancel_notify.notified() => {
+                    self.fail_closed();
+                    return Err(ClientRuntimeError::Shutdown);
+                }
                 datagram = self.connection.read_datagram() => {
                     if let Err(error) = self.session.ensure_active(self.session.clock().now()).map_err(ClientRuntimeError::Session) {
                         self.fail_closed();
@@ -721,6 +860,10 @@ impl ClientRuntime {
                             | quinn::ConnectionError::ApplicationClosed { .. }
                             | quinn::ConnectionError::Reset
                             | quinn::ConnectionError::LocallyClosed) => {
+                                if self.cancel.load(Ordering::Acquire) {
+                                    self.fail_closed();
+                                    return Err(ClientRuntimeError::Shutdown);
+                                }
                                 let now = self.session.clock().now();
                                 if let Err(error) = self.session.transport_lost(now) {
                                     self.fail_closed();
@@ -835,6 +978,8 @@ impl ClientRuntime {
     }
 
     fn fail_closed_with_deadline(&mut self, deadline: Instant) -> bool {
+        self.cancel.store(true, Ordering::Release);
+        self.cancel_notify.notify_waiters();
         let _ = self.session.expire();
         self.input.shutdown();
         self.render_queue.shutdown();
