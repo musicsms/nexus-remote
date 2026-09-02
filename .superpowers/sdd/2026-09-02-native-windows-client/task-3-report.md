@@ -26,7 +26,7 @@ replacement, and shutdown rejection.
 ## Verification
 
 - `cargo fmt --all -- --check` — passed
-- `cargo test -p nexus-client` — passed (29 tests; Windows smoke has 0 tests
+- `cargo test -p nexus-client` — passed (32 tests; Windows smoke has 0 tests
   on Linux because its crate is `cfg(windows)`)
 - `cargo clippy -p nexus-client --all-targets -- -D warnings` — passed
 - `git diff --check` — passed
@@ -54,8 +54,8 @@ thread exists.
   before native startup/allocation, repacks padded NV12 rows, releases every
   unselected MFT activation, and moves timed-out worker joins to a reaper.
 - Added an HWND-capable D3D11 swap-chain startup path and Present path; Task 4
-  supplies the HWND. The existing ignored smoke stays explicitly non-Windows
-  on GNU/Linux and cannot be treated as live GPU evidence.
+  supplies the HWND. The ignored smoke remains Windows-only and cannot be
+  treated as live GPU evidence on GNU/Linux.
 
 ## Fix round 2
 
@@ -78,8 +78,31 @@ thread exists.
 ## Fix round 2 verification
 
 - `cargo fmt --all` — passed
-- `cargo test -p nexus-client` — passed (29 tests)
+- `cargo test -p nexus-client` — passed (32 tests)
 - `cargo clippy -p nexus-client --all-targets -- -D warnings` — passed
 - `git diff --check` — passed
 - Live Windows Media Foundation/D3D11 smoke remains intentionally ignored and
   was not run in this GNU/Linux environment.
+
+## Fix round 3
+
+- Corrected the Windows 0.58 FFI calls: HWND values are converted to the
+  pointer-backed handle type, `ID3D11Texture2D::GetDesc` receives an output
+  pointer, and `IDXGISwapChain::Present` checks its raw HRESULT.
+- Replaced the invalid mapped-buffer extent assumption. `IMF2DBuffer2` now
+  uses `Lock2DSize` and validates the returned allocation base/length before
+  reading padded rows; older `IMF2DBuffer` implementations use bounded
+  `ContiguousCopyTo`, and plain buffers validate the lengths returned by
+  `Lock` before copying.
+- The Windows smoke now obtains a real deterministic 1280x720 keyframe from
+  the native Media Foundation encoder, authenticates it through the client
+  receiver, decodes it, and presents it to the operator HWND.
+
+## Fix round 3 verification
+
+- `cargo fmt --all` — passed
+- `cargo test --workspace` — passed
+- `cargo clippy -p nexus-client --all-targets -- -D warnings` — passed
+- `git diff --check` — passed
+- Windows native compilation and the ignored interactive smoke remain
+  unavailable in this GNU/Linux environment.

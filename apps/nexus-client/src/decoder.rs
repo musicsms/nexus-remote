@@ -248,9 +248,10 @@ pub(crate) mod native {
     use std::{mem::ManuallyDrop, ptr};
     use windows::core::Interface;
     use windows::Win32::Media::MediaFoundation::{
-        IMF2DBuffer, IMFMediaBuffer, IMFShutdown, IMFTransform, MFCreateMediaType,
-        MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video, MFShutdown, MFStartup, MFTEnumEx,
-        MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoInterlace_Progressive, MFSTARTUP_FULL,
+        IMF2DBuffer, IMF2DBuffer2, IMFMediaBuffer, IMFShutdown, IMFTransform,
+        MF2DBuffer_LockFlags_Read, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample,
+        MFMediaType_Video, MFShutdown, MFStartup, MFTEnumEx, MFVideoFormat_H264,
+        MFVideoFormat_NV12, MFVideoInterlace_Progressive, MFSTARTUP_FULL,
         MFT_CATEGORY_VIDEO_DECODER, MFT_ENUM_FLAG, MFT_ENUM_FLAG_SORTANDFILTER,
         MFT_ENUM_FLAG_SYNCMFT, MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
         MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
@@ -723,21 +724,27 @@ pub(crate) mod native {
             .ok()
             .and_then(|height| height.checked_add(height / 2))
             .ok_or(DecoderError::InvalidDimensions)?;
-        if let Ok(buffer_2d) = buffer.cast::<IMF2DBuffer>() {
-            let contiguous_length = usize::try_from(
-                unsafe { buffer_2d.GetContiguousLength() }
-                    .map_err(|_| DecoderError::BackendLost)?,
-            )
-            .map_err(|_| DecoderError::InvalidSurface)?;
-            if contiguous_length > max_length {
-                return Err(DecoderError::InvalidSurface);
-            }
+        let expected = validated_nv12_len(width, height)?;
+        if actual_length < expected {
+            return Err(DecoderError::InvalidSurface);
+        }
+        if let Ok(buffer_2d) = buffer.cast::<IMF2DBuffer2>() {
             let mut source = ptr::null_mut();
+            let mut buffer_start = ptr::null_mut();
             let mut signed_pitch = 0_i32;
-            unsafe { buffer_2d.Lock2D(&mut source, &mut signed_pitch) }
-                .map_err(|_| DecoderError::BackendLost)?;
+            let mut buffer_length = 0_u32;
+            unsafe {
+                buffer_2d.Lock2DSize(
+                    MF2DBuffer_LockFlags_Read,
+                    &mut source,
+                    &mut signed_pitch,
+                    &mut buffer_start,
+                    &mut buffer_length,
+                )
+            }
+            .map_err(|_| DecoderError::BackendLost)?;
             let result = (|| {
-                if source.is_null() || signed_pitch < 0 {
+                if source.is_null() || buffer_start.is_null() || signed_pitch < 0 {
                     return Err(DecoderError::InvalidSurface);
                 }
                 let pitch =
@@ -745,18 +752,29 @@ pub(crate) mod native {
                 if pitch < width_usize {
                     return Err(DecoderError::InvalidSurface);
                 }
+                let allocation_length =
+                    usize::try_from(buffer_length).map_err(|_| DecoderError::InvalidSurface)?;
+                if allocation_length > max_length || allocation_length > super::MAX_SURFACE_BYTES {
+                    return Err(DecoderError::InvalidSurface);
+                }
+                let source_address = source as usize;
+                let allocation_address = buffer_start as usize;
+                let offset = source_address
+                    .checked_sub(allocation_address)
+                    .ok_or(DecoderError::InvalidSurface)?;
                 let length = pitch
                     .checked_mul(rows)
                     .ok_or(DecoderError::InvalidDimensions)?;
-                let expected = validated_nv12_len(width, height)?;
-                if length > super::MAX_SURFACE_BYTES
-                    || length > contiguous_length
-                    || actual_length < expected
+                if offset
+                    .checked_add(length)
+                    .ok_or(DecoderError::InvalidDimensions)?
+                    > allocation_length
                 {
                     return Err(DecoderError::InvalidSurface);
                 }
-                // SAFETY: Lock2D returned `source` with `pitch * rows` bytes
-                // for the negotiated NV12 surface; copying finishes before Unlock2D.
+                // SAFETY: Lock2DSize supplied the mapped allocation base and
+                // byte length. The checked offset and pitch*rows prove that
+                // every byte is inside that allocation until Unlock2D.
                 Ok((
                     unsafe { std::slice::from_raw_parts(source, length) }.to_vec(),
                     pitch,
@@ -766,20 +784,57 @@ pub(crate) mod native {
             unlock.map_err(|_| DecoderError::BackendLost)?;
             return result;
         }
-        let expected = validated_nv12_len(width, height)?;
-        if actual_length != expected {
-            return Err(DecoderError::InvalidSurface);
+        if let Ok(buffer_2d) = buffer.cast::<IMF2DBuffer>() {
+            let contiguous_length = usize::try_from(
+                unsafe { buffer_2d.GetContiguousLength() }
+                    .map_err(|_| DecoderError::BackendLost)?,
+            )
+            .map_err(|_| DecoderError::InvalidSurface)?;
+            if contiguous_length != expected || contiguous_length > max_length {
+                return Err(DecoderError::InvalidSurface);
+            }
+            let mut packed = vec![0_u8; contiguous_length];
+            // ContiguousCopyTo writes only into the caller-owned bounded
+            // destination, so no mapped pointer extent is inferred here.
+            unsafe { buffer_2d.ContiguousCopyTo(&mut packed) }
+                .map_err(|_| DecoderError::BackendLost)?;
+            return Ok((packed, width_usize));
         }
         let mut source = ptr::null_mut();
-        unsafe { buffer.Lock(&mut source, None, None) }.map_err(|_| DecoderError::BackendLost)?;
+        let mut locked_max = 0_u32;
+        let mut locked_current = 0_u32;
+        unsafe {
+            buffer.Lock(
+                &mut source,
+                Some(&mut locked_max),
+                Some(&mut locked_current),
+            )
+        }
+        .map_err(|_| DecoderError::BackendLost)?;
         if source.is_null() {
             let _ = unsafe { buffer.Unlock() };
             return Err(DecoderError::BackendLost);
         }
-        // SAFETY: Media Foundation reports the current length for its live
-        // locked buffer, and this worker copies it before Unlock.
-        let bytes = unsafe { std::slice::from_raw_parts(source, actual_length) }.to_vec();
+        let locked_max = usize::try_from(locked_max).map_err(|_| DecoderError::InvalidSurface);
+        let locked_current =
+            usize::try_from(locked_current).map_err(|_| DecoderError::InvalidSurface);
+        let bytes_result = match (locked_max, locked_current) {
+            (Ok(locked_max), Ok(locked_current))
+                if locked_max <= max_length
+                    && locked_max <= super::MAX_SURFACE_BYTES
+                    && locked_current >= expected
+                    && locked_current <= locked_max =>
+            {
+                // SAFETY: Lock reported a bounded allocation and current
+                // length covering exactly the bytes read below.
+                Ok(unsafe { std::slice::from_raw_parts(source, expected) }.to_vec())
+            }
+            _ => Err(DecoderError::InvalidSurface),
+        };
+        // Unlock even when the reported extent is invalid; leaving a native
+        // Media Foundation buffer locked can deadlock the decoder on teardown.
         unsafe { buffer.Unlock() }.map_err(|_| DecoderError::BackendLost)?;
+        let bytes = bytes_result?;
         Ok((bytes, width_usize))
     }
 }

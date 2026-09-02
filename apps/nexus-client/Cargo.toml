@@ -22,6 +22,10 @@ ed25519-dalek.workspace = true
 prost.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+bytes.workspace = true
+nexus-capture.workspace = true
+nexus-codec.workspace = true
+platform-windows = { path = "../../platform/windows" }
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct3D",

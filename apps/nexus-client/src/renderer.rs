@@ -101,8 +101,8 @@ pub(crate) fn native_renderer_smoke(
     hwnd: isize,
     surface: crate::decoder::DecodedSurface,
 ) -> Result<(), crate::decoder::DecoderError> {
-    let mut renderer =
-        native::D3D11Renderer::start_for_window(windows::Win32::Foundation::HWND(hwnd))?;
+    let hwnd = windows::Win32::Foundation::HWND(hwnd as *mut core::ffi::c_void);
+    let mut renderer = native::D3D11Renderer::start_for_window(hwnd)?;
     renderer.present(surface)
 }
 
@@ -399,7 +399,10 @@ pub(crate) mod native {
             // stream since the last frame.  `presentation_size` is only a
             // cache, so verify the actual back-buffer dimensions immediately
             // before CopyResource; that API requires identical extents.
-            let back_buffer_desc = unsafe { back_buffer.GetDesc() };
+            let mut back_buffer_desc = D3D11_TEXTURE2D_DESC::default();
+            // SAFETY: `back_buffer_desc` is a valid output struct for the
+            // texture's synchronous descriptor query.
+            unsafe { back_buffer.GetDesc(&mut back_buffer_desc) };
             if (back_buffer_desc.Width, back_buffer_desc.Height) != requested_size {
                 drop(back_buffer);
                 unsafe {
@@ -416,7 +419,10 @@ pub(crate) mod native {
                 back_buffer =
                     unsafe { swap_chain.GetBuffer(0) }.map_err(|_| DecoderError::BackendLost)?;
             }
-            let back_buffer_desc = unsafe { back_buffer.GetDesc() };
+            let mut back_buffer_desc = D3D11_TEXTURE2D_DESC::default();
+            // SAFETY: the back buffer remains live while its descriptor is
+            // copied into this stack-owned output struct.
+            unsafe { back_buffer.GetDesc(&mut back_buffer_desc) };
             if (back_buffer_desc.Width, back_buffer_desc.Height) != requested_size
                 || back_buffer_desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM
             {
@@ -426,8 +432,10 @@ pub(crate) mod native {
             // swap-chain path normalizes decoded surfaces to a BGRA texture
             // with the same dimensions as the backbuffer.
             unsafe { context.CopyResource(&back_buffer, &texture) };
-            unsafe { swap_chain.Present(1, DXGI_PRESENT(0)) }
-                .map_err(|_| DecoderError::BackendLost)?;
+            let present_status = unsafe { swap_chain.Present(1, DXGI_PRESENT(0)) };
+            if present_status < 0 {
+                return Err(DecoderError::BackendLost);
+            }
         }
         Ok(())
     }
