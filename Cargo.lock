@@ -1316,14 +1316,18 @@ name = "nexus-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "ed25519-dalek",
  "nexus-auth",
+ "nexus-capture",
+ "nexus-codec",
  "nexus-common",
  "nexus-crypto",
  "nexus-input",
  "nexus-protocol",
  "nexus-session",
  "nexus-transport",
+ "platform-windows",
  "prost",
  "thiserror 1.0.69",
  "tokio",
