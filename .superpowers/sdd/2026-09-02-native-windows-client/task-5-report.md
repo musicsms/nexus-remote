@@ -25,7 +25,7 @@
 ## Verification
 
 - `cargo fmt --all -- --check` — passed.
-- `cargo test -p nexus-client --all-targets` — passed (52 tests including the
+- `cargo test -p nexus-client --all-targets` — passed (53 tests including the
   loopback test; Windows-only smoke files compile to zero Linux tests).
 - `cargo clippy -p nexus-client --all-targets -- -D warnings` — passed.
 - `cargo check -p nexus-client --tests --target x86_64-pc-windows-gnu` — not
@@ -78,7 +78,7 @@ condition.
 ## Review fix verification
 
 - `cargo fmt --all -- --check` — passed.
-- `cargo test -p nexus-client --all-targets` — passed (52 tests).
+- `cargo test -p nexus-client --all-targets` — passed (53 tests).
 - `cargo clippy -p nexus-client --all-targets -- -D warnings` — passed.
 - `cargo build --workspace` — passed.
 - `cargo test --workspace` — passed.
@@ -133,4 +133,13 @@ condition.
   convenience wrapper with a fresh token. `main` now retains a cloneable
   handle and cancels the configured runtime on Ctrl-C.
 - The configured path test proves a caller-cancelled handle exits before
-  bootstrap parsing or transport setup; report count refreshed to 52.
+  bootstrap parsing or transport setup; report count refreshed to 53.
+
+## Review fix round 7
+
+- Initial authenticated QUIC connection now selects against the caller-owned
+  cancellation permit, expires the pending session, closes an already-created
+  connection when cancellation races handshake completion, and returns typed
+  shutdown instead of hanging on transport establishment.
+- Added a loopback regression with a server that does not accept the pending
+  handshake; cancellation interrupts it within the test deadline.

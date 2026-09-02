@@ -1,7 +1,8 @@
 use ed25519_dalek::{Signer, SigningKey};
 use nexus_client::session::{ClientState, ClientVerification, RelayTokenMetadata, SessionPolicy};
 use nexus_client::{
-    ClientConnectConfig, ClientRuntime, ClientRuntimeError, VideoStreamConfig, WindowEvent,
+    ClientConnectConfig, ClientRuntime, ClientRuntimeError, RuntimeCancellation, VideoStreamConfig,
+    WindowEvent,
 };
 use nexus_common::{MockClock, UnixTimestamp};
 use nexus_crypto::NonceSequence;
@@ -311,4 +312,35 @@ async fn reconnect_reuses_session_id_and_revalidates_session_window() {
     assert!(matches!(retry_result, Err(ClientRuntimeError::Session(_))));
     assert_eq!(runtime.session_state(), ClientState::Expired);
     server_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn cancellation_interrupts_pending_initial_connect() {
+    let server = make_server_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
+    let endpoint = make_client_endpoint("127.0.0.1:0".parse().unwrap(), &server.cert_der).unwrap();
+    let cancellation = RuntimeCancellation::new();
+    let cancel = cancellation.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        cancel.cancel();
+    });
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        ClientRuntime::connect_with_cancellation(
+            &endpoint,
+            ClientConnectConfig {
+                server: server.endpoint.local_addr().unwrap(),
+                server_name: "localhost".into(),
+                monitor: monitor(),
+                stream: VideoStreamConfig::new(1_280, 720).unwrap(),
+            },
+            session(MockClock::from_secs(100)),
+            KEY,
+            NONCE_DOMAIN,
+            cancellation,
+        ),
+    )
+    .await
+    .expect("initial connect cancellation should be bounded");
+    assert!(matches!(result, Err(ClientRuntimeError::Shutdown)));
 }

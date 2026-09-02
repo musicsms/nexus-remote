@@ -737,7 +737,7 @@ impl ClientRuntime {
         .await
     }
 
-    async fn connect_with_cancellation(
+    pub async fn connect_with_cancellation(
         endpoint: &quinn::Endpoint,
         config: ClientConnectConfig,
         mut session: ClientSession,
@@ -745,6 +745,10 @@ impl ClientRuntime {
         nonce_domain: u32,
         cancellation: RuntimeCancellation,
     ) -> Result<Self, ClientRuntimeError> {
+        if cancellation.is_cancelled() {
+            let _ = session.expire();
+            return Err(ClientRuntimeError::Shutdown);
+        }
         config.stream.validate()?;
         let now = session.clock().now();
         session.begin_connect(now)?;
@@ -755,13 +759,24 @@ impl ClientRuntime {
                 return Err(ClientRuntimeError::Connect(error));
             }
         };
-        let connection = match connecting.await {
+        let connection = match tokio::select! {
+            connection = connecting => connection,
+            _ = cancellation.notify.notified() => {
+                let _ = session.expire();
+                return Err(ClientRuntimeError::Shutdown);
+            }
+        } {
             Ok(connection) => connection,
             Err(error) => {
                 let _ = session.expire();
                 return Err(ClientRuntimeError::Transport(error));
             }
         };
+        if cancellation.is_cancelled() {
+            connection.close(0u32.into(), b"client shutdown requested");
+            let _ = session.expire();
+            return Err(ClientRuntimeError::Shutdown);
+        }
         if let Err(error) = session.connected(session.clock().now()) {
             connection.close(0u32.into(), b"session rejected");
             let _ = session.expire();
