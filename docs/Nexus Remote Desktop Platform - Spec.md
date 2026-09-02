@@ -814,9 +814,27 @@ frame_id       u32
 packet_id      u16
 packet_count   u16
 timestamp_us   u64
+nonce_sequence u64
 payload_len    u16
 payload        bytes
 ```
+
+Current video packet version is **2**. Its fixed header is 30 bytes and all
+multi-byte fields use big-endian network order. `nonce_sequence` is the
+sender's monotonically increasing per-direction frame sequence; it is repeated
+on every fragment and supplies the low 64 bits of the AEAD nonce (the high 32
+bits are the negotiated channel/direction domain). A receiver derives the
+nonce from that sequence after complete reassembly, allowing datagram loss and
+reordering without completion-order nonce state. It records sequence and frame
+freshness only after AEAD authentication, permits each sequence once in a
+bounded replay window, and rejects duplicate or too-old sequences.
+
+The authenticated encoded-frame AAD includes protocol version, stream/channel,
+frame ID, codec/config identifier, `timestamp_us`, and the `KEYFRAME` flag.
+Packet IDs, packet counts, and `FRAME_START`/`FRAME_END` remain outside AAD
+because they are packetizer metadata. Version 1's 22-byte header lacks
+`nonce_sequence` and is incompatible: v2 receivers reject it rather than
+attempting a lossy compatibility interpretation.
 
 Flags may include:
 

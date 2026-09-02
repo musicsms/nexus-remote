@@ -1,5 +1,7 @@
 use nexus_client::{ClientInputError, ClientInputSender, ClientReceiver};
-use nexus_crypto::NonceSequence;
+use nexus_crypto::{
+    nonce_from_sequence, seal_session_payload, EncodedFrameMetadata, NonceSequence,
+};
 use nexus_input::{InputError, InputEvent, KeyAction, Modifiers};
 use nexus_protocol::{
     video_packet, CursorPosition, KeyEvent, MonitorInfo, MouseButton as ProtoMouseButton,
@@ -40,6 +42,50 @@ fn frame_datagrams(
     let sealed = seal_video_frame(&KEY, sequence, &header, 1, access_unit).unwrap();
     header.nonce_sequence = u64::from_be_bytes(sealed.nonce[4..].try_into().unwrap());
     packetize_video_frame(&header, &sealed.ciphertext, 1000)
+        .unwrap()
+        .into_iter()
+        .map(|(header, payload)| encode_video_datagram(&header, &payload).unwrap())
+        .collect()
+}
+
+fn frame_datagrams_with_nonce_sequence(
+    frame_id: u32,
+    timestamp_us: u64,
+    keyframe: bool,
+    nonce_sequence: u64,
+    access_unit: &[u8],
+) -> Vec<Vec<u8>> {
+    let header = VideoPacketHeader {
+        version: video_packet::CURRENT_VERSION,
+        flags: if keyframe {
+            video_packet::flags::KEYFRAME
+        } else {
+            0
+        },
+        stream_id: 1,
+        frame_id,
+        packet_id: 0,
+        packet_count: 0,
+        timestamp_us,
+        nonce_sequence,
+        payload_len: 0,
+    };
+    let ciphertext = seal_session_payload(
+        &KEY,
+        &nonce_from_sequence(NONCE_DOMAIN, nonce_sequence),
+        &EncodedFrameMetadata {
+            protocol_version: header.version as u32,
+            channel: header.stream_id as u32,
+            frame_id: header.frame_id,
+            codec_config_id: 1,
+            timestamp_us: header.timestamp_us,
+            keyframe,
+        }
+        .aad(),
+        access_unit,
+    )
+    .unwrap();
+    packetize_video_frame(&header, &ciphertext, 1000)
         .unwrap()
         .into_iter()
         .map(|(header, payload)| encode_video_datagram(&header, &payload).unwrap())
@@ -183,6 +229,39 @@ fn rejects_a_replayed_nonce_sequence_on_a_different_frame() {
     assert!(receiver.drain_latest_frame().is_some());
     assert!(receiver.accept_datagram(&replayed_nonce.remove(0)).is_err());
     assert_eq!(receiver.drain_latest_frame(), None);
+}
+
+#[test]
+fn rejects_an_authenticated_reused_nonce_sequence() {
+    let first = frame_datagrams_with_nonce_sequence(1, 100, false, 7, b"first");
+    let reused = frame_datagrams_with_nonce_sequence(2, 101, true, 7, b"second");
+    let mut receiver = ClientReceiver::new(KEY, NONCE_DOMAIN);
+
+    deliver(&mut receiver, &first);
+    assert!(receiver.drain_latest_frame().is_some());
+    assert!(receiver.accept_datagram(&reused[0]).is_err());
+    assert_eq!(receiver.drain_latest_frame(), None);
+}
+
+#[test]
+fn authentication_failure_does_not_consume_the_nonce_sequence() {
+    let mut rejected = frame_datagrams_with_nonce_sequence(1, 100, false, 8, b"rejected");
+    *rejected[0].last_mut().unwrap() ^= 1;
+    let accepted = frame_datagrams_with_nonce_sequence(2, 101, true, 8, b"accepted");
+    let mut receiver = ClientReceiver::new(KEY, NONCE_DOMAIN);
+
+    assert!(receiver.accept_datagram(&rejected[0]).is_err());
+    deliver(&mut receiver, &accepted);
+
+    assert_eq!(
+        receiver.drain_latest_frame(),
+        Some(nexus_client::DecodedFrameJob {
+            frame_id: 2,
+            timestamp_us: 101,
+            keyframe: true,
+            access_unit: b"accepted".to_vec(),
+        })
+    );
 }
 
 #[test]

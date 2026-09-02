@@ -14,6 +14,39 @@ use nexus_transport::{
 };
 use thiserror::Error;
 
+const NONCE_REPLAY_WINDOW: u64 = 4096;
+
+#[derive(Debug, Default)]
+struct NonceReplayWindow {
+    highest_sequence: Option<u64>,
+    accepted_sequences: std::collections::BTreeSet<u64>,
+}
+
+impl NonceReplayWindow {
+    /// Records one sequence after its frame has passed AEAD. Values inside the
+    /// bounded window may arrive out of order, but each is accepted once.
+    fn commit_authenticated(&mut self, sequence: u64) -> bool {
+        if self.accepted_sequences.contains(&sequence) {
+            return false;
+        }
+        if self
+            .highest_sequence
+            .is_some_and(|highest| sequence <= highest && highest - sequence >= NONCE_REPLAY_WINDOW)
+        {
+            return false;
+        }
+
+        let highest = self
+            .highest_sequence
+            .map_or(sequence, |known| known.max(sequence));
+        self.accepted_sequences.insert(sequence);
+        self.highest_sequence = Some(highest);
+        self.accepted_sequences
+            .retain(|accepted| highest - *accepted < NONCE_REPLAY_WINDOW);
+        true
+    }
+}
+
 /// The MVP has one negotiated H.264 codec configuration. Future configuration
 /// changes must carry an authenticated configuration identifier before this is
 /// made dynamic.
@@ -38,6 +71,8 @@ pub enum ClientReceiverError {
     Reassembly(#[from] ReassemblyError),
     #[error("frame authentication failed: {0}")]
     Authentication(#[from] AeadError),
+    #[error("frame nonce sequence was replayed or is outside the replay window")]
+    NonceReplay,
     #[error("invalid control message: {0}")]
     Control(#[from] ControlMessageError),
     #[error("invalid cursor monitor: {0}")]
@@ -56,6 +91,7 @@ pub struct ClientReceiver {
     frame_key: [u8; 32],
     nonce_domain: u32,
     reassembler: VideoFrameReassembler,
+    nonce_replay_window: NonceReplayWindow,
     latest_frame: Option<DecodedFrameJob>,
     cursor_monitor: Option<MonitorInfo>,
 }
@@ -66,6 +102,7 @@ impl ClientReceiver {
             frame_key,
             nonce_domain,
             reassembler: VideoFrameReassembler::default(),
+            nonce_replay_window: NonceReplayWindow::default(),
             latest_frame: None,
             cursor_monitor: None,
         }
@@ -99,6 +136,13 @@ impl ClientReceiver {
             },
             &encrypted,
         )?;
+
+        if !self
+            .nonce_replay_window
+            .commit_authenticated(assembled.header.nonce_sequence)
+        {
+            return Err(ClientReceiverError::NonceReplay);
+        }
 
         if !self
             .reassembler
