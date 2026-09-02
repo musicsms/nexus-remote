@@ -25,7 +25,7 @@
 ## Verification
 
 - `cargo fmt --all -- --check` — passed.
-- `cargo test -p nexus-client --all-targets` — passed (43 tests including the
+- `cargo test -p nexus-client --all-targets` — passed (46 tests including the
   loopback test; Windows-only smoke files compile to zero Linux tests).
 - `cargo clippy -p nexus-client --all-targets -- -D warnings` — passed.
 - `cargo check -p nexus-client --tests --target x86_64-pc-windows-gnu` — not
@@ -55,10 +55,30 @@ condition.
 - Corrected status documentation to report the unavailable MinGW compiler
   rather than claiming GNU-target evidence.
 
+## Review fix round 2
+
+- Added bounded `ClientRuntime::reconnect`, which reuses the authenticated
+  `ClientSession`, revalidates the reconnect window, preserves the session ID,
+  and rejects reconnect after expiry.
+- Moved Windows decoder/renderer calls behind a dedicated latest-job pipeline
+  worker. Tokio receive work only replaces a bounded pending slot and polls a
+  bounded error channel; decoder/device errors still fail closed.
+- Shutdown now uses the caller's absolute deadline for the pipeline and window
+  workers, retaining a reaper when a native worker exceeds that deadline.
+- Added explicit validated `VideoStreamConfig`; native decoder dimensions come
+  from authenticated/negotiated stream configuration rather than a hardcoded
+  1280x720 default.
+- Expanded loopback coverage for reconnect identity/state and corrected the
+  generated brief/report metadata.
+- Replaced the binary's unconditional stub return with the validated
+  `ClientRuntime::run_configured` entry boundary; it reports the missing
+  authenticated control-plane bootstrap without reading private keys or
+  browser credentials.
+
 ## Review fix verification
 
 - `cargo fmt --all -- --check` — passed.
-- `cargo test -p nexus-client --all-targets` — passed (43 tests).
+- `cargo test -p nexus-client --all-targets` — passed (46 tests).
 - `cargo clippy -p nexus-client --all-targets -- -D warnings` — passed.
 - `cargo build --workspace` — passed.
 - `cargo test --workspace` — passed.

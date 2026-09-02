@@ -66,6 +66,12 @@ impl RenderQueue {
         self.state.lock().ok()?.latest.take()
     }
 
+    pub fn clear(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.latest = None;
+        }
+    }
+
     pub fn dropped_frames(&self) -> u64 {
         self.state.lock().map_or(0, |state| state.dropped_frames)
     }

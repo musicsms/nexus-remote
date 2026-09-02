@@ -12,7 +12,8 @@ async fn main() -> anyhow::Result<()> {
         server_name = %configuration.server_name,
         "validated non-secret client configuration"
     );
-    Err(anyhow::anyhow!(
-        "authenticated session bootstrap is not configured; capability, relay token, certificate, and frame key must be supplied by the control plane before ClientRuntime::connect"
-    ))
+    nexus_client::ClientRuntime::run_configured(configuration)
+        .await
+        .map(|_| ())
+        .map_err(|error| anyhow::anyhow!("nexus-client runtime stopped: {error}"))
 }

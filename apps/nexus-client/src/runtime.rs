@@ -72,8 +72,12 @@ pub enum ClientRuntimeError {
     SendDatagram(#[from] quinn::SendDatagramError),
     #[error("client runtime has already been shut down")]
     Shutdown,
+    #[error("authenticated session bootstrap is not available from non-secret configuration")]
+    SessionBootstrapRequired,
     #[error("client window shutdown exceeded its deadline")]
     ShutdownTimeout,
+    #[error("authenticated video stream dimensions are invalid")]
+    InvalidStreamDimensions,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,32 +86,193 @@ pub struct RuntimeSummary {
     pub sent_input_messages: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VideoStreamConfig {
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClientConnectConfig {
+    pub server: SocketAddr,
+    pub server_name: String,
+    pub monitor: MonitorInfo,
+    pub stream: VideoStreamConfig,
+}
+
+impl VideoStreamConfig {
+    pub fn new(width: u32, height: u32) -> Result<Self, ClientRuntimeError> {
+        let config = Self { width, height };
+        config.validate()?;
+        Ok(config)
+    }
+
+    fn validate(self) -> Result<(), ClientRuntimeError> {
+        if self.width == 0
+            || self.height == 0
+            || self.width > 7_680
+            || self.height > 4_320
+            || !self.width.is_multiple_of(2)
+            || !self.height.is_multiple_of(2)
+        {
+            return Err(ClientRuntimeError::InvalidStreamDimensions);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+use std::sync::{mpsc, Arc, Condvar, Mutex};
+#[cfg(windows)]
+use std::thread::{self, JoinHandle};
+
 #[cfg(windows)]
 struct NativePipeline {
-    decoder: crate::decoder::NativeFrameDecoder,
-    renderer: crate::renderer::NativeFrameRenderer,
+    pending: Arc<(Mutex<Option<crate::DecodedFrameJob>>, Condvar)>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    errors: mpsc::Receiver<crate::decoder::DecoderError>,
+    worker: Option<JoinHandle<()>>,
 }
 
 #[cfg(windows)]
 impl NativePipeline {
     fn start(
         window: &WindowController,
-        config: &WindowConfig,
+        stream: VideoStreamConfig,
     ) -> Result<Self, crate::decoder::DecoderError> {
         let handle = window
             .native_handle()
             .ok_or(crate::decoder::DecoderError::BackendUnavailable)?;
-        Ok(Self {
-            decoder: crate::decoder::NativeFrameDecoder::start(config.width, config.height)?,
-            renderer: crate::renderer::NativeFrameRenderer::start_for_native_handle(handle)?,
-        })
+        let pending = Arc::new((Mutex::new(None), Condvar::new()));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_pending = Arc::clone(&pending);
+        let worker_stop = Arc::clone(&stop);
+        let (error_tx, errors) = mpsc::sync_channel(1);
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let worker = thread::Builder::new()
+            .name("nexus-client-pipeline".to_owned())
+            .spawn(move || {
+                let mut decoder =
+                    match crate::decoder::NativeFrameDecoder::start(stream.width, stream.height) {
+                        Ok(decoder) => decoder,
+                        Err(error) => {
+                            let _ = started_tx.send(Err(error));
+                            return;
+                        }
+                    };
+                let mut renderer =
+                    match crate::renderer::NativeFrameRenderer::start_for_native_handle(handle) {
+                        Ok(renderer) => renderer,
+                        Err(error) => {
+                            let _ = started_tx.send(Err(error));
+                            return;
+                        }
+                    };
+                let _ = started_tx.send(Ok(()));
+                loop {
+                    let job = {
+                        let (lock, wake) = &*worker_pending;
+                        let mut pending = lock.lock().expect("pipeline slot poisoned");
+                        while pending.is_none()
+                            && !worker_stop.load(std::sync::atomic::Ordering::Acquire)
+                        {
+                            pending = wake.wait(pending).expect("pipeline slot poisoned");
+                        }
+                        if worker_stop.load(std::sync::atomic::Ordering::Acquire) {
+                            None
+                        } else {
+                            pending.take()
+                        }
+                    };
+                    let Some(job) = job else { break };
+                    match decoder.decode(job) {
+                        Ok(Some(surface)) => {
+                            if let Err(error) = renderer.present(surface) {
+                                let _ = error_tx.try_send(error);
+                                break;
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            let _ = error_tx.try_send(error);
+                            break;
+                        }
+                    }
+                }
+            })
+            .map_err(|_| crate::decoder::DecoderError::BackendUnavailable)?;
+        match started_rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(Ok(())) => Ok(Self {
+                pending,
+                stop,
+                errors,
+                worker: Some(worker),
+            }),
+            Ok(Err(error)) => {
+                stop.store(true, std::sync::atomic::Ordering::Release);
+                let _ = worker.join();
+                Err(error)
+            }
+            Err(_) => {
+                stop.store(true, std::sync::atomic::Ordering::Release);
+                let _ = worker.join();
+                Err(crate::decoder::DecoderError::BackendUnavailable)
+            }
+        }
     }
 
-    fn consume(&mut self, job: crate::DecodedFrameJob) -> Result<(), crate::decoder::DecoderError> {
-        if let Some(surface) = self.decoder.decode(job)? {
-            self.renderer.present(surface)?;
+    fn submit(&mut self, job: crate::DecodedFrameJob) -> Result<(), crate::decoder::DecoderError> {
+        if let Some(error) = self.poll_error() {
+            return Err(error);
         }
+        if self.worker.as_ref().is_some_and(JoinHandle::is_finished) {
+            return Err(crate::decoder::DecoderError::BackendLost);
+        }
+        let (lock, wake) = &*self.pending;
+        *lock
+            .lock()
+            .map_err(|_| crate::decoder::DecoderError::BackendLost)? = Some(job);
+        wake.notify_one();
         Ok(())
+    }
+
+    fn poll_error(&self) -> Option<crate::decoder::DecoderError> {
+        self.errors.try_recv().ok()
+    }
+
+    fn shutdown(&mut self, deadline: Instant) -> bool {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        self.pending.1.notify_one();
+        let Some(worker) = self.worker.take() else {
+            return true;
+        };
+        if worker.is_finished() {
+            let _ = worker.join();
+            return true;
+        }
+        if Instant::now() < deadline {
+            while !worker.is_finished() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+        if worker.is_finished() {
+            let _ = worker.join();
+            true
+        } else {
+            let _ = thread::Builder::new()
+                .name("nexus-client-pipeline-reaper".to_owned())
+                .spawn(move || {
+                    let _ = worker.join();
+                });
+            false
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for NativePipeline {
+    fn drop(&mut self) {
+        let _ = self.shutdown(Instant::now() + Duration::from_millis(250));
     }
 }
 
@@ -117,11 +282,14 @@ struct NativePipeline;
 
 #[cfg(not(windows))]
 impl NativePipeline {
-    fn start(_window: &WindowController, _config: &WindowConfig) -> Self {
+    fn start(_window: &WindowController, _stream: VideoStreamConfig) -> Self {
         Self
     }
 
-    fn consume(&mut self, _job: crate::DecodedFrameJob) {}
+    fn submit(&mut self, _job: crate::DecodedFrameJob) {}
+    fn shutdown(&mut self, _deadline: Instant) -> bool {
+        true
+    }
 }
 
 /// Portable owner of client network, receiver, render handoff, input state,
@@ -141,19 +309,30 @@ pub struct ClientRuntime {
 }
 
 impl ClientRuntime {
+    /// Enters the production runtime from the validated endpoint configuration.
+    ///
+    /// The control plane owns the authenticated capability, relay metadata,
+    /// peer certificate, and frame key.  Since those values are deliberately
+    /// not read from the process environment, this boundary reports the
+    /// missing bootstrap instead of manufacturing an unauthenticated session.
+    pub async fn run_configured(
+        _configuration: ClientConfiguration,
+    ) -> Result<RuntimeSummary, ClientRuntimeError> {
+        Err(ClientRuntimeError::SessionBootstrapRequired)
+    }
+
     /// Validates signed claims before opening a QUIC transport.
     pub async fn connect(
         endpoint: &quinn::Endpoint,
-        server: SocketAddr,
-        server_name: &str,
+        config: ClientConnectConfig,
         mut session: ClientSession,
         frame_key: [u8; 32],
         nonce_domain: u32,
-        monitor: MonitorInfo,
     ) -> Result<Self, ClientRuntimeError> {
+        config.stream.validate()?;
         let now = session.clock().now();
         session.begin_connect(now)?;
-        let connecting = match endpoint.connect(server, server_name) {
+        let connecting = match endpoint.connect(config.server, &config.server_name) {
             Ok(connecting) => connecting,
             Err(error) => {
                 let _ = session.expire();
@@ -177,9 +356,54 @@ impl ClientRuntime {
             session,
             frame_key,
             nonce_domain,
-            monitor,
+            config.monitor,
+            config.stream,
             WindowConfig::default(),
         )
+    }
+
+    /// Re-establishes the transport within the existing reconnect window.
+    /// The session object is retained, so its established-duration limit and
+    /// stable session ID are never reset by a reconnect.
+    pub async fn reconnect(
+        &mut self,
+        endpoint: &quinn::Endpoint,
+        server: SocketAddr,
+        server_name: &str,
+    ) -> Result<(), ClientRuntimeError> {
+        if self.shutdown {
+            return Err(ClientRuntimeError::Shutdown);
+        }
+        let now = self.session.clock().now();
+        if let Err(error) = self.session.begin_connect(now) {
+            self.fail_closed();
+            return Err(ClientRuntimeError::Session(error));
+        }
+        let connecting = match endpoint.connect(server, server_name) {
+            Ok(connecting) => connecting,
+            Err(error) => {
+                self.fail_closed();
+                return Err(ClientRuntimeError::Connect(error));
+            }
+        };
+        let connection = match connecting.await {
+            Ok(connection) => connection,
+            Err(error) => {
+                self.fail_closed();
+                return Err(ClientRuntimeError::Transport(error));
+            }
+        };
+        if let Err(error) = self.session.connected(self.session.clock().now()) {
+            connection.close(0u32.into(), b"reconnect rejected");
+            self.fail_closed();
+            return Err(ClientRuntimeError::Session(error));
+        }
+        self.connection.close(0u32.into(), b"transport replaced");
+        self.connection = connection;
+        self.input.clear_pending();
+        self.render_queue.clear();
+        self.latest_frame = None;
+        Ok(())
     }
 
     fn build(
@@ -188,6 +412,7 @@ impl ClientRuntime {
         frame_key: [u8; 32],
         nonce_domain: u32,
         monitor: MonitorInfo,
+        stream: VideoStreamConfig,
         window_config: WindowConfig,
     ) -> Result<Self, ClientRuntimeError> {
         let mut receiver = ClientReceiver::new(frame_key, nonce_domain);
@@ -195,7 +420,7 @@ impl ClientRuntime {
         let input = InputController::new(monitor)?;
         let window = WindowController::start(window_config.clone())?;
         let render_queue = window.render_queue();
-        let pipeline = NativePipeline::start(&window, &window_config);
+        let pipeline = NativePipeline::start(&window, stream);
         #[cfg(windows)]
         let pipeline = pipeline?;
         Ok(Self {
@@ -258,7 +483,10 @@ impl ClientRuntime {
                             | quinn::ConnectionError::Reset
                             | quinn::ConnectionError::LocallyClosed) => {
                                 let now = self.session.clock().now();
-                                let _ = self.session.transport_lost(now);
+                                if let Err(error) = self.session.transport_lost(now) {
+                                    self.fail_closed();
+                                    return Err(ClientRuntimeError::Session(error));
+                                }
                                 break;
                             }
                         Err(error) => {
@@ -278,17 +506,22 @@ impl ClientRuntime {
                         }
                         if let Some(render_job) = self.render_queue.take_latest() {
                             #[cfg(windows)]
-                            if let Err(error) = self.pipeline.consume(render_job) {
+                            if let Err(error) = self.pipeline.submit(render_job) {
                                 self.fail_closed();
                                 return Err(ClientRuntimeError::Decoder(error));
                             }
                             #[cfg(not(windows))]
-                            self.pipeline.consume(render_job);
+                            self.pipeline.submit(render_job);
                         }
                         self.received_frames = self.received_frames.saturating_add(1);
                     }
                 }
                 _ = tokio::time::sleep(RUNTIME_POLL_INTERVAL) => {
+                    #[cfg(windows)]
+                    if let Some(error) = self.pipeline.poll_error() {
+                        self.fail_closed();
+                        return Err(ClientRuntimeError::Decoder(error));
+                    }
                     if let Err(error) = self.session.ensure_active(self.session.clock().now()).map_err(ClientRuntimeError::Session) {
                         self.fail_closed();
                         return Err(error);
@@ -346,23 +579,27 @@ impl ClientRuntime {
         if self.shutdown {
             return Ok(());
         }
-        self.fail_closed();
-        self.window.shutdown(deadline).map_err(|error| match error {
-            WindowError::ShutdownTimeout => ClientRuntimeError::ShutdownTimeout,
-            other => ClientRuntimeError::Window(other),
-        })
+        if self.fail_closed_with_deadline(deadline) {
+            Ok(())
+        } else {
+            Err(ClientRuntimeError::ShutdownTimeout)
+        }
     }
 
     fn fail_closed(&mut self) {
+        self.fail_closed_with_deadline(Instant::now() + Duration::from_millis(250));
+    }
+
+    fn fail_closed_with_deadline(&mut self, deadline: Instant) -> bool {
         let _ = self.session.expire();
         self.input.shutdown();
         self.render_queue.shutdown();
         self.latest_frame = None;
         self.connection.close(0u32.into(), b"client runtime closed");
         self.shutdown = true;
-        let _ = self
-            .window
-            .shutdown(Instant::now() + Duration::from_millis(250));
+        let pipeline_stopped = self.pipeline.shutdown(deadline);
+        let window_stopped = self.window.shutdown(deadline).is_ok();
+        pipeline_stopped && window_stopped
     }
 }
 

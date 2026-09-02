@@ -105,6 +105,13 @@ impl InputController {
         self.expire();
     }
 
+    /// Drops controls produced for a transport that has gone away while
+    /// retaining the window focus state for a reconnect.
+    pub(crate) fn clear_pending(&mut self) {
+        self.queue.clear();
+        self.recent_events.clear();
+    }
+
     pub fn is_shutdown(&self) -> bool {
         self.shutdown
     }

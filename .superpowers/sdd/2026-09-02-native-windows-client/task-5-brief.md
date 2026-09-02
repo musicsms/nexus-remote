@@ -1,4 +1,3 @@
-wrote /home/ubuntu/nexus-remote/.worktrees/windows-platform-backends/.superpowers/sdd/2026-09-02-native-windows-client/task-5-brief.md: 74 lines
 ### Task 5: Wire Client Binary and Synthetic Loopback Integration
 
 **Files:**

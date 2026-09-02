@@ -270,10 +270,9 @@ impl WindowController {
     /// Network receive paths must use this instead of the FIFO command queue,
     /// so a saturated window thread cannot retain stale frames.
     pub fn render_latest(&self, frame: DecodedFrameJob) -> Result<(), WindowError> {
-        validate_command(
-            &WindowCommand::Render(frame.clone()),
-            self.max_render_payload,
-        )?;
+        if frame.access_unit.len() > self.max_render_payload {
+            return Err(WindowError::RenderPayloadTooLarge);
+        }
         self.render_queue
             .push_latest(frame)
             .map_err(|error| match error {

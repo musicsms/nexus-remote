@@ -1,6 +1,8 @@
 use ed25519_dalek::{Signer, SigningKey};
 use nexus_client::session::{ClientState, ClientVerification, RelayTokenMetadata, SessionPolicy};
-use nexus_client::{ClientRuntime, ClientRuntimeError, WindowEvent};
+use nexus_client::{
+    ClientConnectConfig, ClientRuntime, ClientRuntimeError, VideoStreamConfig, WindowEvent,
+};
 use nexus_common::{MockClock, UnixTimestamp};
 use nexus_crypto::NonceSequence;
 use nexus_input::InputEvent;
@@ -114,12 +116,15 @@ async fn loopback_authenticates_video_and_emits_one_semantic_input() {
     let client_endpoint = make_client_endpoint("127.0.0.1:0".parse().unwrap(), &cert).unwrap();
     let mut runtime = ClientRuntime::connect(
         &client_endpoint,
-        server_addr,
-        "localhost",
+        ClientConnectConfig {
+            server: server_addr,
+            server_name: "localhost".into(),
+            monitor: monitor(),
+            stream: VideoStreamConfig::new(1_280, 720).unwrap(),
+        },
         session(MockClock::from_secs(100)),
         KEY,
         NONCE_DOMAIN,
-        monitor(),
     )
     .await
     .unwrap();
@@ -160,12 +165,15 @@ async fn invalid_session_is_rejected_before_transport_connect() {
     invalid.expire().unwrap();
     let result = ClientRuntime::connect(
         &endpoint,
-        server.endpoint.local_addr().unwrap(),
-        "localhost",
+        ClientConnectConfig {
+            server: server.endpoint.local_addr().unwrap(),
+            server_name: "localhost".into(),
+            monitor: monitor(),
+            stream: VideoStreamConfig::new(1_280, 720).unwrap(),
+        },
         invalid,
         KEY,
         NONCE_DOMAIN,
-        monitor(),
     )
     .await;
     let error = match result {
@@ -188,12 +196,15 @@ async fn session_expiry_clears_runtime_handoffs() {
     let clock = MockClock::from_secs(100);
     let mut runtime = ClientRuntime::connect(
         &endpoint,
-        server_addr,
-        "localhost",
+        ClientConnectConfig {
+            server: server_addr,
+            server_name: "localhost".into(),
+            monitor: monitor(),
+            stream: VideoStreamConfig::new(1_280, 720).unwrap(),
+        },
         session(clock.clone()),
         KEY,
         NONCE_DOMAIN,
-        monitor(),
     )
     .await
     .unwrap();
@@ -221,12 +232,15 @@ async fn window_close_terminates_and_clears_input_and_render_state() {
     });
     let mut runtime = ClientRuntime::connect(
         &endpoint,
-        server_addr,
-        "localhost",
+        ClientConnectConfig {
+            server: server_addr,
+            server_name: "localhost".into(),
+            monitor: monitor(),
+            stream: VideoStreamConfig::new(1_280, 720).unwrap(),
+        },
         session(MockClock::from_secs(100)),
         KEY,
         NONCE_DOMAIN,
-        monitor(),
     )
     .await
     .unwrap();
@@ -236,5 +250,53 @@ async fn window_close_terminates_and_clears_input_and_render_state() {
     assert_eq!(runtime.session_state(), ClientState::Expired);
     assert_eq!(runtime.drain_latest_frame(), None);
     assert_eq!(runtime.sent_input_count(), 0);
+    server_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn reconnect_reuses_session_id_and_revalidates_session_window() {
+    let server = make_server_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
+    let server_addr = server.endpoint.local_addr().unwrap();
+    let endpoint = make_client_endpoint("127.0.0.1:0".parse().unwrap(), &server.cert_der).unwrap();
+    let server_task = tokio::spawn(async move {
+        for attempt in 0..2 {
+            let incoming = server.endpoint.accept().await.unwrap();
+            let connection = incoming.await.unwrap();
+            if attempt == 0 {
+                connection.close(0u32.into(), b"reconnect test");
+            } else {
+                connection.closed().await;
+            }
+        }
+    });
+    let mut runtime = ClientRuntime::connect(
+        &endpoint,
+        ClientConnectConfig {
+            server: server_addr,
+            server_name: "localhost".into(),
+            monitor: monitor(),
+            stream: VideoStreamConfig::new(1_280, 720).unwrap(),
+        },
+        session(MockClock::from_secs(100)),
+        KEY,
+        NONCE_DOMAIN,
+    )
+    .await
+    .unwrap();
+    let session_id = runtime.session_id().to_owned();
+    tokio::time::timeout(Duration::from_secs(1), runtime.run())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(runtime.session_state(), ClientState::Reconnecting);
+    runtime
+        .reconnect(&endpoint, server_addr, "localhost")
+        .await
+        .unwrap();
+    assert_eq!(runtime.session_id(), session_id);
+    assert_eq!(runtime.session_state(), ClientState::Connected);
+    runtime
+        .shutdown(std::time::Instant::now() + Duration::from_secs(1))
+        .unwrap();
     server_task.await.unwrap();
 }
