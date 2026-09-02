@@ -22,6 +22,8 @@ pub fn seal_video_frame(
             channel: header.stream_id as u32,
             frame_id: header.frame_id,
             codec_config_id,
+            timestamp_us: header.timestamp_us,
+            keyframe: header.flags & nexus_protocol::video_packet::flags::KEYFRAME != 0,
         },
         encoded_frame,
     )
@@ -40,6 +42,8 @@ pub fn open_video_frame(
             channel: header.stream_id as u32,
             frame_id: header.frame_id,
             codec_config_id,
+            timestamp_us: header.timestamp_us,
+            keyframe: header.flags & nexus_protocol::video_packet::flags::KEYFRAME != 0,
         },
         encrypted,
     )
@@ -199,7 +203,7 @@ pub struct VideoFrameReassembler {
     frames: std::collections::BTreeMap<u32, InFlightFrame>,
     max_in_flight: usize,
     max_frame_bytes: usize,
-    last_delivered_frame_id: Option<u32>,
+    last_authenticated_frame_id: Option<u32>,
 }
 
 impl Default for VideoFrameReassembler {
@@ -214,7 +218,7 @@ impl VideoFrameReassembler {
             frames: std::collections::BTreeMap::new(),
             max_in_flight: max_in_flight.max(1),
             max_frame_bytes,
-            last_delivered_frame_id: None,
+            last_authenticated_frame_id: None,
         }
     }
 
@@ -254,10 +258,10 @@ impl VideoFrameReassembler {
             return Err(ReassemblyError::InvalidBoundaryFlags);
         }
 
-        // Drop if this frame has already been delivered or is older than the last delivered frame (ADR-022).
-        // This check must precede the single-packet fast path so delayed packets
-        // cannot regress the delivery watermark.
-        if let Some(last_id) = self.last_delivered_frame_id {
+        // Drop only frames stale relative to an already *authenticated*
+        // delivery. A caller must explicitly commit after AEAD verification so
+        // a forged high frame ID cannot advance this watermark.
+        if let Some(last_id) = self.last_authenticated_frame_id {
             if header.frame_id <= last_id {
                 return Ok(None);
             }
@@ -268,8 +272,6 @@ impl VideoFrameReassembler {
             if payload.len() > self.max_frame_bytes {
                 return Ok(None);
             }
-            self.last_delivered_frame_id = Some(header.frame_id);
-            self.prune_stale_before(header.frame_id);
             return Ok(Some(AssembledFrame {
                 header: header.clone(),
                 assembled_len: payload.len(),
@@ -298,6 +300,10 @@ impl VideoFrameReassembler {
         if in_flight.packets.len() != header.packet_count as usize
             || in_flight.base_header.stream_id != header.stream_id
             || in_flight.base_header.version != header.version
+            || in_flight.base_header.timestamp_us != header.timestamp_us
+            || in_flight.base_header.nonce_sequence != header.nonce_sequence
+            || (in_flight.base_header.flags & nexus_protocol::video_packet::flags::KEYFRAME)
+                != (header.flags & nexus_protocol::video_packet::flags::KEYFRAME)
         {
             return Err(ReassemblyError::InconsistentFragmentMetadata);
         }
@@ -323,9 +329,6 @@ impl VideoFrameReassembler {
             final_header.flags |= nexus_protocol::video_packet::flags::FRAME_START
                 | nexus_protocol::video_packet::flags::FRAME_END;
 
-            self.last_delivered_frame_id = Some(header.frame_id);
-            self.prune_stale_before(header.frame_id);
-
             Ok(Some(AssembledFrame {
                 header: final_header,
                 assembled_len: full_payload.len(),
@@ -334,6 +337,20 @@ impl VideoFrameReassembler {
         } else {
             Ok(None)
         }
+    }
+
+    /// Commits freshness only after the caller has authenticated the complete
+    /// frame. Returns false when an authenticated-but-delayed frame is stale.
+    pub fn commit_authenticated_frame(&mut self, frame_id: u32) -> bool {
+        if self
+            .last_authenticated_frame_id
+            .is_some_and(|last_id| frame_id <= last_id)
+        {
+            return false;
+        }
+        self.last_authenticated_frame_id = Some(frame_id);
+        self.prune_stale_before(frame_id);
+        true
     }
 
     fn prune_stale_before(&mut self, frame_id: u32) {
@@ -364,6 +381,7 @@ mod tests {
             packet_id: 0,
             packet_count: 1,
             timestamp_us: 3,
+            nonce_sequence: 0,
             payload_len: 3,
         };
         let bytes = encode_video_datagram(&header, &[1, 2, 3]).unwrap();
@@ -391,6 +409,7 @@ mod tests {
             packet_id: 0,
             packet_count: 1,
             timestamp_us: 0,
+            nonce_sequence: 0,
             payload_len: (nexus_protocol::video_packet::MAX_PAYLOAD_LEN + 1) as u16,
         };
         let err = encode_video_datagram(
@@ -411,6 +430,7 @@ mod tests {
             packet_id: 0,
             packet_count: 1,
             timestamp_us: 0,
+            nonce_sequence: 0,
             payload_len: 2,
         };
         assert_eq!(
@@ -430,6 +450,7 @@ mod tests {
             packet_id: 0,
             packet_count: 1,
             timestamp_us: 0,
+            nonce_sequence: 0,
             payload_len: 4,
         };
         let mut reassembler = VideoFrameReassembler::new(2, 3);
@@ -450,6 +471,7 @@ mod tests {
             packet_id: 0,
             packet_count: 1,
             timestamp_us: 0,
+            nonce_sequence: 0,
             payload_len: 1,
         };
         let mut reassembler = VideoFrameReassembler::new(2, 8);
@@ -457,6 +479,7 @@ mod tests {
             .process_packet(&make_header(10), &[1])
             .unwrap()
             .is_some());
+        assert!(reassembler.commit_authenticated_frame(10));
         assert!(reassembler
             .process_packet(&make_header(9), &[2])
             .unwrap()
@@ -477,6 +500,7 @@ mod tests {
             packet_id: 0,
             packet_count: 1,
             timestamp_us: 0,
+            nonce_sequence: 0,
             payload_len: 0,
         };
         let mut sequence = NonceSequence::new(0x0102_0304);
@@ -503,6 +527,7 @@ mod tests {
             packet_id: 0,
             packet_count: 1,
             timestamp_us: 1000,
+            nonce_sequence: 0,
             payload_len: 0,
         };
         let payload = b"small single packet payload";
@@ -538,6 +563,7 @@ mod tests {
             packet_id: 0,
             packet_count: 0,
             timestamp_us: 2000,
+            nonce_sequence: 0,
             payload_len: 0,
         };
         let mut large_payload = Vec::new();
@@ -590,6 +616,7 @@ mod tests {
             packet_id: 0,
             packet_count: 2,
             timestamp_us: 100,
+            nonce_sequence: 0,
             payload_len: 4,
         };
         // Frame 1 part 0 arrives
@@ -608,6 +635,7 @@ mod tests {
             packet_id: 0,
             packet_count: 1,
             timestamp_us: 200,
+            nonce_sequence: 0,
             payload_len: 4,
         };
         let assembled_f2 = reassembler
@@ -615,6 +643,7 @@ mod tests {
             .unwrap()
             .expect("frame 2 delivered");
         assert_eq!(assembled_f2.header.frame_id, 2);
+        assert!(reassembler.commit_authenticated_frame(2));
 
         // Now late packet for Frame 1 arrives -> should be ignored (stale)
         let header_f1_p1 = VideoPacketHeader {
@@ -625,6 +654,7 @@ mod tests {
             packet_id: 1,
             packet_count: 2,
             timestamp_us: 100,
+            nonce_sequence: 0,
             payload_len: 4,
         };
         assert!(reassembler
@@ -646,6 +676,7 @@ mod tests {
             packet_id: 2,
             packet_count: 2,
             timestamp_us: 0,
+            nonce_sequence: 0,
             payload_len: 1,
         };
         assert!(matches!(
@@ -662,6 +693,7 @@ mod tests {
             packet_id: 0,
             packet_count: 2,
             timestamp_us: 0,
+            nonce_sequence: 0,
             payload_len: 1,
         };
         assert_eq!(

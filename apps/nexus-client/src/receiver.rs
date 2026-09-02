@@ -1,13 +1,12 @@
 //! Portable authenticated video receive and semantic-input encoding boundary.
 
 use nexus_crypto::{
-    open_encoded_frame, AeadError, EncodedFrameMetadata, EncryptedFrame, NonceSequence,
-    NonceSequenceError,
+    nonce_from_sequence, open_encoded_frame, AeadError, EncodedFrameMetadata, EncryptedFrame,
 };
 use nexus_input::{InputError, InputEvent, KeyAction, MouseButton};
 use nexus_protocol::{
-    video_packet, CursorPosition, KeyEvent, MouseButton as ProtoMouseButton, MouseMove, MouseWheel,
-    TextInput,
+    video_packet, CursorPosition, KeyEvent, MonitorInfo, MonitorInfoError,
+    MouseButton as ProtoMouseButton, MouseMove, MouseWheel, TextInput,
 };
 use nexus_transport::{
     control::{decode_framed_control, encode_framed_control, ControlMessageError},
@@ -37,12 +36,16 @@ pub enum ClientReceiverError {
     TrailingDatagramBytes,
     #[error("invalid video fragment: {0}")]
     Reassembly(#[from] ReassemblyError),
-    #[error("frame nonce allocation failed: {0}")]
-    Nonce(#[from] NonceSequenceError),
     #[error("frame authentication failed: {0}")]
     Authentication(#[from] AeadError),
     #[error("invalid control message: {0}")]
     Control(#[from] ControlMessageError),
+    #[error("invalid cursor monitor: {0}")]
+    CursorMonitor(#[from] MonitorInfoError),
+    #[error("cursor control received before monitor bounds are configured")]
+    CursorMonitorUnavailable,
+    #[error("cursor position is outside the configured monitor")]
+    CursorOutOfBounds,
 }
 
 /// Validates and decrypts host-to-client video before making frames available.
@@ -51,18 +54,20 @@ pub enum ClientReceiverError {
 /// for this session; it must not be reused for client-to-host traffic.
 pub struct ClientReceiver {
     frame_key: [u8; 32],
-    receive_nonces: NonceSequence,
+    nonce_domain: u32,
     reassembler: VideoFrameReassembler,
     latest_frame: Option<DecodedFrameJob>,
+    cursor_monitor: Option<MonitorInfo>,
 }
 
 impl ClientReceiver {
     pub fn new(frame_key: [u8; 32], nonce_domain: u32) -> Self {
         Self {
             frame_key,
-            receive_nonces: NonceSequence::new(nonce_domain),
+            nonce_domain,
             reassembler: VideoFrameReassembler::default(),
             latest_frame: None,
+            cursor_monitor: None,
         }
     }
 
@@ -79,7 +84,7 @@ impl ClientReceiver {
         };
 
         let encrypted = EncryptedFrame {
-            nonce: self.receive_nonces.next_nonce()?,
+            nonce: nonce_from_sequence(self.nonce_domain, assembled.header.nonce_sequence),
             ciphertext: assembled.payload,
         };
         let access_unit = open_encoded_frame(
@@ -89,9 +94,18 @@ impl ClientReceiver {
                 channel: assembled.header.stream_id as u32,
                 frame_id: assembled.header.frame_id,
                 codec_config_id: CODEC_CONFIG_ID,
+                timestamp_us: assembled.header.timestamp_us,
+                keyframe: assembled.header.flags & video_packet::flags::KEYFRAME != 0,
             },
             &encrypted,
         )?;
+
+        if !self
+            .reassembler
+            .commit_authenticated_frame(assembled.header.frame_id)
+        {
+            return Ok(());
+        }
 
         self.latest_frame = Some(DecodedFrameJob {
             frame_id: assembled.header.frame_id,
@@ -102,11 +116,32 @@ impl ClientReceiver {
         Ok(())
     }
 
-    /// Validates an inbound cursor-position control frame before a future UI
-    /// boundary consumes it. It deliberately retains no remote text or media.
-    pub fn accept_control(&mut self, bytes: &[u8]) -> Result<(), ClientReceiverError> {
-        let _: CursorPosition = decode_framed_control(bytes)?;
+    /// Configures the monitor coordinate space used to validate inbound cursor
+    /// positions. Call this after authenticated monitor configuration arrives.
+    pub fn set_cursor_monitor(&mut self, monitor: MonitorInfo) -> Result<(), ClientReceiverError> {
+        monitor.validate()?;
+        self.cursor_monitor = Some(monitor);
         Ok(())
+    }
+
+    /// Decodes and validates an inbound cursor position against the configured
+    /// monitor before returning it to the UI boundary.
+    pub fn accept_control(&self, bytes: &[u8]) -> Result<CursorPosition, ClientReceiverError> {
+        let cursor: CursorPosition = decode_framed_control(bytes)?;
+        let monitor = self
+            .cursor_monitor
+            .as_ref()
+            .ok_or(ClientReceiverError::CursorMonitorUnavailable)?;
+        let x_end = i64::from(monitor.origin_x) + i64::from(monitor.width);
+        let y_end = i64::from(monitor.origin_y) + i64::from(monitor.height);
+        if i64::from(cursor.x) < i64::from(monitor.origin_x)
+            || i64::from(cursor.x) >= x_end
+            || i64::from(cursor.y) < i64::from(monitor.origin_y)
+            || i64::from(cursor.y) >= y_end
+        {
+            return Err(ClientReceiverError::CursorOutOfBounds);
+        }
+        Ok(cursor)
     }
 
     /// Returns the newest authenticated frame, dropping it from the depth-one

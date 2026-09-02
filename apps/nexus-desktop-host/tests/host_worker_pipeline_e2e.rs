@@ -6,7 +6,7 @@ use tokio::sync::mpsc;
 
 use nexus_common::id::SessionId;
 use nexus_desktop_host::worker::DesktopHostWorker;
-use nexus_protocol::{KeyEvent, MouseMove};
+use nexus_protocol::{video_packet::CURRENT_VERSION, KeyEvent, MouseMove};
 use nexus_transport::video::decode_video_datagram;
 use prost::Message;
 
@@ -42,7 +42,7 @@ async fn test_desktop_host_worker_streaming_and_input_flow() {
     // 3. Verify datagrams decode cleanly
     for dg in &datagrams {
         let (header, payload) = decode_video_datagram(dg).unwrap();
-        assert_eq!(header.version, 1);
+        assert_eq!(header.version, CURRENT_VERSION);
         assert!(!payload.is_empty());
     }
 

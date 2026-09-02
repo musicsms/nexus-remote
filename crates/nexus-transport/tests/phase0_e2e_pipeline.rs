@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use nexus_capture::{CaptureSource, LatestFrameQueue, SyntheticCaptureSource};
 use nexus_codec::{CodecKind, EncoderConfig, SoftwareFallbackEncoder, VideoEncoder};
-use nexus_crypto::{AeadError, EncryptedFrame, NonceSequence};
+use nexus_crypto::{nonce_from_sequence, AeadError, EncryptedFrame, NonceSequence};
 use nexus_protocol::{video_packet, MouseMove, SessionHello, VideoPacketHeader};
 use nexus_transport::control::{decode_framed_control, encode_framed_control};
 use nexus_transport::quic::{make_client_endpoint, make_server_endpoint};
@@ -106,7 +106,7 @@ async fn phase0_full_e2e_pipeline_test() {
 
         // 6. AEAD Encryption (ADR-025)
         let mut host_nonce_seq = NonceSequence::new(video_channel_domain);
-        let base_header = VideoPacketHeader {
+        let mut base_header = VideoPacketHeader {
             version: video_packet::CURRENT_VERSION,
             flags: if encoded_frame.keyframe {
                 video_packet::flags::KEYFRAME
@@ -118,6 +118,7 @@ async fn phase0_full_e2e_pipeline_test() {
             packet_id: 0,
             packet_count: 0,
             timestamp_us: encoded_frame.timestamp_us,
+            nonce_sequence: 0,
             payload_len: 0,
         };
 
@@ -129,6 +130,8 @@ async fn phase0_full_e2e_pipeline_test() {
             &encoded_frame.data,
         )
         .expect("seal video frame");
+        base_header.nonce_sequence =
+            u64::from_be_bytes(encrypted_frame.nonce[4..].try_into().unwrap());
 
         // 7. Packetization into bounded MTU chunks (<= 1200 bytes)
         let fragments = packetize_video_frame(
@@ -237,8 +240,7 @@ async fn phase0_full_e2e_pipeline_test() {
     );
 
     // 4. Decrypt Reassembled Frame via open_video_frame
-    let mut client_nonce_seq = NonceSequence::new(video_channel_domain);
-    let client_nonce = client_nonce_seq.next_nonce().expect("nonce allocated");
+    let client_nonce = nonce_from_sequence(video_channel_domain, assembled.header.nonce_sequence);
     let encrypted_payload = EncryptedFrame {
         nonce: client_nonce,
         ciphertext: assembled.payload,
@@ -315,7 +317,7 @@ async fn phase0_multi_frame_stream_pipeline() {
             let encoded = encoder.encode(frame).unwrap();
             expected_frames_data.push(encoded.data.to_vec());
 
-            let base_header = VideoPacketHeader {
+            let mut base_header = VideoPacketHeader {
                 version: video_packet::CURRENT_VERSION,
                 flags: if encoded.keyframe {
                     video_packet::flags::KEYFRAME
@@ -327,6 +329,7 @@ async fn phase0_multi_frame_stream_pipeline() {
                 packet_id: 0,
                 packet_count: 0,
                 timestamp_us: encoded.timestamp_us,
+                nonce_sequence: 0,
                 payload_len: 0,
             };
 
@@ -338,6 +341,8 @@ async fn phase0_multi_frame_stream_pipeline() {
                 &encoded.data,
             )
             .unwrap();
+            base_header.nonce_sequence =
+                u64::from_be_bytes(encrypted.nonce[4..].try_into().unwrap());
 
             let fragments =
                 packetize_video_frame(&base_header, &encrypted.ciphertext, MAX_DATAGRAM_CHUNK_SIZE)
@@ -368,7 +373,6 @@ async fn phase0_multi_frame_stream_pipeline() {
         .unwrap();
 
     let mut reassembler = VideoFrameReassembler::default();
-    let mut client_nonce_seq = NonceSequence::new(video_channel_domain);
     let mut received_frames_data = Vec::new();
 
     while received_frames_data.len() < num_frames {
@@ -379,7 +383,7 @@ async fn phase0_multi_frame_stream_pipeline() {
 
         let (header, payload) = decode_video_datagram(&datagram).unwrap();
         if let Some(assembled) = reassembler.process_packet(&header, payload).unwrap() {
-            let nonce = client_nonce_seq.next_nonce().unwrap();
+            let nonce = nonce_from_sequence(video_channel_domain, assembled.header.nonce_sequence);
             let encrypted = EncryptedFrame {
                 nonce,
                 ciphertext: assembled.payload,
@@ -438,7 +442,7 @@ async fn phase0_tampered_frame_detection() {
         let encoded = encoder.encode(captured).unwrap();
 
         let mut host_nonce_seq = NonceSequence::new(video_channel_domain);
-        let base_header = VideoPacketHeader {
+        let mut base_header = VideoPacketHeader {
             version: video_packet::CURRENT_VERSION,
             flags: video_packet::flags::KEYFRAME,
             stream_id: 1,
@@ -446,6 +450,7 @@ async fn phase0_tampered_frame_detection() {
             packet_id: 0,
             packet_count: 0,
             timestamp_us: encoded.timestamp_us,
+            nonce_sequence: 0,
             payload_len: 0,
         };
 
@@ -457,6 +462,7 @@ async fn phase0_tampered_frame_detection() {
             &encoded.data,
         )
         .unwrap();
+        base_header.nonce_sequence = u64::from_be_bytes(encrypted.nonce[4..].try_into().unwrap());
 
         let mut fragments =
             packetize_video_frame(&base_header, &encrypted.ciphertext, MAX_DATAGRAM_CHUNK_SIZE)
@@ -506,8 +512,7 @@ async fn phase0_tampered_frame_detection() {
     }
 
     let assembled = assembled_frame.unwrap();
-    let mut client_nonce_seq = NonceSequence::new(video_channel_domain);
-    let nonce = client_nonce_seq.next_nonce().unwrap();
+    let nonce = nonce_from_sequence(video_channel_domain, assembled.header.nonce_sequence);
     let encrypted = EncryptedFrame {
         nonce,
         ciphertext: assembled.payload,

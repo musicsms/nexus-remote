@@ -1,7 +1,7 @@
 use nexus_capture::{CaptureSource, CapturedFrame, LatestFrameQueue};
 use nexus_codec::{CodecKind, EncoderConfig, SoftwareFallbackEncoder, VideoEncoder};
 use nexus_crypto::NonceSequence;
-use nexus_protocol::video_packet::flags;
+use nexus_protocol::video_packet::{flags, CURRENT_VERSION};
 use nexus_protocol::VideoPacketHeader;
 use nexus_transport::video::{encode_video_datagram, packetize_video_frame, seal_video_frame};
 use thiserror::Error;
@@ -174,8 +174,8 @@ impl<C: CaptureSource> HostVideoStreamer<C> {
             u32::try_from(encoded.frame_id).map_err(|_| StreamerError::FrameIdOutOfRange {
                 frame_id: encoded.frame_id,
             })?;
-        let base_header = VideoPacketHeader {
-            version: 1,
+        let mut base_header = VideoPacketHeader {
+            version: CURRENT_VERSION,
             flags: flags_val,
             stream_id: self.stream_id as u16,
             frame_id,
@@ -183,6 +183,7 @@ impl<C: CaptureSource> HostVideoStreamer<C> {
             packet_count: 1,
             payload_len: 0,
             timestamp_us: encoded.timestamp_us,
+            nonce_sequence: 0,
         };
 
         // 5. Seal encoded frame with ChaCha20-Poly1305 AEAD (ADR-025)
@@ -193,6 +194,11 @@ impl<C: CaptureSource> HostVideoStreamer<C> {
             self.codec_config_id,
             &encoded.data,
         )?;
+        base_header.nonce_sequence = u64::from_be_bytes(
+            encrypted_frame.nonce[4..]
+                .try_into()
+                .expect("AEAD nonce has a 64-bit sequence suffix"),
+        );
 
         // 6. Packetize encrypted payload into datagram chunks
         let chunk_size = 1200; // Safe MTU for QUIC datagrams

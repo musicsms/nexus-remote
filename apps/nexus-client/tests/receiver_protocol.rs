@@ -2,8 +2,8 @@ use nexus_client::{ClientInputError, ClientInputSender, ClientReceiver};
 use nexus_crypto::NonceSequence;
 use nexus_input::{InputError, InputEvent, KeyAction, Modifiers};
 use nexus_protocol::{
-    video_packet, CursorPosition, KeyEvent, MouseButton as ProtoMouseButton, MouseMove, MouseWheel,
-    TextInput, VideoPacketHeader,
+    video_packet, CursorPosition, KeyEvent, MonitorInfo, MouseButton as ProtoMouseButton,
+    MouseMove, MouseWheel, TextInput, VideoPacketHeader,
 };
 use nexus_transport::{
     control::{decode_framed_control, encode_framed_control},
@@ -22,7 +22,7 @@ fn frame_datagrams(
     keyframe: bool,
     access_unit: &[u8],
 ) -> Vec<Vec<u8>> {
-    let header = VideoPacketHeader {
+    let mut header = VideoPacketHeader {
         version: video_packet::CURRENT_VERSION,
         flags: if keyframe {
             video_packet::flags::KEYFRAME
@@ -34,9 +34,11 @@ fn frame_datagrams(
         packet_id: 0,
         packet_count: 0,
         timestamp_us,
+        nonce_sequence: 0,
         payload_len: 0,
     };
     let sealed = seal_video_frame(&KEY, sequence, &header, 1, access_unit).unwrap();
+    header.nonce_sequence = u64::from_be_bytes(sealed.nonce[4..].try_into().unwrap());
     packetize_video_frame(&header, &sealed.ciphertext, 1000)
         .unwrap()
         .into_iter()
@@ -80,6 +82,7 @@ fn rejects_truncated_oversized_and_malformed_datagrams_without_emitting_jobs() {
         packet_id: 1,
         packet_count: 1,
         timestamp_us: 0,
+        nonce_sequence: 0,
         payload_len: 1,
     };
     let malformed = encode_video_datagram(&malformed_header, &[0]).unwrap();
@@ -103,6 +106,82 @@ fn rejects_a_header_modified_after_aead_seal_without_emitting_a_job() {
     let mut receiver = ClientReceiver::new(KEY, NONCE_DOMAIN);
 
     assert!(receiver.accept_datagram(&datagram).is_err());
+    assert_eq!(receiver.drain_latest_frame(), None);
+}
+
+#[test]
+fn recovers_after_a_lost_earlier_nonce_sequence() {
+    let mut sender_sequence = NonceSequence::new(NONCE_DOMAIN);
+    let _lost = frame_datagrams(&mut sender_sequence, 1, 100, false, b"lost");
+    let delivered = frame_datagrams(&mut sender_sequence, 2, 101, true, b"received");
+    let mut receiver = ClientReceiver::new(KEY, NONCE_DOMAIN);
+
+    deliver(&mut receiver, &delivered);
+
+    assert_eq!(
+        receiver.drain_latest_frame(),
+        Some(nexus_client::DecodedFrameJob {
+            frame_id: 2,
+            timestamp_us: 101,
+            keyframe: true,
+            access_unit: b"received".to_vec(),
+        })
+    );
+}
+
+#[test]
+fn forged_high_frame_id_cannot_poison_authenticated_freshness() {
+    let mut sender_sequence = NonceSequence::new(NONCE_DOMAIN);
+    let mut forged = frame_datagrams(&mut sender_sequence, 100, 1_000, false, b"forged");
+    let legitimate = frame_datagrams(&mut sender_sequence, 2, 101, true, b"legitimate");
+    let last = forged.last_mut().unwrap().last_mut().unwrap();
+    *last ^= 1;
+    let mut receiver = ClientReceiver::new(KEY, NONCE_DOMAIN);
+
+    assert!(receiver.accept_datagram(&forged.remove(0)).is_err());
+    deliver(&mut receiver, &legitimate);
+
+    assert_eq!(
+        receiver.drain_latest_frame(),
+        Some(nexus_client::DecodedFrameJob {
+            frame_id: 2,
+            timestamp_us: 101,
+            keyframe: true,
+            access_unit: b"legitimate".to_vec(),
+        })
+    );
+}
+
+#[test]
+fn rejects_timestamp_and_keyframe_mutations_not_in_the_ciphertext() {
+    let mut sender_sequence = NonceSequence::new(NONCE_DOMAIN);
+    let mut timestamp_changed = frame_datagrams(&mut sender_sequence, 3, 300, false, b"frame");
+    timestamp_changed[0][12] ^= 1;
+    let mut keyframe_changed = frame_datagrams(&mut sender_sequence, 4, 400, false, b"frame");
+    keyframe_changed[0][1] ^= video_packet::flags::KEYFRAME;
+    let mut receiver = ClientReceiver::new(KEY, NONCE_DOMAIN);
+
+    assert!(receiver
+        .accept_datagram(&timestamp_changed.remove(0))
+        .is_err());
+    assert!(receiver
+        .accept_datagram(&keyframe_changed.remove(0))
+        .is_err());
+    assert_eq!(receiver.drain_latest_frame(), None);
+}
+
+#[test]
+fn rejects_a_replayed_nonce_sequence_on_a_different_frame() {
+    let mut sender_sequence = NonceSequence::new(NONCE_DOMAIN);
+    let first = frame_datagrams(&mut sender_sequence, 1, 100, false, b"first");
+    let mut replayed_nonce = frame_datagrams(&mut sender_sequence, 2, 101, false, b"second");
+    let nonce_start = nexus_protocol::video_packet::NONCE_SEQUENCE_OFFSET;
+    replayed_nonce[0][nonce_start..nonce_start + 8].copy_from_slice(&0u64.to_be_bytes());
+    let mut receiver = ClientReceiver::new(KEY, NONCE_DOMAIN);
+
+    deliver(&mut receiver, &first);
+    assert!(receiver.drain_latest_frame().is_some());
+    assert!(receiver.accept_datagram(&replayed_nonce.remove(0)).is_err());
     assert_eq!(receiver.drain_latest_frame(), None);
 }
 
@@ -244,6 +323,48 @@ fn accepts_a_well_framed_inbound_cursor_control_message() {
     })
     .unwrap();
     let mut receiver = ClientReceiver::new(KEY, NONCE_DOMAIN);
+    receiver
+        .set_cursor_monitor(MonitorInfo {
+            id: 1,
+            origin_x: 0,
+            origin_y: -100,
+            width: 100,
+            height: 200,
+            scale: 1.0,
+        })
+        .unwrap();
 
-    receiver.accept_control(&bytes).unwrap();
+    assert_eq!(
+        receiver.accept_control(&bytes).unwrap(),
+        CursorPosition {
+            x: 20,
+            y: -30,
+            visible: true,
+            shape_id: 4,
+        }
+    );
+}
+
+#[test]
+fn rejects_cursor_control_outside_the_configured_monitor() {
+    let bytes = encode_framed_control(&CursorPosition {
+        x: 100,
+        y: 0,
+        visible: true,
+        shape_id: 4,
+    })
+    .unwrap();
+    let mut receiver = ClientReceiver::new(KEY, NONCE_DOMAIN);
+    receiver
+        .set_cursor_monitor(MonitorInfo {
+            id: 1,
+            origin_x: 0,
+            origin_y: 0,
+            width: 100,
+            height: 100,
+            scale: 1.0,
+        })
+        .unwrap();
+
+    assert!(receiver.accept_control(&bytes).is_err());
 }
