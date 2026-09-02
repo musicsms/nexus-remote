@@ -12,7 +12,14 @@ async fn main() -> anyhow::Result<()> {
         server_name = %configuration.server_name,
         "validated non-secret client configuration"
     );
-    nexus_client::ClientRuntime::run_configured(configuration)
+    let cancellation = nexus_client::RuntimeCancellation::new();
+    let ctrl_c_cancellation = cancellation.clone();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            ctrl_c_cancellation.cancel();
+        }
+    });
+    nexus_client::ClientRuntime::run_configured_with_cancellation(configuration, cancellation)
         .await
         .map(|_| ())
         .map_err(|error| anyhow::anyhow!("nexus-client runtime stopped: {error}"))

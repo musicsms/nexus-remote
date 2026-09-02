@@ -25,7 +25,7 @@
 ## Verification
 
 - `cargo fmt --all -- --check` — passed.
-- `cargo test -p nexus-client --all-targets` — passed (51 tests including the
+- `cargo test -p nexus-client --all-targets` — passed (52 tests including the
   loopback test; Windows-only smoke files compile to zero Linux tests).
 - `cargo clippy -p nexus-client --all-targets -- -D warnings` — passed.
 - `cargo check -p nexus-client --tests --target x86_64-pc-windows-gnu` — not
@@ -78,7 +78,7 @@ condition.
 ## Review fix verification
 
 - `cargo fmt --all -- --check` — passed.
-- `cargo test -p nexus-client --all-targets` — passed (51 tests).
+- `cargo test -p nexus-client --all-targets` — passed (52 tests).
 - `cargo clippy -p nexus-client --all-targets -- -D warnings` — passed.
 - `cargo build --workspace` — passed.
 - `cargo test --workspace` — passed.
@@ -125,4 +125,12 @@ condition.
   flag and permit-retaining `Notify`, and retained the handle through the
   configured run/reconnect path for prompt cancellation.
 - Added configured-entrypoint, malformed-Unicode, decoder-reset, and
-  generation/stale-job regression coverage; report count refreshed to 51.
+  generation/stale-job regression coverage; report count refreshed to 52.
+
+## Review fix round 6
+
+- Added `run_configured_with_cancellation` and kept `run_configured` as a
+  convenience wrapper with a fresh token. `main` now retains a cloneable
+  handle and cancels the configured runtime on Ctrl-C.
+- The configured path test proves a caller-cancelled handle exits before
+  bootstrap parsing or transport setup; report count refreshed to 52.

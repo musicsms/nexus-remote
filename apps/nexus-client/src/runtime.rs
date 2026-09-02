@@ -39,7 +39,7 @@ pub struct RuntimeCancellation {
 pub type ShutdownHandle = RuntimeCancellation;
 
 impl RuntimeCancellation {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             cancelled: Arc::new(AtomicBool::new(false)),
             notify: Arc::new(tokio::sync::Notify::new()),
@@ -53,6 +53,12 @@ impl RuntimeCancellation {
 
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
+    }
+}
+
+impl Default for RuntimeCancellation {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -133,7 +139,9 @@ fn decode_hex(name: &str, value: &str) -> Result<Vec<u8>, ClientRuntimeError> {
 
 #[cfg(test)]
 mod bootstrap_tests {
-    use super::{decode_hex, ClientConfiguration, ClientRuntime, ClientRuntimeError};
+    use super::{
+        decode_hex, ClientConfiguration, ClientRuntime, ClientRuntimeError, RuntimeCancellation,
+    };
 
     #[test]
     fn malformed_unicode_hex_is_rejected_without_panicking() {
@@ -178,6 +186,21 @@ mod bootstrap_tests {
             result,
             Err(ClientRuntimeError::SessionBootstrapRequired)
         ));
+    }
+
+    #[tokio::test]
+    async fn configured_entrypoint_honors_caller_cancellation() {
+        let cancellation = RuntimeCancellation::new();
+        cancellation.cancel();
+        let result = ClientRuntime::run_configured_with_cancellation(
+            ClientConfiguration {
+                server: "127.0.0.1:4433".parse().unwrap(),
+                server_name: "localhost".to_owned(),
+            },
+            cancellation.clone(),
+        )
+        .await;
+        assert!(matches!(result, Err(ClientRuntimeError::Shutdown)));
     }
 }
 
@@ -573,6 +596,19 @@ impl ClientRuntime {
     pub async fn run_configured(
         configuration: ClientConfiguration,
     ) -> Result<RuntimeSummary, ClientRuntimeError> {
+        Self::run_configured_with_cancellation(configuration, RuntimeCancellation::new()).await
+    }
+
+    /// Runs the configured client with caller-owned cancellation. The handle
+    /// is checked before bootstrap parsing and is shared with the constructed
+    /// runtime, so callers can interrupt reconnect/connect waits externally.
+    pub async fn run_configured_with_cancellation(
+        configuration: ClientConfiguration,
+        cancellation: RuntimeCancellation,
+    ) -> Result<RuntimeSummary, ClientRuntimeError> {
+        if cancellation.is_cancelled() {
+            return Err(ClientRuntimeError::Shutdown);
+        }
         let bootstrap_names = [
             "NEXUS_CLIENT_SERVER_CERT_DER",
             "NEXUS_CLIENT_CAPABILITY_HEX",
@@ -652,9 +688,15 @@ impl ClientRuntime {
         };
         let frame_key = read_fixed_hex_env::<32>("NEXUS_CLIENT_FRAME_KEY_HEX")?;
         let nonce_domain = parse_env("NEXUS_CLIENT_NONCE_DOMAIN")?;
-        let mut runtime =
-            Self::connect(&endpoint, connect_config, session, frame_key, nonce_domain).await?;
-        let cancellation = runtime.shutdown_handle();
+        let mut runtime = Self::connect_with_cancellation(
+            &endpoint,
+            connect_config,
+            session,
+            frame_key,
+            nonce_domain,
+            cancellation.clone(),
+        )
+        .await?;
         let summary = loop {
             let summary = runtime.run().await;
             if cancellation.is_cancelled() && matches!(&summary, Err(ClientRuntimeError::Shutdown))
@@ -680,9 +722,28 @@ impl ClientRuntime {
     pub async fn connect(
         endpoint: &quinn::Endpoint,
         config: ClientConnectConfig,
+        session: ClientSession,
+        frame_key: [u8; 32],
+        nonce_domain: u32,
+    ) -> Result<Self, ClientRuntimeError> {
+        Self::connect_with_cancellation(
+            endpoint,
+            config,
+            session,
+            frame_key,
+            nonce_domain,
+            RuntimeCancellation::new(),
+        )
+        .await
+    }
+
+    async fn connect_with_cancellation(
+        endpoint: &quinn::Endpoint,
+        config: ClientConnectConfig,
         mut session: ClientSession,
         frame_key: [u8; 32],
         nonce_domain: u32,
+        cancellation: RuntimeCancellation,
     ) -> Result<Self, ClientRuntimeError> {
         config.stream.validate()?;
         let now = session.clock().now();
@@ -714,6 +775,7 @@ impl ClientRuntime {
             config.monitor,
             config.stream,
             WindowConfig::default(),
+            cancellation,
         )
     }
 
@@ -815,6 +877,7 @@ impl ClientRuntime {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build(
         connection: Connection,
         session: ClientSession,
@@ -823,6 +886,7 @@ impl ClientRuntime {
         monitor: MonitorInfo,
         stream: VideoStreamConfig,
         window_config: WindowConfig,
+        cancellation: RuntimeCancellation,
     ) -> Result<Self, ClientRuntimeError> {
         let mut receiver = ClientReceiver::new(frame_key, nonce_domain);
         receiver.set_cursor_monitor(monitor)?;
@@ -832,7 +896,6 @@ impl ClientRuntime {
         let pipeline = NativePipeline::start(&window, stream);
         #[cfg(windows)]
         let pipeline = pipeline?;
-        let cancellation = RuntimeCancellation::new();
         Ok(Self {
             connection,
             session,
@@ -879,7 +942,9 @@ impl ClientRuntime {
     /// Requests cancellation from another task or thread. The owner should
     /// subsequently call [`Self::shutdown`] to join workers and release all
     /// resources; the notification makes reconnect and transport waits stop
-    /// promptly instead of waiting for their retry/QUIC deadlines.
+    /// promptly instead of waiting for their retry/QUIC deadlines. For a
+    /// configured runtime, prefer retaining the cloneable [`ShutdownHandle`]
+    /// returned by [`Self::shutdown_handle`].
     pub fn request_shutdown(&self) {
         self.cancellation.cancel();
         self.connection
