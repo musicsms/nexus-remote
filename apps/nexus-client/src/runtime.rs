@@ -952,10 +952,11 @@ impl ClientRuntime {
             return Err(ClientRuntimeError::Shutdown);
         }
         let closed = matches!(&event, WindowEvent::Closed);
-        if matches!(&event, WindowEvent::Input(_)) {
-            self.session
-                .require_control()
-                .map_err(ClientRuntimeError::Session)?;
+        if matches!(&event, WindowEvent::Input(_)) && !self.session.can_control() {
+            // View-only sessions may still receive local OS events while the
+            // window is focused. Drop them at the client boundary rather than
+            // treating an unauthorized local event as a fatal session error.
+            return Ok(());
         }
         self.input.handle_window_event(event)?;
         if closed {
@@ -1080,10 +1081,8 @@ impl ClientRuntime {
 
     fn pump_window_events(&mut self) -> Result<(), ClientRuntimeError> {
         while let Some(event) = self.window.try_next_event() {
-            if matches!(&event, WindowEvent::Input(_)) {
-                self.session
-                    .require_control()
-                    .map_err(ClientRuntimeError::Session)?;
+            if matches!(&event, WindowEvent::Input(_)) && !self.session.can_control() {
+                continue;
             }
             if matches!(event, WindowEvent::Closed) {
                 self.input.handle_window_event(event)?;

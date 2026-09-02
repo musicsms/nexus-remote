@@ -168,3 +168,16 @@ condition.
 - `cargo check -p nexus-client --tests --target x86_64-pc-windows-gnu` —
   blocked before client compilation because `x86_64-w64-mingw32-gcc` is not
   installed; no GNU-target success is claimed.
+
+## Review fix round 9
+
+- Replaced heuristic cursor protobuf classification with an explicit bounded
+  control envelope kind. Default-valued `CursorShape` messages now remain
+  distinguishable from `CursorPosition` messages on the datagram path.
+- View-only local input is dropped non-fatally at both direct and window-pump
+  boundaries; the network emission gate remains enforced as a second safety
+  check.
+- Added transport envelope coverage and updated loopback/receiver tests for a
+  default-valued cursor shape. Workspace build, tests, clippy, formatting, and
+  diff checks pass; the GNU Windows target remains blocked by the unavailable
+  MinGW compiler documented above.

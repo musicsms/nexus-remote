@@ -8,7 +8,10 @@ use nexus_protocol::{
     MouseButton as ProtoMouseButton, MouseMove, MouseWheel, TextInput, VideoPacketHeader,
 };
 use nexus_transport::{
-    control::{decode_framed_control, encode_framed_control},
+    control::{
+        decode_framed_control, encode_framed_control, encode_framed_control_envelope,
+        ControlMessageKind,
+    },
     video::{
         encode_video_datagram, packetize_video_frame, seal_video_frame, MAX_VIDEO_DATAGRAM_SIZE,
     },
@@ -422,7 +425,17 @@ fn accepts_a_well_framed_inbound_cursor_control_message() {
             shape_id: 4,
         }
     );
-    let event = receiver.accept_control_datagram(&bytes).unwrap();
+    let typed_bytes = encode_framed_control_envelope(
+        ControlMessageKind::CursorPosition,
+        &CursorPosition {
+            x: 20,
+            y: -30,
+            visible: true,
+            shape_id: 4,
+        },
+    )
+    .unwrap();
+    let event = receiver.accept_control_datagram(&typed_bytes).unwrap();
     assert!(matches!(
         event,
         nexus_client::ClientControlEvent::CursorPosition(_)
@@ -455,15 +468,18 @@ fn rejects_cursor_control_outside_the_configured_monitor() {
 
 #[test]
 fn accepts_and_validates_inbound_cursor_shape_control_message() {
-    let bytes = encode_framed_control(&CursorShape {
-        id: 9,
-        width: 1,
-        height: 1,
-        hotspot_x: 0,
-        hotspot_y: 0,
-        pixel_format: 1,
-        data: vec![0, 0, 0, 0],
-    })
+    let bytes = encode_framed_control_envelope(
+        ControlMessageKind::CursorShape,
+        &CursorShape {
+            id: 9,
+            width: 1,
+            height: 1,
+            hotspot_x: 0,
+            hotspot_y: 0,
+            pixel_format: 0,
+            data: Vec::new(),
+        },
+    )
     .unwrap();
     let receiver = ClientReceiver::new(KEY, NONCE_DOMAIN);
     assert!(matches!(

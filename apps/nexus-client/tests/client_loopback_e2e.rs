@@ -11,7 +11,7 @@ use nexus_protocol::{
     video_packet, CursorPosition, CursorShape, MonitorInfo, MouseMove, VideoPacketHeader,
 };
 use nexus_transport::{
-    control::{decode_framed_control, encode_framed_control},
+    control::{decode_framed_control, encode_framed_control_envelope, ControlMessageKind},
     quic::{make_client_endpoint, make_server_endpoint},
     video::{encode_video_datagram, packetize_video_frame, seal_video_frame},
 };
@@ -118,27 +118,33 @@ async fn loopback_authenticates_video_and_emits_one_semantic_input() {
         let connection = incoming.await.unwrap();
         connection
             .send_datagram(
-                encode_framed_control(&CursorPosition {
-                    x: 80,
-                    y: 90,
-                    visible: true,
-                    shape_id: 7,
-                })
+                encode_framed_control_envelope(
+                    ControlMessageKind::CursorPosition,
+                    &CursorPosition {
+                        x: 80,
+                        y: 90,
+                        visible: true,
+                        shape_id: 7,
+                    },
+                )
                 .unwrap()
                 .into(),
             )
             .unwrap();
         connection
             .send_datagram(
-                encode_framed_control(&CursorShape {
-                    id: 7,
-                    width: 1,
-                    height: 1,
-                    hotspot_x: 0,
-                    hotspot_y: 0,
-                    pixel_format: 1,
-                    data: vec![0, 0, 0, 0],
-                })
+                encode_framed_control_envelope(
+                    ControlMessageKind::CursorShape,
+                    &CursorShape {
+                        id: 7,
+                        width: 1,
+                        height: 1,
+                        hotspot_x: 0,
+                        hotspot_y: 0,
+                        pixel_format: 0,
+                        data: Vec::new(),
+                    },
+                )
                 .unwrap()
                 .into(),
             )
@@ -238,12 +244,9 @@ async fn view_only_capability_cannot_emit_semantic_input() {
     runtime
         .handle_window_event(WindowEvent::Focused(true))
         .unwrap();
-    assert!(matches!(
-        runtime.handle_window_event(WindowEvent::Input(InputEvent::MouseMove { x: 80, y: 90 })),
-        Err(ClientRuntimeError::Session(
-            nexus_client::session::ClientError::PermissionDenied("desktop.control")
-        ))
-    ));
+    runtime
+        .handle_window_event(WindowEvent::Input(InputEvent::MouseMove { x: 80, y: 90 }))
+        .unwrap();
     assert_eq!(runtime.sent_input_count(), 0);
     runtime
         .shutdown(std::time::Instant::now() + Duration::from_secs(1))
