@@ -262,13 +262,11 @@ async fn reconnect_reuses_session_id_and_revalidates_session_window() {
         for attempt in 0..2 {
             let incoming = server.endpoint.accept().await.unwrap();
             let connection = incoming.await.unwrap();
-            if attempt == 0 {
-                connection.close(0u32.into(), b"reconnect test");
-            } else {
-                connection.closed().await;
-            }
+            assert!(attempt < 2);
+            connection.close(0u32.into(), b"reconnect test");
         }
     });
+    let clock = MockClock::from_secs(100);
     let mut runtime = ClientRuntime::connect(
         &endpoint,
         ClientConnectConfig {
@@ -277,7 +275,7 @@ async fn reconnect_reuses_session_id_and_revalidates_session_window() {
             monitor: monitor(),
             stream: VideoStreamConfig::new(1_280, 720).unwrap(),
         },
-        session(MockClock::from_secs(100)),
+        session(clock.clone()),
         KEY,
         NONCE_DOMAIN,
     )
@@ -295,8 +293,22 @@ async fn reconnect_reuses_session_id_and_revalidates_session_window() {
         .unwrap();
     assert_eq!(runtime.session_id(), session_id);
     assert_eq!(runtime.session_state(), ClientState::Connected);
-    runtime
-        .shutdown(std::time::Instant::now() + Duration::from_secs(1))
+    tokio::time::timeout(Duration::from_secs(1), runtime.run())
+        .await
+        .unwrap()
         .unwrap();
+    assert_eq!(runtime.session_state(), ClientState::Reconnecting);
+
+    let expiry_clock = clock.clone();
+    let advance = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        expiry_clock.advance_secs(61);
+    });
+    let retry_result = runtime
+        .reconnect_with_retry(&endpoint, server_addr, "", Duration::from_millis(1))
+        .await;
+    advance.await.unwrap();
+    assert!(matches!(retry_result, Err(ClientRuntimeError::Session(_))));
+    assert_eq!(runtime.session_state(), ClientState::Expired);
     server_task.await.unwrap();
 }

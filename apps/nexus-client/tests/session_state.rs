@@ -128,6 +128,25 @@ fn reconnect_deadline_and_duration_are_bounded() {
 }
 
 #[test]
+fn transient_reconnect_failure_returns_to_reconnecting_until_window_expires() {
+    let mut client = client(capability(), token(), 100);
+    client.begin_connect(UnixTimestamp::from_secs(100)).unwrap();
+    client.connected(UnixTimestamp::from_secs(101)).unwrap();
+    client
+        .transport_lost(UnixTimestamp::from_secs(102))
+        .unwrap();
+    client.begin_connect(UnixTimestamp::from_secs(110)).unwrap();
+    client
+        .reconnect_attempt_failed(UnixTimestamp::from_secs(111))
+        .unwrap();
+    assert_eq!(client.state(), ClientState::Reconnecting);
+    client
+        .begin_connect(UnixTimestamp::from_secs(163))
+        .unwrap_err();
+    assert_eq!(client.state(), ClientState::Expired);
+}
+
+#[test]
 fn rejects_invalid_signatures_and_expiry_on_reconnect() {
     let mut c = capability();
     c.signature[0] ^= 1;

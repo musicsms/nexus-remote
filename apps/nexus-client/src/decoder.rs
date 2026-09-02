@@ -118,6 +118,10 @@ impl DecoderGate {
         }
         Ok(())
     }
+
+    fn reset(&mut self) {
+        self.initialized = false;
+    }
 }
 
 #[cfg(test)]
@@ -143,6 +147,17 @@ mod tests {
         );
         assert!(gate.accept(&job(true, b"\0\0\0\x01\x67\x64")).is_ok());
         assert!(gate.accept(&job(false, b"ordinary-inter-frame")).is_ok());
+    }
+
+    #[test]
+    fn decoder_gate_reset_rejects_delta_until_a_new_keyframe() {
+        let mut gate = DecoderGate::default();
+        assert!(gate.accept(&job(true, b"\0\0\0\x01\x67\x64")).is_ok());
+        gate.reset();
+        assert_eq!(
+            gate.accept(&job(false, b"delta-after-reconnect")),
+            Err(DecoderError::MissingSequenceHeader)
+        );
     }
 
     #[test]

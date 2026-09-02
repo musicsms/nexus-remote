@@ -13,11 +13,11 @@
   private to the window/renderer/decoder modules.
 - Added bounded runtime shutdown with transport close, input expiry, render
   queue clearing, and a caller-provided native-worker deadline.
-- Replaced the binary no-op with tracing plus validated, non-secret endpoint
-  configuration. The entrypoint returns an explicit error until the
-  authenticated control-plane bootstrap supplies capability, relay token,
-  certificate, and frame key; no unattended private-key or browser handling
-  was added.
+- Replaced the binary no-op with tracing plus validated endpoint and explicit
+  authenticated bootstrap configuration. The entrypoint constructs/runs the
+  runtime when capability, relay token, certificate, dimensions, and frame key
+  are supplied, and returns an explicit error when bootstrap is absent; no
+  unattended private-key or browser handling was added.
 - Updated implementation status and README while keeping Phase 1 **In
   progress** and documenting the missing MSVC/live-Windows/full acceptance
   evidence.
@@ -25,7 +25,7 @@
 ## Verification
 
 - `cargo fmt --all -- --check` — passed.
-- `cargo test -p nexus-client --all-targets` — passed (46 tests including the
+- `cargo test -p nexus-client --all-targets` — passed (47 tests including the
   loopback test; Windows-only smoke files compile to zero Linux tests).
 - `cargo clippy -p nexus-client --all-targets -- -D warnings` — passed.
 - `cargo check -p nexus-client --tests --target x86_64-pc-windows-gnu` — not
@@ -78,9 +78,24 @@ condition.
 ## Review fix verification
 
 - `cargo fmt --all -- --check` — passed.
-- `cargo test -p nexus-client --all-targets` — passed (46 tests).
+- `cargo test -p nexus-client --all-targets` — passed (47 tests).
 - `cargo clippy -p nexus-client --all-targets -- -D warnings` — passed.
 - `cargo build --workspace` — passed.
 - `cargo test --workspace` — passed.
 - `cargo check -p nexus-client --tests --target x86_64-pc-windows-gnu` —
   remains blocked by the missing `x86_64-w64-mingw32-gcc` compiler.
+
+## Review fix round 3
+
+- Reconnect now retries transient endpoint/transport failures on a bounded
+  timer and keeps the authenticated session in `Reconnecting` until the
+  original reconnect deadline expires or shutdown is requested.
+- Transport loss increments a native pipeline generation, clears its pending
+  slot, and drops stale decoded output; the next submitted job starts a fresh
+  decoder continuity epoch and therefore requires a keyframe.
+- The configured binary path now parses the control-plane capability, relay
+  metadata/signatures, trusted server certificate, negotiated monitor/stream
+  dimensions, and frame key from explicit bootstrap environment variables,
+  then constructs `ClientRuntime::connect` and runs/shuts it down. No private
+  identity key or browser credential is read.
+- Added reconnect-failure state coverage and decoder-gate reset coverage.

@@ -1,12 +1,19 @@
 //! Bounded orchestration for the native viewer/controller.
 
-use crate::session::{ClientError, ClientSession, ClientState};
+use crate::session::{
+    ClientError, ClientSession, ClientState, ClientVerification, RelayTokenMetadata, SessionPolicy,
+    DEFAULT_MAX_SESSION_DURATION,
+};
 use crate::{
     ClientReceiver, ClientReceiverError, InputController, InputControllerError, RenderQueue,
     RenderQueueError, WindowCommand, WindowConfig, WindowController, WindowError, WindowEvent,
 };
-use nexus_protocol::MonitorInfo;
+use ed25519_dalek::VerifyingKey;
+use nexus_common::{SystemClock, UnixTimestamp};
+use nexus_protocol::{MonitorInfo, SessionCapability};
+use prost::Message;
 use quinn::Connection;
+use rustls::pki_types::CertificateDer;
 use std::{
     net::SocketAddr,
     time::{Duration, Instant},
@@ -14,6 +21,7 @@ use std::{
 use thiserror::Error;
 
 const RUNTIME_POLL_INTERVAL: Duration = Duration::from_millis(2);
+const RECONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ClientConfigurationError {
@@ -49,6 +57,52 @@ impl ClientConfiguration {
     }
 }
 
+fn required_env(name: &str) -> Result<String, ClientRuntimeError> {
+    std::env::var(name).map_err(|_| ClientRuntimeError::InvalidBootstrap(name.to_owned()))
+}
+
+fn parse_env<T>(name: &str) -> Result<T, ClientRuntimeError>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    required_env(name)?
+        .parse()
+        .map_err(|error: T::Err| ClientRuntimeError::InvalidBootstrap(format!("{name}: {error}")))
+}
+
+fn read_hex_env(name: &str) -> Result<Vec<u8>, ClientRuntimeError> {
+    let value = required_env(name)?;
+    if value.len() % 2 != 0 {
+        return Err(ClientRuntimeError::InvalidBootstrap(format!(
+            "{name} must contain an even number of hexadecimal digits"
+        )));
+    }
+    (0..value.len())
+        .step_by(2)
+        .map(|index| {
+            u8::from_str_radix(&value[index..index + 2], 16).map_err(|_| {
+                ClientRuntimeError::InvalidBootstrap(format!("{name} is not hexadecimal"))
+            })
+        })
+        .collect()
+}
+
+fn read_fixed_hex_env<const N: usize>(name: &str) -> Result<[u8; N], ClientRuntimeError> {
+    let bytes = read_hex_env(name)?;
+    bytes.try_into().map_err(|bytes: Vec<u8>| {
+        ClientRuntimeError::InvalidBootstrap(format!(
+            "{name} must decode to exactly {N} bytes, got {}",
+            bytes.len()
+        ))
+    })
+}
+
+fn verifying_key_env(name: &str) -> Result<VerifyingKey, ClientRuntimeError> {
+    VerifyingKey::from_bytes(&read_fixed_hex_env::<32>(name)?)
+        .map_err(|error| ClientRuntimeError::InvalidBootstrap(format!("{name}: {error}")))
+}
+
 #[derive(Debug, Error)]
 pub enum ClientRuntimeError {
     #[error("client window could not start: {0}")]
@@ -74,6 +128,8 @@ pub enum ClientRuntimeError {
     Shutdown,
     #[error("authenticated session bootstrap is not available from non-secret configuration")]
     SessionBootstrapRequired,
+    #[error("authenticated client bootstrap value is invalid: {0}")]
+    InvalidBootstrap(String),
     #[error("client window shutdown exceeded its deadline")]
     ShutdownTimeout,
     #[error("authenticated video stream dimensions are invalid")]
@@ -128,10 +184,17 @@ use std::thread::{self, JoinHandle};
 
 #[cfg(windows)]
 struct NativePipeline {
-    pending: Arc<(Mutex<Option<crate::DecodedFrameJob>>, Condvar)>,
+    pending: Arc<(Mutex<Option<PendingNativeJob>>, Condvar)>,
+    generation: Arc<std::sync::atomic::AtomicU64>,
     stop: Arc<std::sync::atomic::AtomicBool>,
     errors: mpsc::Receiver<crate::decoder::DecoderError>,
     worker: Option<JoinHandle<()>>,
+}
+
+#[cfg(windows)]
+struct PendingNativeJob {
+    generation: u64,
+    job: crate::DecodedFrameJob,
 }
 
 #[cfg(windows)]
@@ -144,8 +207,10 @@ impl NativePipeline {
             .native_handle()
             .ok_or(crate::decoder::DecoderError::BackendUnavailable)?;
         let pending = Arc::new((Mutex::new(None), Condvar::new()));
+        let generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let worker_pending = Arc::clone(&pending);
+        let worker_generation = Arc::clone(&generation);
         let worker_stop = Arc::clone(&stop);
         let (error_tx, errors) = mpsc::sync_channel(1);
         let (started_tx, started_rx) = mpsc::sync_channel(1);
@@ -170,7 +235,7 @@ impl NativePipeline {
                     };
                 let _ = started_tx.send(Ok(()));
                 loop {
-                    let job = {
+                    let pending_job = {
                         let (lock, wake) = &*worker_pending;
                         let mut pending = lock.lock().expect("pipeline slot poisoned");
                         while pending.is_none()
@@ -184,12 +249,31 @@ impl NativePipeline {
                             pending.take()
                         }
                     };
-                    let Some(job) = job else { break };
-                    match decoder.decode(job) {
-                        Ok(Some(surface)) => {
-                            if let Err(error) = renderer.present(surface) {
+                    let Some(pending_job) = pending_job else {
+                        break;
+                    };
+                    let job_generation = pending_job.generation;
+                    if job_generation
+                        != worker_generation.load(std::sync::atomic::Ordering::Acquire)
+                    {
+                        match crate::decoder::NativeFrameDecoder::start(stream.width, stream.height)
+                        {
+                            Ok(next_decoder) => decoder = next_decoder,
+                            Err(error) => {
                                 let _ = error_tx.try_send(error);
                                 break;
+                            }
+                        }
+                    }
+                    match decoder.decode(pending_job.job) {
+                        Ok(Some(surface)) => {
+                            if job_generation
+                                == worker_generation.load(std::sync::atomic::Ordering::Acquire)
+                            {
+                                if let Err(error) = renderer.present(surface) {
+                                    let _ = error_tx.try_send(error);
+                                    break;
+                                }
                             }
                         }
                         Ok(None) => {}
@@ -204,6 +288,7 @@ impl NativePipeline {
         match started_rx.recv_timeout(Duration::from_secs(2)) {
             Ok(Ok(())) => Ok(Self {
                 pending,
+                generation,
                 stop,
                 errors,
                 worker: Some(worker),
@@ -229,9 +314,24 @@ impl NativePipeline {
             return Err(crate::decoder::DecoderError::BackendLost);
         }
         let (lock, wake) = &*self.pending;
+        let generation = self.generation.load(std::sync::atomic::Ordering::Acquire);
         *lock
             .lock()
-            .map_err(|_| crate::decoder::DecoderError::BackendLost)? = Some(job);
+            .map_err(|_| crate::decoder::DecoderError::BackendLost)? =
+            Some(PendingNativeJob { generation, job });
+        wake.notify_one();
+        Ok(())
+    }
+
+    /// Drops all pre-disconnect work and makes the next submission start a
+    /// fresh decoder continuity epoch, requiring a keyframe.
+    fn reset_for_reconnect(&mut self) -> Result<(), crate::decoder::DecoderError> {
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let (lock, wake) = &*self.pending;
+        lock.lock()
+            .map_err(|_| crate::decoder::DecoderError::BackendLost)?
+            .take();
         wake.notify_one();
         Ok(())
     }
@@ -259,11 +359,24 @@ impl NativePipeline {
             let _ = worker.join();
             true
         } else {
-            let _ = thread::Builder::new()
+            let slot = Arc::new(Mutex::new(Some(worker)));
+            let reaper_slot = Arc::clone(&slot);
+            if thread::Builder::new()
                 .name("nexus-client-pipeline-reaper".to_owned())
                 .spawn(move || {
+                    if let Some(worker) = reaper_slot.lock().ok().and_then(|mut slot| slot.take()) {
+                        let _ = worker.join();
+                    }
+                })
+                .is_err()
+            {
+                // Keep join ownership if the bounded reaper cannot start.
+                // This exceptional fallback may exceed the deadline, but it
+                // never silently detaches a native worker.
+                if let Some(worker) = slot.lock().ok().and_then(|mut slot| slot.take()) {
                     let _ = worker.join();
-                });
+                }
+            }
             false
         }
     }
@@ -316,9 +429,94 @@ impl ClientRuntime {
     /// not read from the process environment, this boundary reports the
     /// missing bootstrap instead of manufacturing an unauthenticated session.
     pub async fn run_configured(
-        _configuration: ClientConfiguration,
+        configuration: ClientConfiguration,
     ) -> Result<RuntimeSummary, ClientRuntimeError> {
-        Err(ClientRuntimeError::SessionBootstrapRequired)
+        let bootstrap_names = [
+            "NEXUS_CLIENT_SERVER_CERT_DER",
+            "NEXUS_CLIENT_CAPABILITY_HEX",
+            "NEXUS_CLIENT_CAPABILITY_VERIFYING_KEY_HEX",
+            "NEXUS_CLIENT_RELAY_ID",
+            "NEXUS_CLIENT_RELAY_SESSION_ID",
+            "NEXUS_CLIENT_RELAY_CLIENT_DEVICE_ID",
+            "NEXUS_CLIENT_RELAY_TARGET_DEVICE_ID",
+            "NEXUS_CLIENT_RELAY_EXPIRES_AT",
+            "NEXUS_CLIENT_RELAY_SIGNATURE_HEX",
+            "NEXUS_CLIENT_RELAY_VERIFYING_KEY_HEX",
+            "NEXUS_CLIENT_FRAME_KEY_HEX",
+            "NEXUS_CLIENT_NONCE_DOMAIN",
+            "NEXUS_CLIENT_MONITOR_WIDTH",
+            "NEXUS_CLIENT_MONITOR_HEIGHT",
+            "NEXUS_CLIENT_STREAM_WIDTH",
+            "NEXUS_CLIENT_STREAM_HEIGHT",
+        ];
+        if !bootstrap_names
+            .iter()
+            .any(|name| std::env::var_os(name).is_some())
+        {
+            return Err(ClientRuntimeError::SessionBootstrapRequired);
+        }
+
+        let server_certificate =
+            CertificateDer::from(read_hex_env("NEXUS_CLIENT_SERVER_CERT_DER")?);
+        let endpoint = nexus_transport::quic::make_client_endpoint(
+            "0.0.0.0:0"
+                .parse()
+                .expect("literal client bind address is valid"),
+            &server_certificate,
+        )
+        .map_err(|error| ClientRuntimeError::InvalidBootstrap(error.to_string()))?;
+        let capability_bytes = read_hex_env("NEXUS_CLIENT_CAPABILITY_HEX")?;
+        let capability = SessionCapability::decode(capability_bytes.as_slice())
+            .map_err(|error| ClientRuntimeError::InvalidBootstrap(error.to_string()))?;
+        let relay_token = RelayTokenMetadata {
+            relay_id: required_env("NEXUS_CLIENT_RELAY_ID")?,
+            session_id: required_env("NEXUS_CLIENT_RELAY_SESSION_ID")?,
+            client_device_id: required_env("NEXUS_CLIENT_RELAY_CLIENT_DEVICE_ID")?,
+            target_device_id: required_env("NEXUS_CLIENT_RELAY_TARGET_DEVICE_ID")?,
+            expires_at: UnixTimestamp::from_secs(parse_env("NEXUS_CLIENT_RELAY_EXPIRES_AT")?),
+            signature: read_hex_env("NEXUS_CLIENT_RELAY_SIGNATURE_HEX")?,
+        };
+        let verification = ClientVerification {
+            capability_key: verifying_key_env("NEXUS_CLIENT_CAPABILITY_VERIFYING_KEY_HEX")?,
+            relay_key: verifying_key_env("NEXUS_CLIENT_RELAY_VERIFYING_KEY_HEX")?,
+            relay_id: relay_token.relay_id.clone(),
+        };
+        let session = ClientSession::new(
+            capability,
+            relay_token,
+            SystemClock::new(),
+            SessionPolicy::new(DEFAULT_MAX_SESSION_DURATION, Duration::from_secs(60))
+                .map_err(|error| ClientRuntimeError::InvalidBootstrap(error.to_string()))?,
+            verification,
+        );
+        let monitor = MonitorInfo {
+            id: 0,
+            origin_x: 0,
+            origin_y: 0,
+            width: parse_env("NEXUS_CLIENT_MONITOR_WIDTH")?,
+            height: parse_env("NEXUS_CLIENT_MONITOR_HEIGHT")?,
+            scale: 1.0,
+        };
+        let connect_config = ClientConnectConfig {
+            server: configuration.server,
+            server_name: configuration.server_name,
+            monitor,
+            stream: VideoStreamConfig::new(
+                parse_env("NEXUS_CLIENT_STREAM_WIDTH")?,
+                parse_env("NEXUS_CLIENT_STREAM_HEIGHT")?,
+            )?,
+        };
+        let frame_key = read_fixed_hex_env::<32>("NEXUS_CLIENT_FRAME_KEY_HEX")?;
+        let nonce_domain = parse_env("NEXUS_CLIENT_NONCE_DOMAIN")?;
+        let mut runtime =
+            Self::connect(&endpoint, connect_config, session, frame_key, nonce_domain).await?;
+        let summary = runtime.run().await;
+        let shutdown_result = runtime.shutdown(Instant::now() + Duration::from_secs(1));
+        match (summary, shutdown_result) {
+            (Err(error), _) => Err(error),
+            (Ok(summary), Ok(())) => Ok(summary),
+            (Ok(_), Err(error)) => Err(error),
+        }
     }
 
     /// Validates signed claims before opening a QUIC transport.
@@ -371,31 +569,67 @@ impl ClientRuntime {
         server: SocketAddr,
         server_name: &str,
     ) -> Result<(), ClientRuntimeError> {
+        self.reconnect_with_retry(endpoint, server, server_name, RECONNECT_RETRY_INTERVAL)
+            .await
+    }
+
+    /// Retries transport establishment without revoking the authenticated
+    /// session. The retry loop ends only when the session reconnect deadline
+    /// is reached or the runtime is explicitly shut down.
+    pub async fn reconnect_with_retry(
+        &mut self,
+        endpoint: &quinn::Endpoint,
+        server: SocketAddr,
+        server_name: &str,
+        retry_interval: Duration,
+    ) -> Result<(), ClientRuntimeError> {
         if self.shutdown {
             return Err(ClientRuntimeError::Shutdown);
         }
+        loop {
+            match self.reconnect_attempt(endpoint, server, server_name).await {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    if self.session.state() != ClientState::Reconnecting {
+                        self.fail_closed();
+                        return Err(error);
+                    }
+                    tokio::time::sleep(retry_interval).await;
+                }
+            }
+        }
+    }
+
+    async fn reconnect_attempt(
+        &mut self,
+        endpoint: &quinn::Endpoint,
+        server: SocketAddr,
+        server_name: &str,
+    ) -> Result<(), ClientRuntimeError> {
         let now = self.session.clock().now();
         if let Err(error) = self.session.begin_connect(now) {
-            self.fail_closed();
             return Err(ClientRuntimeError::Session(error));
         }
         let connecting = match endpoint.connect(server, server_name) {
             Ok(connecting) => connecting,
             Err(error) => {
-                self.fail_closed();
+                self.session
+                    .reconnect_attempt_failed(self.session.clock().now())
+                    .map_err(ClientRuntimeError::Session)?;
                 return Err(ClientRuntimeError::Connect(error));
             }
         };
         let connection = match connecting.await {
             Ok(connection) => connection,
             Err(error) => {
-                self.fail_closed();
+                self.session
+                    .reconnect_attempt_failed(self.session.clock().now())
+                    .map_err(ClientRuntimeError::Session)?;
                 return Err(ClientRuntimeError::Transport(error));
             }
         };
         if let Err(error) = self.session.connected(self.session.clock().now()) {
             connection.close(0u32.into(), b"reconnect rejected");
-            self.fail_closed();
             return Err(ClientRuntimeError::Session(error));
         }
         self.connection.close(0u32.into(), b"transport replaced");
@@ -403,6 +637,11 @@ impl ClientRuntime {
         self.input.clear_pending();
         self.render_queue.clear();
         self.latest_frame = None;
+        #[cfg(windows)]
+        if let Err(error) = self.pipeline.reset_for_reconnect() {
+            self.fail_closed();
+            return Err(ClientRuntimeError::Decoder(error));
+        }
         Ok(())
     }
 
@@ -486,6 +725,11 @@ impl ClientRuntime {
                                 if let Err(error) = self.session.transport_lost(now) {
                                     self.fail_closed();
                                     return Err(ClientRuntimeError::Session(error));
+                                }
+                                #[cfg(windows)]
+                                if let Err(error) = self.pipeline.reset_for_reconnect() {
+                                    self.fail_closed();
+                                    return Err(ClientRuntimeError::Decoder(error));
                                 }
                                 break;
                             }

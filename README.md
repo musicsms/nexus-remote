@@ -141,6 +141,14 @@ host/client/service/relay acceptance are still required before Phase 1 can
 exit. See
 `docs/IMPLEMENTATION_STATUS.md` for exact per-crate/per-app status.
 
+`nexus-client` accepts `NEXUS_CLIENT_SERVER` and
+`NEXUS_CLIENT_SERVER_NAME` for the endpoint. When the control plane supplies
+the explicit authenticated bootstrap variables (capability, relay metadata,
+trusted server certificate, negotiated monitor/stream dimensions, nonce
+domain, and frame key), the binary constructs and runs `ClientRuntime`; with
+bootstrap absent it exits closed with a clear error. Private identity keys and
+browser credentials are never read by the entrypoint.
+
 ## Contributing
 
 This project (and any agent working in it, Claude or otherwise) follows the

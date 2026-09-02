@@ -1330,6 +1330,7 @@ dependencies = [
  "platform-windows",
  "prost",
  "quinn",
+ "rustls",
  "thiserror 1.0.69",
  "tokio",
  "tracing",

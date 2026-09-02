@@ -14,6 +14,7 @@ nexus-transport.workspace = true
 nexus-input.workspace = true
 nexus-protocol.workspace = true
 quinn.workspace = true
+rustls.workspace = true
 platform-windows = { path = "../../platform/windows" }
 tokio.workspace = true
 tracing.workspace = true

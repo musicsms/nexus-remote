@@ -195,6 +195,34 @@ impl ClientSession {
         Ok(())
     }
 
+    /// Returns a failed reconnect attempt to the retryable state without
+    /// extending its original reconnect deadline. A transient network error
+    /// must not revoke an otherwise valid authenticated session.
+    pub fn reconnect_attempt_failed(&mut self, now: UnixTimestamp) -> Result<(), ClientError> {
+        if self.state != ClientState::Connecting {
+            return Err(ClientError::InvalidTransition {
+                from: self.state,
+                to: ClientState::Reconnecting,
+            });
+        }
+        if self.session_duration_expired(now) {
+            self.state = ClientState::Expired;
+            self.reconnect_deadline = None;
+            return Err(ClientError::Expired);
+        }
+        let Some(deadline) = self.reconnect_deadline else {
+            self.state = ClientState::Expired;
+            return Err(ClientError::ReconnectWindowElapsed);
+        };
+        if now > deadline {
+            self.state = ClientState::Expired;
+            self.reconnect_deadline = None;
+            return Err(ClientError::ReconnectWindowElapsed);
+        }
+        self.state = ClientState::Reconnecting;
+        Ok(())
+    }
+
     pub fn transport_lost(&mut self, now: UnixTimestamp) -> Result<(), ClientError> {
         if self.state == ClientState::Expired {
             return Err(ClientError::Expired);
