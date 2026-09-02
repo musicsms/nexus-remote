@@ -133,8 +133,11 @@ cargo fmt --all -- --check
 | 4 — v0.5 Enterprise | OIDC, SAML, WebAuthn, access requests, ABAC | — |
 | 5 — v1.0 | macOS/Linux hosts, HEVC/AV1, enterprise SSO, JIT, device trust | — |
 
-The OS-independent Phase 0 foundation is complete — see `docs/IMPLEMENTATION_STATUS.md` for exact
-per-crate/per-app status.
+The OS-independent Phase 0 foundation is complete and the native client is in
+progress. The client milestone has Linux/GNU-target evidence and a synthetic
+QUIC loopback test; MSVC/live-Windows smoke and full host/client/service/relay
+acceptance are still required before Phase 1 can exit. See
+`docs/IMPLEMENTATION_STATUS.md` for exact per-crate/per-app status.
 
 ## Contributing
 

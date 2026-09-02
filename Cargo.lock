@@ -1329,6 +1329,7 @@ dependencies = [
  "nexus-transport",
  "platform-windows",
  "prost",
+ "quinn",
  "thiserror 1.0.69",
  "tokio",
  "tracing",

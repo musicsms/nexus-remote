@@ -3,6 +3,7 @@
 pub mod input;
 pub mod receiver;
 pub mod renderer;
+pub mod runtime;
 pub mod session;
 pub mod window;
 
@@ -15,6 +16,10 @@ pub use receiver::{
     ClientInputError, ClientInputSender, ClientReceiver, ClientReceiverError, DecodedFrameJob,
 };
 pub use renderer::{RenderQueue, RenderQueueError};
+pub use runtime::{
+    ClientConfiguration, ClientConfigurationError, ClientRuntime, ClientRuntimeError,
+    RuntimeSummary,
+};
 pub use window::{
     WindowCommand, WindowCommandSender, WindowConfig, WindowController, WindowError, WindowEvent,
 };
