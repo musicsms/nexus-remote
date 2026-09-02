@@ -7,9 +7,11 @@ use nexus_client::{
 use nexus_common::{MockClock, UnixTimestamp};
 use nexus_crypto::NonceSequence;
 use nexus_input::InputEvent;
-use nexus_protocol::{video_packet, MonitorInfo, MouseMove, VideoPacketHeader};
+use nexus_protocol::{
+    video_packet, CursorPosition, CursorShape, MonitorInfo, MouseMove, VideoPacketHeader,
+};
 use nexus_transport::{
-    control::decode_framed_control,
+    control::{decode_framed_control, encode_framed_control},
     quic::{make_client_endpoint, make_server_endpoint},
     video::{encode_video_datagram, packetize_video_frame, seal_video_frame},
 };
@@ -30,6 +32,13 @@ fn monitor() -> MonitorInfo {
 }
 
 fn session(clock: MockClock) -> nexus_client::session::ClientSession {
+    session_with_permissions(clock, &["desktop.view", "desktop.control"])
+}
+
+fn session_with_permissions(
+    clock: MockClock,
+    permissions: &[&str],
+) -> nexus_client::session::ClientSession {
     let capability_key = SigningKey::from_bytes(&[1; 32]);
     let relay_key = SigningKey::from_bytes(&[2; 32]);
     let mut capability = nexus_protocol::SessionCapability {
@@ -39,7 +48,10 @@ fn session(clock: MockClock) -> nexus_client::session::ClientSession {
         subject_user_id: "user".into(),
         client_device_id: "client".into(),
         target_device_id: "host".into(),
-        permissions: vec!["desktop.view".into()],
+        permissions: permissions
+            .iter()
+            .map(|permission| (*permission).into())
+            .collect(),
         restrictions: vec![],
         not_before: 100,
         expires_at: 200,
@@ -104,6 +116,33 @@ async fn loopback_authenticates_video_and_emits_one_semantic_input() {
     let server_task = tokio::spawn(async move {
         let incoming = server.endpoint.accept().await.unwrap();
         let connection = incoming.await.unwrap();
+        connection
+            .send_datagram(
+                encode_framed_control(&CursorPosition {
+                    x: 80,
+                    y: 90,
+                    visible: true,
+                    shape_id: 7,
+                })
+                .unwrap()
+                .into(),
+            )
+            .unwrap();
+        connection
+            .send_datagram(
+                encode_framed_control(&CursorShape {
+                    id: 7,
+                    width: 1,
+                    height: 1,
+                    hotspot_x: 0,
+                    hotspot_y: 0,
+                    pixel_format: 1,
+                    data: vec![0, 0, 0, 0],
+                })
+                .unwrap()
+                .into(),
+            )
+            .unwrap();
         connection.send_datagram(video_datagram().into()).unwrap();
         let control = tokio::time::timeout(Duration::from_secs(2), connection.read_datagram())
             .await
@@ -112,6 +151,7 @@ async fn loopback_authenticates_video_and_emits_one_semantic_input() {
             .to_vec();
         let decoded: MouseMove = decode_framed_control(&control).unwrap();
         assert_eq!((decoded.x, decoded.y), (80, 90));
+        tokio::time::sleep(Duration::from_millis(100)).await;
     });
 
     let client_endpoint = make_client_endpoint("127.0.0.1:0".parse().unwrap(), &cert).unwrap();
@@ -148,6 +188,18 @@ async fn loopback_authenticates_video_and_emits_one_semantic_input() {
     assert!(frame.keyframe);
     assert_eq!(frame.access_unit, b"loopback-h264");
     assert_eq!(runtime.drain_latest_frame(), None);
+    assert_eq!(
+        runtime.drain_latest_cursor(),
+        Some(CursorPosition {
+            x: 80,
+            y: 90,
+            visible: true,
+            shape_id: 7,
+        })
+    );
+    assert_eq!(runtime.drain_latest_cursor(), None);
+    assert_eq!(runtime.drain_latest_cursor_shape().unwrap().id, 7);
+    assert_eq!(runtime.drain_latest_cursor_shape(), None);
     assert_eq!(runtime.sent_input_count(), 1);
     assert_eq!(runtime.session_id(), "loopback-session");
     assert_eq!(runtime.session_state(), ClientState::Reconnecting);
@@ -155,6 +207,47 @@ async fn loopback_authenticates_video_and_emits_one_semantic_input() {
         .shutdown(std::time::Instant::now() + Duration::from_secs(1))
         .unwrap();
     assert_eq!(runtime.session_state(), ClientState::Expired);
+    server_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn view_only_capability_cannot_emit_semantic_input() {
+    let server = make_server_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
+    let server_addr = server.endpoint.local_addr().unwrap();
+    let cert = server.cert_der.clone();
+    let server_task = tokio::spawn(async move {
+        let incoming = server.endpoint.accept().await.unwrap();
+        let _connection = incoming.await.unwrap();
+    });
+
+    let client_endpoint = make_client_endpoint("127.0.0.1:0".parse().unwrap(), &cert).unwrap();
+    let mut runtime = ClientRuntime::connect(
+        &client_endpoint,
+        ClientConnectConfig {
+            server: server_addr,
+            server_name: "localhost".into(),
+            monitor: monitor(),
+            stream: VideoStreamConfig::new(1_280, 720).unwrap(),
+        },
+        session_with_permissions(MockClock::from_secs(100), &["desktop.view"]),
+        KEY,
+        NONCE_DOMAIN,
+    )
+    .await
+    .unwrap();
+    runtime
+        .handle_window_event(WindowEvent::Focused(true))
+        .unwrap();
+    assert!(matches!(
+        runtime.handle_window_event(WindowEvent::Input(InputEvent::MouseMove { x: 80, y: 90 })),
+        Err(ClientRuntimeError::Session(
+            nexus_client::session::ClientError::PermissionDenied("desktop.control")
+        ))
+    ));
+    assert_eq!(runtime.sent_input_count(), 0);
+    runtime
+        .shutdown(std::time::Instant::now() + Duration::from_secs(1))
+        .unwrap();
     server_task.await.unwrap();
 }
 

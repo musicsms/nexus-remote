@@ -13,7 +13,8 @@ mod native_worker;
 
 pub use input::{InputController, InputControllerError, MAX_INPUT_RATE_PER_SECOND};
 pub use receiver::{
-    ClientInputError, ClientInputSender, ClientReceiver, ClientReceiverError, DecodedFrameJob,
+    ClientControlEvent, ClientInputError, ClientInputSender, ClientReceiver, ClientReceiverError,
+    DecodedFrameJob,
 };
 pub use renderer::{RenderQueue, RenderQueueError};
 pub use runtime::{

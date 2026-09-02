@@ -5,8 +5,8 @@ use nexus_crypto::{
 };
 use nexus_input::{InputError, InputEvent, KeyAction, MouseButton};
 use nexus_protocol::{
-    video_packet, CursorPosition, KeyEvent, MonitorInfo, MonitorInfoError,
-    MouseButton as ProtoMouseButton, MouseMove, MouseWheel, TextInput,
+    video_packet, CursorPosition, CursorShape, CursorShapeError, KeyEvent, MonitorInfo,
+    MonitorInfoError, MouseButton as ProtoMouseButton, MouseMove, MouseWheel, TextInput,
 };
 use nexus_transport::{
     control::{decode_framed_control, encode_framed_control, ControlMessageError},
@@ -61,6 +61,15 @@ pub struct DecodedFrameJob {
     pub access_unit: Vec<u8>,
 }
 
+/// Bounded control state sent by the host on the datagram path.  These
+/// messages are deliberately separate from video packets: a cursor update
+/// must never be handed to the video reassembler as if it were a fragment.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ClientControlEvent {
+    CursorPosition(CursorPosition),
+    CursorShape(CursorShape),
+}
+
 #[derive(Debug, Error)]
 pub enum ClientReceiverError {
     #[error("invalid video datagram: {0}")]
@@ -81,6 +90,8 @@ pub enum ClientReceiverError {
     CursorMonitorUnavailable,
     #[error("cursor position is outside the configured monitor")]
     CursorOutOfBounds,
+    #[error("invalid cursor shape: {0}")]
+    CursorShape(#[from] CursorShapeError),
 }
 
 /// Validates and decrypts host-to-client video before making frames available.
@@ -188,11 +199,97 @@ impl ClientReceiver {
         Ok(cursor)
     }
 
+    /// Decodes either supported host cursor control message.  Cursor shapes
+    /// are validated before they cross the UI boundary, including a strict
+    /// payload bound from the protocol crate.  The position fallback keeps
+    /// the existing wire format compatible with hosts that send raw framed
+    /// protobuf messages (there is no unbounded or dynamically typed queue).
+    pub fn accept_control_datagram(
+        &self,
+        bytes: &[u8],
+    ) -> Result<ClientControlEvent, ClientReceiverError> {
+        // The legacy framing has no message-kind byte. CursorPosition and a
+        // minimal CursorShape can therefore be wire-ambiguous; shape-only
+        // fields (hotspot/pixel format/data, tags 5-7) are the safe marker.
+        // Hosts sending a shape include at least one of these fields, while a
+        // position remains compatible with the existing four-field format.
+        if cursor_shape_fields_present(bytes) {
+            let shape: CursorShape = decode_framed_control(bytes)?;
+            shape.validate()?;
+            return Ok(ClientControlEvent::CursorShape(shape));
+        }
+        self.accept_control(bytes)
+            .map(ClientControlEvent::CursorPosition)
+    }
+
     /// Returns the newest authenticated frame, dropping it from the depth-one
     /// handoff slot.
     pub fn drain_latest_frame(&mut self) -> Option<DecodedFrameJob> {
         self.latest_frame.take()
     }
+}
+
+/// CursorShape has fields 5-7 that CursorPosition cannot carry.  Looking for
+/// those tags only disambiguates malformed shape payloads; valid shapes with
+/// default optional fields still pass the strict `CursorShape::validate`
+/// path above.
+fn cursor_shape_fields_present(bytes: &[u8]) -> bool {
+    let Some(declared) = bytes
+        .get(..4)
+        .and_then(|prefix| prefix.try_into().ok())
+        .map(u32::from_be_bytes)
+    else {
+        return false;
+    };
+    let payload = bytes
+        .get(4..)
+        .filter(|payload| payload.len() == declared as usize);
+    let Some(payload) = payload else { return false };
+    let mut index = 0;
+    let mut shape_field_seen = false;
+    while index < payload.len() {
+        let Some((tag, consumed)) = read_varint(payload, index) else {
+            return false;
+        };
+        index += consumed;
+        let field = tag >> 3;
+        if field >= 5 {
+            shape_field_seen = true;
+        }
+        let wire_type = tag & 7;
+        let Some(skip) = (match wire_type {
+            0 => read_varint(payload, index).map(|(_, size)| size),
+            1 => Some(8),
+            2 => read_varint(payload, index).and_then(|(len, size)| {
+                usize::try_from(len)
+                    .ok()
+                    .map(|len| size.saturating_add(len))
+            }),
+            5 => Some(4),
+            _ => None,
+        }) else {
+            return false;
+        };
+        let Some(next) = index.checked_add(skip) else {
+            return false;
+        };
+        index = next;
+    }
+    index == payload.len() && shape_field_seen
+}
+
+fn read_varint(bytes: &[u8], mut index: usize) -> Option<(u64, usize)> {
+    let start = index;
+    let mut value = 0u64;
+    for shift in (0..64).step_by(7) {
+        let byte = *bytes.get(index)?;
+        index += 1;
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Some((value, index - start));
+        }
+    }
+    None
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]

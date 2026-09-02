@@ -143,3 +143,28 @@ condition.
   shutdown instead of hanging on transport establishment.
 - Added a loopback regression with a server that does not accept the pending
   handshake; cancellation interrupts it within the test deadline.
+
+## Review fix round 8
+
+- Capability permissions now remain authoritative at every client boundary:
+  `desktop.view` is required before transport/video setup and
+  `desktop.control` is required before semantic input is accepted or sent.
+  View-only capabilities therefore cannot emit keyboard, mouse, or text
+  controls.
+- Runtime datagrams are classified as video or bounded framed cursor control
+  before dispatch. Validated cursor positions and shapes are retained in
+  depth-one latest-value slots and are cleared on reconnect or shutdown;
+  cursor protobufs are never passed to video reassembly.
+- Added loopback coverage for view-only input denial and position/shape
+  demultiplexing, receiver shape validation, and signed session permission
+  helpers. Fresh `cargo test -p nexus-client --all-targets` runs 56 tests.
+
+## Review fix round 8 verification
+
+- `cargo fmt --all -- --check` and `git diff --check` — passed.
+- `cargo build --workspace` — passed.
+- `cargo test --workspace` — passed.
+- `cargo clippy --workspace --all-targets -- -D warnings` — passed.
+- `cargo check -p nexus-client --tests --target x86_64-pc-windows-gnu` —
+  blocked before client compilation because `x86_64-w64-mingw32-gcc` is not
+  installed; no GNU-target success is claimed.

@@ -75,6 +75,8 @@ pub enum ClientError {
     InvalidCapabilitySignature,
     #[error("relay token signature is invalid")]
     InvalidRelaySignature,
+    #[error("client session lacks required permission: {0}")]
+    PermissionDenied(&'static str),
 }
 
 pub struct ClientSession {
@@ -118,6 +120,48 @@ impl ClientSession {
 
     pub fn session_id(&self) -> &str {
         &self.capability.session_id
+    }
+
+    /// Returns whether the signed capability grants the named operation.
+    /// Permission checks are kept on the authenticated session so transport,
+    /// video, and input paths cannot accidentally drift apart.
+    pub fn has_permission(&self, permission: &str) -> bool {
+        self.capability
+            .permissions
+            .iter()
+            .any(|granted| granted == permission)
+    }
+
+    pub fn can_view(&self) -> bool {
+        self.has_permission("desktop.view")
+    }
+
+    pub fn can_control(&self) -> bool {
+        self.has_permission("desktop.control")
+    }
+
+    pub fn require_view(&self) -> Result<(), ClientError> {
+        if self.can_view() {
+            Ok(())
+        } else {
+            Err(ClientError::PermissionDenied("desktop.view"))
+        }
+    }
+
+    pub fn require_control(&self) -> Result<(), ClientError> {
+        if self.can_control() {
+            Ok(())
+        } else {
+            Err(ClientError::PermissionDenied("desktop.control"))
+        }
+    }
+
+    pub fn require_permission(&self, permission: &'static str) -> Result<(), ClientError> {
+        if self.has_permission(permission) {
+            Ok(())
+        } else {
+            Err(ClientError::PermissionDenied(permission))
+        }
     }
 
     /// Revalidates the signed claims and established-duration policy while a

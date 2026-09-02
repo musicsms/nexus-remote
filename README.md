@@ -135,8 +135,9 @@ cargo fmt --all -- --check
 
 The OS-independent Phase 0 foundation is complete and the native client is in
 progress. The client milestone has Linux workspace evidence and a synthetic
-QUIC loopback test; the GNU Windows-target check is currently blocked by the
-missing MinGW compiler. MSVC/live-Windows smoke and full
+QUIC loopback test (including signed view/control permissions and cursor
+control demultiplexing); the GNU Windows-target check is currently blocked by
+the missing MinGW compiler. MSVC/live-Windows smoke and full
 host/client/service/relay acceptance are still required before Phase 1 can
 exit. See
 `docs/IMPLEMENTATION_STATUS.md` for exact per-crate/per-app status.

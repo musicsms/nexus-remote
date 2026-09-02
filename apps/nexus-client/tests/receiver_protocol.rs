@@ -4,8 +4,8 @@ use nexus_crypto::{
 };
 use nexus_input::{InputError, InputEvent, KeyAction, Modifiers};
 use nexus_protocol::{
-    video_packet, CursorPosition, KeyEvent, MonitorInfo, MouseButton as ProtoMouseButton,
-    MouseMove, MouseWheel, TextInput, VideoPacketHeader,
+    video_packet, CursorPosition, CursorShape, KeyEvent, MonitorInfo,
+    MouseButton as ProtoMouseButton, MouseMove, MouseWheel, TextInput, VideoPacketHeader,
 };
 use nexus_transport::{
     control::{decode_framed_control, encode_framed_control},
@@ -422,6 +422,11 @@ fn accepts_a_well_framed_inbound_cursor_control_message() {
             shape_id: 4,
         }
     );
+    let event = receiver.accept_control_datagram(&bytes).unwrap();
+    assert!(matches!(
+        event,
+        nexus_client::ClientControlEvent::CursorPosition(_)
+    ));
 }
 
 #[test]
@@ -446,4 +451,23 @@ fn rejects_cursor_control_outside_the_configured_monitor() {
         .unwrap();
 
     assert!(receiver.accept_control(&bytes).is_err());
+}
+
+#[test]
+fn accepts_and_validates_inbound_cursor_shape_control_message() {
+    let bytes = encode_framed_control(&CursorShape {
+        id: 9,
+        width: 1,
+        height: 1,
+        hotspot_x: 0,
+        hotspot_y: 0,
+        pixel_format: 1,
+        data: vec![0, 0, 0, 0],
+    })
+    .unwrap();
+    let receiver = ClientReceiver::new(KEY, NONCE_DOMAIN);
+    assert!(matches!(
+        receiver.accept_control_datagram(&bytes).unwrap(),
+        nexus_client::ClientControlEvent::CursorShape(shape) if shape.id == 9
+    ));
 }

@@ -5,12 +5,13 @@ use crate::session::{
     DEFAULT_MAX_SESSION_DURATION,
 };
 use crate::{
-    ClientReceiver, ClientReceiverError, InputController, InputControllerError, RenderQueue,
-    RenderQueueError, WindowCommand, WindowConfig, WindowController, WindowError, WindowEvent,
+    ClientControlEvent, ClientReceiver, ClientReceiverError, InputController, InputControllerError,
+    RenderQueue, RenderQueueError, WindowCommand, WindowConfig, WindowController, WindowError,
+    WindowEvent,
 };
 use ed25519_dalek::VerifyingKey;
 use nexus_common::{SystemClock, UnixTimestamp};
-use nexus_protocol::{MonitorInfo, SessionCapability};
+use nexus_protocol::{CursorPosition, CursorShape, MonitorInfo, SessionCapability};
 use prost::Message;
 use quinn::Connection;
 use rustls::pki_types::CertificateDer;
@@ -579,6 +580,8 @@ pub struct ClientRuntime {
     received_frames: u64,
     sent_input_messages: u64,
     latest_frame: Option<crate::DecodedFrameJob>,
+    latest_cursor: Option<CursorPosition>,
+    latest_cursor_shape: Option<CursorShape>,
     pipeline: NativePipeline,
     cancellation: RuntimeCancellation,
     shutdown: bool,
@@ -750,6 +753,11 @@ impl ClientRuntime {
             return Err(ClientRuntimeError::Shutdown);
         }
         config.stream.validate()?;
+        // Opening transport is permitted only for an authenticated viewer.
+        // Keep this check on the signed session, before endpoint.connect.
+        session
+            .require_view()
+            .map_err(ClientRuntimeError::Session)?;
         let now = session.clock().now();
         session.begin_connect(now)?;
         let connecting = match endpoint.connect(config.server, &config.server_name) {
@@ -884,6 +892,8 @@ impl ClientRuntime {
         self.input.clear_pending();
         self.render_queue.clear();
         self.latest_frame = None;
+        self.latest_cursor = None;
+        self.latest_cursor_shape = None;
         #[cfg(windows)]
         if let Err(error) = self.pipeline.reset_for_reconnect() {
             self.fail_closed();
@@ -921,6 +931,8 @@ impl ClientRuntime {
             received_frames: 0,
             sent_input_messages: 0,
             latest_frame: None,
+            latest_cursor: None,
+            latest_cursor_shape: None,
             pipeline,
             cancellation,
             shutdown: false,
@@ -940,6 +952,11 @@ impl ClientRuntime {
             return Err(ClientRuntimeError::Shutdown);
         }
         let closed = matches!(&event, WindowEvent::Closed);
+        if matches!(&event, WindowEvent::Input(_)) {
+            self.session
+                .require_control()
+                .map_err(ClientRuntimeError::Session)?;
+        }
         self.input.handle_window_event(event)?;
         if closed {
             self.fail_closed();
@@ -1012,9 +1029,9 @@ impl ClientRuntime {
                             return Err(ClientRuntimeError::Transport(error));
                         }
                     };
-                    if let Err(error) = self.receiver.accept_datagram(&bytes) {
+                    if let Err(error) = self.accept_inbound_datagram(&bytes) {
                         self.fail_closed();
-                        return Err(ClientRuntimeError::Receiver(error));
+                        return Err(error);
                     }
                     if let Some(frame) = self.receiver.drain_latest_frame() {
                         self.latest_frame = Some(frame.clone());
@@ -1063,6 +1080,11 @@ impl ClientRuntime {
 
     fn pump_window_events(&mut self) -> Result<(), ClientRuntimeError> {
         while let Some(event) = self.window.try_next_event() {
+            if matches!(&event, WindowEvent::Input(_)) {
+                self.session
+                    .require_control()
+                    .map_err(ClientRuntimeError::Session)?;
+            }
             if matches!(event, WindowEvent::Closed) {
                 self.input.handle_window_event(event)?;
                 self.fail_closed();
@@ -1074,6 +1096,12 @@ impl ClientRuntime {
     }
 
     fn pump_input(&mut self) -> Result<(), ClientRuntimeError> {
+        if !self.session.can_control() {
+            // A view-only capability must not be able to emit queued input,
+            // even if a stale window event raced with a capability update.
+            self.input.clear_pending();
+            return Ok(());
+        }
         if let Some(control) = self.input.try_next_control() {
             self.connection.send_datagram(control.into())?;
             self.sent_input_messages = self.sent_input_messages.saturating_add(1);
@@ -1083,6 +1111,36 @@ impl ClientRuntime {
 
     pub fn drain_latest_frame(&mut self) -> Option<crate::DecodedFrameJob> {
         self.latest_frame.take()
+    }
+
+    pub fn drain_latest_cursor(&mut self) -> Option<CursorPosition> {
+        self.latest_cursor.take()
+    }
+
+    pub fn drain_latest_cursor_shape(&mut self) -> Option<CursorShape> {
+        self.latest_cursor_shape.take()
+    }
+
+    fn accept_inbound_datagram(&mut self, bytes: &[u8]) -> Result<(), ClientRuntimeError> {
+        // Video headers are structurally distinct from framed controls.  Do
+        // this classification before reassembly so cursor protobuf messages
+        // cannot poison the video path or cause a false fail-closed.
+        if nexus_transport::video::decode_video_datagram(bytes).is_ok() {
+            self.receiver
+                .accept_datagram(bytes)
+                .map_err(ClientRuntimeError::Receiver)?;
+            return Ok(());
+        }
+        match self.receiver.accept_control_datagram(bytes) {
+            Ok(ClientControlEvent::CursorPosition(cursor)) => {
+                self.latest_cursor = Some(cursor);
+            }
+            Ok(ClientControlEvent::CursorShape(shape)) => {
+                self.latest_cursor_shape = Some(shape);
+            }
+            Err(error) => return Err(ClientRuntimeError::Receiver(error)),
+        }
+        Ok(())
     }
 
     pub fn received_frame_count(&self) -> u64 {
@@ -1114,6 +1172,8 @@ impl ClientRuntime {
         self.input.shutdown();
         self.render_queue.shutdown();
         self.latest_frame = None;
+        self.latest_cursor = None;
+        self.latest_cursor_shape = None;
         self.connection.close(0u32.into(), b"client runtime closed");
         self.shutdown = true;
         let pipeline_stopped = self.pipeline.shutdown(deadline);

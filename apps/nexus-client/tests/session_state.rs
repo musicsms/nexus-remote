@@ -58,6 +58,20 @@ fn client(c: SessionCapability, t: RelayTokenMetadata, now: u64) -> ClientSessio
         },
     )
 }
+
+#[test]
+fn exposes_signed_capability_permissions_for_each_boundary() {
+    let c = client(capability(), token(), 100);
+    assert!(c.has_permission("desktop.view"));
+    assert!(c.can_view());
+    assert!(!c.can_control());
+    assert!(!c.has_permission("desktop.control"));
+    assert!(c.require_view().is_ok());
+    assert_eq!(
+        c.require_control(),
+        Err(ClientError::PermissionDenied("desktop.control"))
+    );
+}
 #[test]
 fn follows_lifecycle_and_expires() {
     let mut cap = capability();
