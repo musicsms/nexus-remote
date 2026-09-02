@@ -1,9 +1,13 @@
-use nexus_client::session::{ClientError, ClientSession, ClientState, RelayTokenMetadata};
+use ed25519_dalek::{Signer, SigningKey};
+use nexus_client::session::{
+    ClientError, ClientSession, ClientState, ClientVerification, RelayTokenMetadata, SessionPolicy,
+};
 use nexus_common::{MockClock, UnixTimestamp};
 use nexus_protocol::SessionCapability;
+use std::time::Duration;
 
 fn capability() -> SessionCapability {
-    SessionCapability {
+    let mut c = SessionCapability {
         version: 1,
         issuer: "control-plane".into(),
         session_id: "session-1".into(),
@@ -19,79 +23,168 @@ fn capability() -> SessionCapability {
         agent_max_protocol: 1,
         client_ephemeral_public_key: vec![],
         signature: vec![],
-    }
+    };
+    c.signature = SigningKey::from_bytes(&[1; 32])
+        .sign(&c.signing_bytes())
+        .to_bytes()
+        .to_vec();
+    c
 }
-
 fn token() -> RelayTokenMetadata {
-    RelayTokenMetadata {
+    let mut t = RelayTokenMetadata {
+        relay_id: "relay".into(),
         session_id: "session-1".into(),
         client_device_id: "client-1".into(),
         target_device_id: "host-1".into(),
         expires_at: UnixTimestamp::from_secs(200),
-    }
+        signature: vec![],
+    };
+    t.signature = SigningKey::from_bytes(&[2; 32])
+        .sign(&t.signing_bytes())
+        .to_bytes()
+        .to_vec();
+    t
 }
-
+fn client(c: SessionCapability, t: RelayTokenMetadata, now: u64) -> ClientSession {
+    ClientSession::new(
+        c,
+        t,
+        MockClock::from_secs(now),
+        SessionPolicy::new(Duration::from_secs(1800), Duration::from_secs(60)).unwrap(),
+        ClientVerification {
+            capability_key: SigningKey::from_bytes(&[1; 32]).verifying_key(),
+            relay_key: SigningKey::from_bytes(&[2; 32]).verifying_key(),
+            relay_id: "relay".into(),
+        },
+    )
+}
 #[test]
 fn follows_lifecycle_and_expires() {
-    let mut client = ClientSession::new(capability(), token(), MockClock::from_secs(100));
-    assert_eq!(client.state(), ClientState::Disconnected);
-    client.begin_connect(UnixTimestamp::from_secs(100)).unwrap();
-    client.connected(UnixTimestamp::from_secs(101)).unwrap();
-    client
-        .transport_lost(UnixTimestamp::from_secs(102))
-        .unwrap();
-    assert_eq!(client.state(), ClientState::Reconnecting);
-    assert!(client.reconnect_deadline().is_some());
-    client.expire().unwrap();
-    assert_eq!(client.state(), ClientState::Expired);
+    let mut cap = capability();
+    cap.expires_at = 120;
+    cap.signature = SigningKey::from_bytes(&[1; 32])
+        .sign(&cap.signing_bytes())
+        .to_bytes()
+        .to_vec();
+    let mut c = client(cap, token(), 100);
+    assert_eq!(c.state(), ClientState::Disconnected);
+    c.begin_connect(UnixTimestamp::from_secs(100)).unwrap();
+    c.connected(UnixTimestamp::from_secs(101)).unwrap();
+    c.transport_lost(UnixTimestamp::from_secs(102)).unwrap();
+    assert_eq!(c.state(), ClientState::Reconnecting);
+    assert!(c.reconnect_deadline().is_some());
+    c.expire().unwrap();
+    assert_eq!(c.state(), ClientState::Expired);
 }
-
 #[test]
 fn rejects_skipped_and_expired_transitions() {
-    let mut client = ClientSession::new(capability(), token(), MockClock::from_secs(100));
+    let mut cap = capability();
+    cap.expires_at = 120;
+    cap.signature = SigningKey::from_bytes(&[1; 32])
+        .sign(&cap.signing_bytes())
+        .to_bytes()
+        .to_vec();
+    let mut c = client(cap, token(), 100);
     assert!(matches!(
-        client.connected(UnixTimestamp::from_secs(100)),
+        c.connected(UnixTimestamp::from_secs(100)),
         Err(ClientError::InvalidTransition { .. })
     ));
-    client.begin_connect(UnixTimestamp::from_secs(100)).unwrap();
-    client.connected(UnixTimestamp::from_secs(101)).unwrap();
-    client.expire().unwrap();
+    c.begin_connect(UnixTimestamp::from_secs(100)).unwrap();
+    c.connected(UnixTimestamp::from_secs(101)).unwrap();
+    c.expire().unwrap();
     assert!(matches!(
-        client.transport_lost(UnixTimestamp::from_secs(102)),
+        c.transport_lost(UnixTimestamp::from_secs(102)),
         Err(ClientError::Expired)
     ));
 }
-
 #[test]
 fn validates_identity_and_capability_window() {
-    let mut bad_token = token();
-    bad_token.session_id = "other".into();
-    let mut client = ClientSession::new(capability(), bad_token, MockClock::from_secs(100));
+    let mut t = token();
+    t.session_id = "other".into();
+    let mut c = client(capability(), t, 100);
     assert!(matches!(
-        client.begin_connect(UnixTimestamp::from_secs(100)),
+        c.begin_connect(UnixTimestamp::from_secs(100)),
         Err(ClientError::IdentityMismatch)
     ));
-
-    let mut expired = capability();
-    expired.not_before = 150;
-    let mut client = ClientSession::new(expired, token(), MockClock::from_secs(100));
+    let mut x = capability();
+    x.not_before = 150;
+    let mut c = client(x, token(), 100);
     assert!(matches!(
-        client.begin_connect(UnixTimestamp::from_secs(100)),
+        c.begin_connect(UnixTimestamp::from_secs(100)),
         Err(ClientError::CapabilityNotActive)
+    ));
+}
+#[test]
+fn reconnect_deadline_and_duration_are_bounded() {
+    let mut c = client(capability(), token(), 100);
+    c.begin_connect(UnixTimestamp::from_secs(100)).unwrap();
+    c.connected(UnixTimestamp::from_secs(101)).unwrap();
+    c.transport_lost(UnixTimestamp::from_secs(102)).unwrap();
+    assert!(c.can_reconnect(UnixTimestamp::from_secs(162)));
+    assert!(!c.can_reconnect(UnixTimestamp::from_secs(163)));
+    c.begin_connect(UnixTimestamp::from_secs(110)).unwrap();
+    c.connected(UnixTimestamp::from_secs(111)).unwrap();
+    assert!(c.session_duration_expired(UnixTimestamp::from_secs(1901)));
+}
+
+#[test]
+fn rejects_invalid_signatures_and_expiry_on_reconnect() {
+    let mut c = capability();
+    c.signature[0] ^= 1;
+    assert!(matches!(
+        client(c, token(), 100).begin_connect(UnixTimestamp::from_secs(100)),
+        Err(ClientError::InvalidCapabilitySignature)
+    ));
+    let mut t = token();
+    t.signature[0] ^= 1;
+    assert!(matches!(
+        client(capability(), t, 100).begin_connect(UnixTimestamp::from_secs(100)),
+        Err(ClientError::InvalidRelaySignature)
+    ));
+    let mut cap = capability();
+    cap.expires_at = 120;
+    cap.signature = SigningKey::from_bytes(&[1; 32])
+        .sign(&cap.signing_bytes())
+        .to_bytes()
+        .to_vec();
+    let mut c = client(cap, token(), 100);
+    c.begin_connect(UnixTimestamp::from_secs(100)).unwrap();
+    c.connected(UnixTimestamp::from_secs(101)).unwrap();
+    c.transport_lost(UnixTimestamp::from_secs(102)).unwrap();
+    assert!(matches!(
+        c.begin_connect(UnixTimestamp::from_secs(150)),
+        Err(ClientError::CapabilityExpired)
     ));
 }
 
 #[test]
-fn reconnect_deadline_is_inclusive_and_established_duration_does_not_reset() {
-    let mut client = ClientSession::new(capability(), token(), MockClock::from_secs(100));
-    client.begin_connect(UnixTimestamp::from_secs(100)).unwrap();
-    client.connected(UnixTimestamp::from_secs(101)).unwrap();
-    client
-        .transport_lost(UnixTimestamp::from_secs(102))
-        .unwrap();
-    assert!(client.can_reconnect(UnixTimestamp::from_secs(162)));
-    assert!(!client.can_reconnect(UnixTimestamp::from_secs(163)));
-    client.begin_connect(UnixTimestamp::from_secs(110)).unwrap();
-    client.connected(UnixTimestamp::from_secs(111)).unwrap();
-    assert!(client.session_duration_expired(UnixTimestamp::from_secs(1901)));
+fn classifies_relay_expiry() {
+    let mut t = token();
+    t.expires_at = UnixTimestamp::from_secs(102);
+    t.signature = SigningKey::from_bytes(&[2; 32])
+        .sign(&t.signing_bytes())
+        .to_bytes()
+        .to_vec();
+    let mut c = client(capability(), t, 100);
+    c.begin_connect(UnixTimestamp::from_secs(100)).unwrap();
+    c.connected(UnixTimestamp::from_secs(101)).unwrap();
+    c.transport_lost(UnixTimestamp::from_secs(102)).unwrap();
+    assert!(matches!(
+        c.begin_connect(UnixTimestamp::from_secs(105)),
+        Err(ClientError::RelayTokenExpired)
+    ));
+}
+
+#[test]
+fn rejects_deadline_overrun_at_connected() {
+    let mut c = client(capability(), token(), 100);
+    c.begin_connect(UnixTimestamp::from_secs(100)).unwrap();
+    c.connected(UnixTimestamp::from_secs(101)).unwrap();
+    c.transport_lost(UnixTimestamp::from_secs(102)).unwrap();
+    c.begin_connect(UnixTimestamp::from_secs(110)).unwrap();
+    assert!(matches!(
+        c.connected(UnixTimestamp::from_secs(163)),
+        Err(ClientError::ReconnectWindowElapsed)
+    ));
+    assert_eq!(c.state(), ClientState::Expired);
 }

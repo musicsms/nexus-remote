@@ -1,6 +1,7 @@
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use nexus_common::{Clock, UnixTimestamp};
 use nexus_protocol::SessionCapability;
-use nexus_session::{ReconnectPolicy, SessionDurationPolicy, DEFAULT_RECONNECT_WINDOW};
+use nexus_session::{ReconnectPolicy, SessionDurationPolicy};
 use std::time::Duration;
 use thiserror::Error;
 
@@ -19,10 +20,39 @@ pub enum ClientState {
 /// deliberately not part of this portable lifecycle type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelayTokenMetadata {
+    pub relay_id: String,
     pub session_id: String,
     pub client_device_id: String,
     pub target_device_id: String,
     pub expires_at: UnixTimestamp,
+    pub signature: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClientVerification {
+    pub capability_key: VerifyingKey,
+    pub relay_key: VerifyingKey,
+    pub relay_id: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SessionPolicy {
+    pub max_duration: Duration,
+    pub reconnect_window: Duration,
+}
+
+impl SessionPolicy {
+    pub fn new(
+        max_duration: Duration,
+        reconnect_window: Duration,
+    ) -> Result<Self, nexus_session::SessionPolicyError> {
+        SessionDurationPolicy::new(max_duration)?;
+        ReconnectPolicy::new(reconnect_window)?;
+        Ok(Self {
+            max_duration,
+            reconnect_window,
+        })
+    }
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -41,6 +71,10 @@ pub enum ClientError {
     RelayTokenExpired,
     #[error("reconnect window has elapsed")]
     ReconnectWindowElapsed,
+    #[error("capability signature is invalid")]
+    InvalidCapabilitySignature,
+    #[error("relay token signature is invalid")]
+    InvalidRelaySignature,
 }
 
 pub struct ClientSession {
@@ -52,6 +86,7 @@ pub struct ClientSession {
     established_at: Option<UnixTimestamp>,
     duration_policy: SessionDurationPolicy,
     reconnect_policy: ReconnectPolicy,
+    verification: ClientVerification,
 }
 
 impl ClientSession {
@@ -59,6 +94,8 @@ impl ClientSession {
         capability: SessionCapability,
         relay_token: RelayTokenMetadata,
         clock: C,
+        policy: SessionPolicy,
+        verification: ClientVerification,
     ) -> Self {
         Self {
             capability,
@@ -67,10 +104,11 @@ impl ClientSession {
             state: ClientState::Disconnected,
             reconnect_deadline: None,
             established_at: None,
-            duration_policy: SessionDurationPolicy::new(DEFAULT_MAX_SESSION_DURATION)
-                .expect("constant duration is non-zero"),
-            reconnect_policy: ReconnectPolicy::new(DEFAULT_RECONNECT_WINDOW)
-                .expect("constant reconnect window is non-zero"),
+            duration_policy: SessionDurationPolicy::new(policy.max_duration)
+                .expect("validated policy"),
+            reconnect_policy: ReconnectPolicy::new(policy.reconnect_window)
+                .expect("validated policy"),
+            verification,
         }
     }
 
@@ -93,11 +131,7 @@ impl ClientSession {
                 to: ClientState::Connecting,
             });
         }
-        if self.state == ClientState::Disconnected {
-            self.validate_claims(now)?;
-        } else {
-            self.validate_identity()?;
-        }
+        self.validate_claims(now)?;
         self.state = ClientState::Connecting;
         Ok(())
     }
@@ -112,14 +146,21 @@ impl ClientSession {
                 to: ClientState::Connected,
             });
         }
-        self.validate_identity()?;
-        if self.established_at.is_none() {
-            if now.as_secs() < self.capability.not_before {
-                return Err(ClientError::CapabilityNotActive);
-            }
-            if now.as_secs() >= self.capability.expires_at || now >= self.relay_token.expires_at {
-                return Err(ClientError::CapabilityExpired);
-            }
+        if self.established_at.is_some()
+            && self
+                .reconnect_deadline
+                .is_some_and(|deadline| now > deadline)
+        {
+            self.state = ClientState::Expired;
+            return Err(ClientError::ReconnectWindowElapsed);
+        }
+        self.validate_claims(now)?;
+        if self
+            .established_at
+            .is_some_and(|_| self.session_duration_expired(now))
+        {
+            self.state = ClientState::Expired;
+            return Err(ClientError::Expired);
         }
         if self.established_at.is_none() {
             self.established_at = Some(now);
@@ -193,6 +234,37 @@ impl ClientSession {
         if now >= self.relay_token.expires_at {
             return Err(ClientError::RelayTokenExpired);
         }
+        let signature: [u8; 64] = self
+            .capability
+            .signature
+            .as_slice()
+            .try_into()
+            .map_err(|_| ClientError::InvalidCapabilitySignature)?;
+        self.verification
+            .capability_key
+            .verify(
+                &self.capability.signing_bytes(),
+                &Signature::from_bytes(&signature),
+            )
+            .map_err(|_| ClientError::InvalidCapabilitySignature)?;
+        if self.relay_token.relay_id != self.verification.relay_id
+            || self.relay_token.signature.len() != 64
+        {
+            return Err(ClientError::InvalidRelaySignature);
+        }
+        let signature: [u8; 64] = self
+            .relay_token
+            .signature
+            .as_slice()
+            .try_into()
+            .map_err(|_| ClientError::InvalidRelaySignature)?;
+        self.verification
+            .relay_key
+            .verify(
+                &self.relay_token.signing_bytes(),
+                &Signature::from_bytes(&signature),
+            )
+            .map_err(|_| ClientError::InvalidRelaySignature)?;
         Ok(())
     }
 
@@ -204,5 +276,23 @@ impl ClientSession {
             return Err(ClientError::IdentityMismatch);
         }
         Ok(())
+    }
+}
+
+impl RelayTokenMetadata {
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        let mut out = b"nexus-relay-token/v1\0".to_vec();
+        for value in [
+            &self.session_id,
+            &self.relay_id,
+            &self.client_device_id,
+            &self.target_device_id,
+        ] {
+            out.extend_from_slice(&(value.len() as u16).to_be_bytes());
+            out.extend_from_slice(value.as_bytes());
+        }
+        out.push(0); // client endpoint role
+        out.extend_from_slice(&self.expires_at.as_secs().to_be_bytes());
+        out
     }
 }

@@ -1316,6 +1316,7 @@ name = "nexus-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ed25519-dalek",
  "nexus-auth",
  "nexus-common",
  "nexus-crypto",
