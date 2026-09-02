@@ -1316,8 +1316,14 @@ name = "nexus-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "nexus-auth",
  "nexus-common",
+ "nexus-crypto",
+ "nexus-input",
  "nexus-protocol",
+ "nexus-session",
+ "nexus-transport",
+ "thiserror 1.0.69",
  "tokio",
  "tracing",
  "tracing-subscriber",

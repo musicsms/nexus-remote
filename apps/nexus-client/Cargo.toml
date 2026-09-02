@@ -7,8 +7,14 @@ license.workspace = true
 
 [dependencies]
 nexus-common.workspace = true
+nexus-auth.workspace = true
+nexus-crypto.workspace = true
+nexus-session.workspace = true
+nexus-transport.workspace = true
+nexus-input.workspace = true
 nexus-protocol.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
+thiserror.workspace = true
