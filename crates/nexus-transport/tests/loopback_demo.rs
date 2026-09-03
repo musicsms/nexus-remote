@@ -98,6 +98,7 @@ async fn synthetic_frame_and_input_travel_over_quic_loopback() {
         packet_id: 0,
         packet_count: 1,
         timestamp_us: 42,
+        nonce_sequence: 0,
         payload_len: 4,
     };
     let sent_payload = [0xDEu8, 0xAD, 0xBE, 0xEF];

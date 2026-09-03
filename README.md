@@ -23,14 +23,14 @@ Audit observes
 
 ## Status
 
-**Phase 0 foundation complete; Phase 1 persistence work in progress.** See
+**Phase 0 foundation complete; Phase 1 MVP in progress.** See
 [`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md) for the
 current build status against the target architecture — check it before
 assuming any crate has real logic.
 
-All 25 tracked Architecture Decision Records are frozen
-(see [`docs/adr/`](docs/adr/)); the target design itself is settled even
-though implementation hasn't started.
+All 27 tracked Architecture Decision Records are frozen
+(see [`docs/adr/`](docs/adr)); the target design is settled while Phase 1
+implementation remains in progress.
 
 ## Core goals
 
@@ -105,7 +105,7 @@ Read in this order before making non-trivial changes (see
    actually built right now versus the spec's target. Changes often.
 3. [`docs/adr/`](docs/adr/) — frozen Architecture Decision Records. An ADR
    overrides the spec's prose if the two disagree (more recent, more
-   specific). 24/24 tracked ADRs are written.
+   specific). All 27/27 tracked ADRs are written.
 4. [`docs/protocol/`](docs/protocol/) — design notes with the reasoning,
    trade-offs, and edge cases behind specific ADRs (session establishment,
    authorization, connectivity/NAT traversal, Windows agent privilege
@@ -133,8 +133,22 @@ cargo fmt --all -- --check
 | 4 — v0.5 Enterprise | OIDC, SAML, WebAuthn, access requests, ABAC | — |
 | 5 — v1.0 | macOS/Linux hosts, HEVC/AV1, enterprise SSO, JIT, device trust | — |
 
-The OS-independent Phase 0 foundation is complete — see `docs/IMPLEMENTATION_STATUS.md` for exact
-per-crate/per-app status.
+The OS-independent Phase 0 foundation is complete and the native client is in
+progress. The client milestone has Linux workspace evidence and a synthetic
+QUIC loopback test (including signed view/control permissions and cursor
+control demultiplexing); the GNU Windows-target check is currently blocked by
+the missing MinGW compiler. MSVC/live-Windows smoke and full
+host/client/service/relay acceptance are still required before Phase 1 can
+exit. See
+`docs/IMPLEMENTATION_STATUS.md` for exact per-crate/per-app status.
+
+`nexus-client` accepts `NEXUS_CLIENT_SERVER` and
+`NEXUS_CLIENT_SERVER_NAME` for the endpoint. When the control plane supplies
+the explicit authenticated bootstrap variables (capability, relay metadata,
+trusted server certificate, negotiated monitor/stream dimensions, nonce
+domain, and frame key), the binary constructs and runs `ClientRuntime`; with
+bootstrap absent it exits closed with a clear error. Private identity keys and
+browser credentials are never read by the entrypoint.
 
 ## Contributing
 

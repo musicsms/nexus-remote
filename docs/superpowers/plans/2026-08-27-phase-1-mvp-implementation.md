@@ -50,14 +50,14 @@ W3 Windows agent/service ───────┘             │
 - Produces `platform_windows::CaptureBackend`, `EncoderBackend`, `InputBackend`, and `CursorBackend` feature-gated for Windows.
 - Produces ADRs freezing API selection, thread/apartment requirements, fallback behavior, and rendering choice.
 
-- [ ] Verify current Windows SDK/toolchain requirements against the existing Rust MSVC toolchain.
-- [ ] Compare Windows Graphics Capture vs DXGI duplication for session, pre-login, and multi-monitor constraints; record the selected API and fallback in ADR-026.
-- [ ] Compare DirectComposition/Win32 renderer options; record the selected client stack in ADR-027.
-- [ ] Scaffold platform crate with `cfg(windows)` implementations and non-Windows compile stubs that return `UnsupportedPlatform`.
-- [ ] Add compile tests for Windows target and Linux workspace target.
-- [ ] Update status to mark `platform/windows/` scaffolded and the ADRs done.
-- [ ] Run `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo fmt --all -- --check`.
-- [ ] Commit: `feat(platform): scaffold Windows Phase 1 backends`.
+- [ ] Verify current Windows SDK/toolchain requirements against the existing Rust MSVC toolchain (real Windows toolchain/hardware validation remains unverified).
+- [x] Compare Windows Graphics Capture vs DXGI duplication for session, pre-login, and multi-monitor constraints; record the selected API and fallback in ADR-026.
+- [x] Compare DirectComposition/Win32 renderer options; record the selected client stack in ADR-027.
+- [x] Scaffold platform crate with `cfg(windows)` implementations and non-Windows compile stubs that return `UnsupportedPlatform`.
+- [x] Verify Linux workspace checks and GNU Windows-target test compilation: on 2026-09-02, `cargo fmt --all -- --check`, `cargo build --workspace`, `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo check -p platform-windows --target x86_64-pc-windows-gnu --tests` exited zero. The MSVC target was not installed, and live Windows hardware remains unverified.
+- [x] Update status to mark `platform/windows/` **In progress** and the ADRs done.
+- [x] Run `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo fmt --all -- --check`.
+- [x] Commit: `feat(platform): scaffold Windows Phase 1 backends` (evidenced by commits `fde86ab`, `bcff411`, and `40f7946`; this fix round remains a documentation amendment).
 
 ### Task 2: Implement Real Windows Capture, H.264, Input, and Cursor Backends
 
@@ -86,6 +86,13 @@ W3 Windows agent/service ───────┘             │
 - [ ] Add device-loss and fallback telemetry counters.
 - [ ] Run tests on Windows CI/local hardware and Linux cross-compile tests; record measured encoder/capture timings.
 - [ ] Commit: `feat(windows): implement capture codec input and cursor backends`.
+
+#### Backend verification record (2026-09-02)
+
+- **Implemented contracts:** the fresh Linux workspace build, tests, formatting, and lint checks above passed, including deterministic platform-backend contract tests.
+- **Cross-compiled native code:** `x86_64-pc-windows-gnu` is installed and the platform crate's test targets compile with it. `x86_64-pc-windows-msvc` is not installed, so this audit did not verify that target.
+- **Live Windows evidence:** unavailable. The ignored `windows_capture_smoke`, `windows_codec_smoke`, and `windows_input_cursor_smoke` tests require an interactive Windows desktop; capture/codec also require compatible Graphics Capture and Media Foundation hardware/driver support. They were not executed here. Therefore no WGC/DXGI API selection, frame dimensions, capture duration, encoder backend, access-unit size, encoder duration, cursor-capture result, or controlled `SendInput` result is recorded. The codec smoke also currently emits no backend/timing/access-unit telemetry, so that output must be added before it can satisfy the measurement record when Windows hardware becomes available.
+- **Phase result:** Phase 1 remains **In progress**. The real host/client/service/full-relay acceptance path and its interactive Windows hardware evidence remain unmet.
 
 ### Task 3: Complete Desktop-Host Runtime, Agent IPC, Service Runner, and Respawn
 

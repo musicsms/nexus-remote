@@ -176,6 +176,17 @@ mod tests {
     }
 
     #[test]
+    fn encoder_returns_one_encoded_frame_per_input() {
+        let mut encoder = SoftwareFallbackEncoder::new();
+        encoder.configure(valid_config(640, 480)).unwrap();
+
+        let output = encoder.encode(sample_frame(7, 99, 640, 480)).unwrap();
+
+        assert_eq!(output.frame_id, 7);
+        assert_eq!(output.timestamp_us, 99);
+    }
+
+    #[test]
     fn encodes_frames_and_respects_keyframe_interval() {
         let mut encoder = SoftwareFallbackEncoder::with_keyframe_interval(3);
         let config = valid_config(640, 480);

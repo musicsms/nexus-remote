@@ -17,7 +17,7 @@ Status legend: **Not started** (path/doc does not exist yet) · **Scaffolded**
 progress** (real implementation underway, not feature-complete) · **Done**
 (meets the relevant Definition of Done / exit condition in the spec).
 
-Last audited: 2026-08-26.
+Last audited: 2026-09-02.
 
 ---
 
@@ -26,7 +26,7 @@ Last audited: 2026-08-26.
 | Phase | Scope | Exit condition | Status |
 |---|---|---|---|
 | Phase 0 — Foundation | Workspace, CI, protocol crate, QUIC PoC, Windows capture PoC, H.264 encoder PoC | Capture a Windows desktop and stream frames between two local processes | **Done for OS-independent foundation** — protocol, capture/queue, software codec, crypto, fragmentation/reassembly, and QUIC loopback are verified end-to-end in `phase0_e2e_pipeline`; live Windows Graphics Capture/DXGI and hardware H.264 remain Phase 1 platform work |
-| Phase 1 — MVP v0.1 | Windows host/client, minimal nexusd, enrollment, relay-only QUIC, H.264 1080p60, input, cursor, reconnect, telemetry overlay | User can enroll a host + client and control it over the Internet through a relay | Not started |
+| Phase 1 — MVP v0.1 | Windows host/client, minimal nexusd, enrollment, relay-only QUIC, H.264 1080p60, input, cursor, reconnect, telemetry overlay | User can enroll a host + client and control it over the Internet through a relay | **In progress** — SQLite persistence, portable Windows-backend contracts, Windows-native source implementations, and the client runtime boundary are present. Fresh Linux workspace checks pass; GNU Windows-target checking is currently blocked by the missing `x86_64-w64-mingw32-gcc` toolchain. MSVC-target compilation and interactive Windows WGC/DXGI/Media Foundation/input evidence remain unverified, as do the client/service/full-relay exit conditions. |
 | Phase 2 — v0.2 Connectivity | Candidate discovery, hole punching, P2P QUIC, adaptive bitrate, clipboard text | P2P succeeds on common NATs, falls back to relay | Not started |
 | Phase 3 — v0.3 Productization | File transfer, audio, recording, RBAC, audit UI/API, signed updates | — | Not started |
 | Phase 4 — v0.5 Enterprise | OIDC, SAML, WebAuthn, access requests, device labels, ABAC | — | Not started |
@@ -51,9 +51,9 @@ repo yet.
 | `nexus-auth` | User/device authentication logic | **In progress** — Ed25519 one-time EnrollmentToken issuance/validation, DeviceRegistrationRequest with proof-of-possession, signed DeviceCredential model, CapabilityVerifier with ADR-014 TTL window, ADR-016 protocol range pinning, and NonceReplayCache; user password/TOTP authentication remains next |
 | `nexus-policy` | RBAC/ABAC evaluation | **In progress** — 11 first-class actions (Action/ActionSet), role & device label matching models, PolicyEngine evaluating RBAC/ABAC with ADR-015 concurrent control exclusivity, and ADR-017 dynamic policy narrowing validator; database-backed role persistence remains next |
 | `nexus-audit` | Audit event model and sinks | **In progress** — 17 standard audit event types, AuditEvent model with canonical serialization, tamper-evident cryptographic hash chain (BLAKE3) with tamper detection verification, and async AuditSink / MemoryAuditSink / BroadcastAuditSink abstractions; database sink & export adapters remain next |
-| `nexus-codec` | Encoder/decoder abstractions | **In progress** — OS-independent `VideoEncoder`, H.264 config, encoded-frame metadata, keyframe/reconfigure contract, and `SoftwareFallbackEncoder` test/fallback encoder; hardware-accelerated OS backends remain next |
-| `nexus-capture` | Platform-neutral capture traits | **In progress** — `CaptureSource`/`CapturedFrame` contract, ADR-022 depth-1 latest-frame queue with replacement/drop accounting, and `SyntheticCaptureSource` test capture source; Windows Graphics Capture backend remains next |
-| `nexus-input` | Semantic input model | **In progress** — OS-independent keyboard, text, mouse and wheel events with bounded text validation; native Windows injection remains next |
+| `nexus-codec` | Encoder/decoder abstractions | **In progress** — OS-independent `VideoEncoder`, H.264 config, encoded-frame metadata, keyframe/reconfigure contract, and `SoftwareFallbackEncoder`; `platform/windows` adds a cfg-gated Media Foundation H.264 worker with deterministic contracts and GNU target compilation, while live hardware validation remains next |
+| `nexus-capture` | Platform-neutral capture traits | **In progress** — `CaptureSource`/`CapturedFrame` contract, ADR-022 depth-1 latest-frame queue with replacement/drop accounting, and `SyntheticCaptureSource`; `platform/windows` adds a cfg-gated WGC-first/DXGI-fallback capture worker with deterministic contracts and GNU target compilation, while live desktop capture validation remains next |
+| `nexus-input` | Semantic input model | **In progress** — OS-independent keyboard, text, mouse and wheel events with bounded text validation; `platform/windows` adds cfg-gated `SendInput` injection and bounded cursor capture adapters, with live interactive-desktop validation remaining next |
 | `nexus-observability` | tracing, metrics, session quality telemetry | Scaffolded — stub only |
 
 ### `crates/` — Phase 3 members (not yet due)
@@ -71,14 +71,14 @@ repo yet.
 | `nexus-relay` | Stateless encrypted packet relay | **In progress** — Ed25519-signed stateless RelayToken verification (ADR-006), RelaySessionTable with Client/Host endpoint pairing, RelayMetrics accounting, QUIC forwarder bridging bidirectional reliable streams and datagrams with live E2E integration test |
 | `nexus-agent` | Host service: identity, presence, session lifecycle, privilege boundary | **In progress** — AgentIdentity local private key persistence, EnrollmentClient auto-registration with proof-of-possession against nexusd, and AgentSessionManager capability verification (TTL, protocol range, replay defense) & host session tracking; OS service runner remains next |
 | `nexus-desktop-host` | User-session process: capture, encode, input, clipboard, audio | **In progress** — DesktopHostWorker coordinating HostVideoStreamer (depth-1 queue capture, software H.264 encode, ADR-025 ChaCha20-Poly1305 AEAD seal & VideoPacketHeader datagram packetization) and HostInputHandler (Protobuf input event demuxing & dispatch); Windows native GDI/DirectX backends remain next |
-| `nexus-client` | Native viewer/controller | Scaffolded — stub binary only |
+| `nexus-client` | Native viewer/controller | **In progress** — signed capability/relay-token session lifecycle, authenticated bounded video/input receiver, depth-one render queue, portable input/window controllers, private Win32/D3D11/Media Foundation boundaries, bounded `ClientRuntime`, reconnect retry/reset orchestration, capability-gated view/control paths, cursor-control demultiplexing, and synthetic QUIC loopback coverage are implemented. The entrypoint validates endpoint configuration and can construct/run the runtime from explicitly supplied authenticated bootstrap metadata; it fails closed when that bootstrap is absent. Fresh Linux client all-target evidence is 56 tests; MSVC compilation, live Windows GUI/GPU/input smoke, and full host/client/service/relay acceptance remain unverified. |
 | `nexus-cli` | Administrative/debugging CLI | Scaffolded — stub binary only |
 
 ### Everything else in the target tree
 
 | Path | Purpose (Spec) | Status |
 |---|---|---|
-| `platform/windows/` | Windows-specific OS/codec bindings | **Scaffolded** — backend traits, fail-closed non-Windows stubs, and Phase 1 API-selection ADRs; native WGC/DXGI/Media Foundation implementations remain next |
+| `platform/windows/` | Windows-specific OS/codec bindings | **In progress** — portable capture/codec/input/cursor contracts and cfg-gated WGC→DXGI capture selection, DXGI capture, Media Foundation H.264, `SendInput`, and bounded cursor-capture implementations are present. Linux contract tests pass; the installed environment lacks the `x86_64-w64-mingw32-gcc` toolchain and MSVC target, and no interactive Windows hardware has verified WGC/DXGI capture, Media Foundation encoding, cursor capture, or input injection. |
 | `platform/macos/` | macOS-specific bindings (Phase 5) | Not started |
 | `platform/linux/` | Linux-specific bindings (Phase 5) | Not started |
 | `proto/` | Protobuf schemas (Section 33) | Scaffolded — `proto/nexus.proto` defines the Phase 0 session, input, monitor, cursor, and capability messages (package `nexus.protocol.v1`), compiled into `nexus-protocol` by `build.rs` via `prost-build` |
@@ -87,7 +87,7 @@ repo yet.
 | `test/integration/` | Client → relay → agent integration tests | Not started |
 | `test/network-sim/` | Network simulation profiles (Section 47) | Not started |
 | `test/performance/` | Performance regression tests | Not started |
-| `docs/adr/` | Frozen ADRs (Section 51) | **Done** — ADR-001 through ADR-025 are recorded; ADR-025 freezes encoded-frame AEAD granularity and nonce/AAD boundaries. |
+| `docs/adr/` | Frozen ADRs (Section 51) | **Done** — ADR-001 through ADR-027 are recorded; ADR-025 freezes encoded-frame AEAD granularity and nonce/AAD boundaries, while ADR-026/027 freeze Windows capture and client rendering choices. |
 | `docs/protocol/` | Protocol documentation | In progress — 5 design notes added: `session-establishment-signaling.md`, `session-authorization-model.md`, `connectivity-nat-traversal.md`, `windows-agent-privilege-boundary.md`, `video-media-pipeline.md` |
 | `docs/security/` | Threat model, security docs (Section 44) | Not started |
 
@@ -95,15 +95,15 @@ repo yet.
 
 ## 3. ADR status (Spec Section 51, plus ADRs discovered during design review)
 
-All 25 of the tracked ADRs have now been written as documents in
+All 27 of the tracked ADRs have now been written as documents in
 `docs/adr/`. ADR-001 through ADR-013 were the 13 foundational decisions
 Section 51 called for "before heavy implementation" — they were already
 implemented in practice (e.g. the crates in `Cargo.toml` already encoded
 ADR-001/002/003/008/010/012/013) and stated in the spec's prose, but were
 not yet frozen as standalone records until this pass; they are backfill
 ADRs formalizing existing decisions, not new architectural choices.
-ADR-014 through ADR-024 arose from active system-design review ahead of
-Phase 1 and are documented in `docs/protocol/`.
+ADR-014 through ADR-027 arose from active system-design review ahead of
+Phase 1 and are documented in `docs/protocol/` or `docs/adr/`.
 
 | ADR | Decision | Status |
 |---|---|---|
@@ -132,6 +132,8 @@ Phase 1 and are documented in `docs/protocol/`.
 | ADR-023 | Unattended-access consent/notification is a per-role/per-device policy setting (resolves the Section 58 open question) | **Done** — `docs/adr/ADR-023-unattended-consent-policy-per-role.md` |
 | ADR-024 | Desktop-host process crash triggers automatic respawn reusing existing session reconnect semantics, not session termination | **Done** — `docs/adr/ADR-024-desktop-host-crash-respawn.md` |
 | ADR-025 | Encoded-frame payload AEAD granularity, directional nonce domains, and stable AAD metadata | **Done** — `docs/adr/ADR-025-encoded-frame-aead-framing.md` |
+| ADR-026 | Windows Graphics Capture selection with DXGI fallback and dedicated capture apartment | **Done** — `docs/adr/ADR-026-windows-capture-api-selection.md` |
+| ADR-027 | Native Win32 client with Direct3D 11-backed rendering | **Done** — `docs/adr/ADR-027-windows-client-rendering-stack.md` |
 
 ---
 

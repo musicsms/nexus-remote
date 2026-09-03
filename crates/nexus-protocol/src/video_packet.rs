@@ -10,9 +10,13 @@
 
 use thiserror::Error;
 
-/// Total header length in bytes: 1+1+2+4+2+2+8+2.
-pub const HEADER_LEN: usize = 22;
-pub const CURRENT_VERSION: u8 = 1;
+/// Total v2 header length in bytes: 1+1+2+4+2+2+8+8+2.
+pub const HEADER_LEN: usize = 30;
+/// Offset of the explicit sender frame-sequence number in a wire header.
+pub const NONCE_SEQUENCE_OFFSET: usize = 20;
+/// Version 2 adds the explicit nonce sequence required to decrypt reordered
+/// frames independently; version 1 packets are deliberately rejected.
+pub const CURRENT_VERSION: u8 = 2;
 
 /// Conservative QUIC-datagram-safe payload budget (Spec Section 57 rule 6:
 /// "every network message has an explicit maximum size limit"). Real-world
@@ -39,6 +43,8 @@ pub struct VideoPacketHeader {
     pub packet_id: u16,
     pub packet_count: u16,
     pub timestamp_us: u64,
+    /// Sender's monotonic per-direction sequence used to derive the AEAD nonce.
+    pub nonce_sequence: u64,
     pub payload_len: u16,
 }
 
@@ -73,6 +79,7 @@ impl VideoPacketHeader {
         out.extend_from_slice(&self.packet_id.to_be_bytes());
         out.extend_from_slice(&self.packet_count.to_be_bytes());
         out.extend_from_slice(&self.timestamp_us.to_be_bytes());
+        out.extend_from_slice(&self.nonce_sequence.to_be_bytes());
         out.extend_from_slice(&self.payload_len.to_be_bytes());
         out.extend_from_slice(payload);
     }
@@ -101,7 +108,10 @@ impl VideoPacketHeader {
         let timestamp_us = u64::from_be_bytes([
             buf[12], buf[13], buf[14], buf[15], buf[16], buf[17], buf[18], buf[19],
         ]);
-        let payload_len = u16::from_be_bytes([buf[20], buf[21]]);
+        let nonce_sequence = u64::from_be_bytes([
+            buf[20], buf[21], buf[22], buf[23], buf[24], buf[25], buf[26], buf[27],
+        ]);
+        let payload_len = u16::from_be_bytes([buf[28], buf[29]]);
 
         if payload_len as usize > MAX_PAYLOAD_LEN {
             return Err(VideoPacketError::PayloadTooLarge {
@@ -128,6 +138,7 @@ impl VideoPacketHeader {
                 packet_id,
                 packet_count,
                 timestamp_us,
+                nonce_sequence,
                 payload_len,
             },
             &buf[payload_start..payload_end],
@@ -149,6 +160,7 @@ mod tests {
             packet_id: 0,
             packet_count: 1,
             timestamp_us: 1_234_567,
+            nonce_sequence: 0,
             payload_len: 4,
         };
         let payload = [0xDE, 0xAD, 0xBE, 0xEF];
@@ -192,6 +204,7 @@ mod tests {
             packet_id: 0,
             packet_count: 1,
             timestamp_us: 0,
+            nonce_sequence: 0,
             payload_len: 100,
         };
         let mut buf = Vec::new();
@@ -217,6 +230,7 @@ mod tests {
             packet_id: 0,
             packet_count: 1,
             timestamp_us: 0,
+            nonce_sequence: 0,
             payload_len: (MAX_PAYLOAD_LEN + 1) as u16,
         };
         // Header-only buffer (no payload bytes appended) — PayloadTooLarge must
@@ -230,6 +244,7 @@ mod tests {
         buf.extend_from_slice(&header.packet_id.to_be_bytes());
         buf.extend_from_slice(&header.packet_count.to_be_bytes());
         buf.extend_from_slice(&header.timestamp_us.to_be_bytes());
+        buf.extend_from_slice(&header.nonce_sequence.to_be_bytes());
         buf.extend_from_slice(&header.payload_len.to_be_bytes());
 
         let err = VideoPacketHeader::decode(&buf).unwrap_err();
@@ -252,6 +267,7 @@ mod tests {
             packet_id: 0x090A,
             packet_count: 0x0B0C,
             timestamp_us: 0x0D0E_0F10_1112_1314,
+            nonce_sequence: 0x1516_1718_191A_1B1C,
             payload_len: 0x0004,
         };
         let payload = [0xAAu8, 0xBB, 0xCC, 0xDD];
@@ -259,13 +275,14 @@ mod tests {
         let mut buf = Vec::new();
         header.encode(&payload, &mut buf);
 
-        let expected: [u8; 26] = [
+        let expected: [u8; 34] = [
             0x01, 0x02, // version, flags
             0x03, 0x04, // stream_id (big-endian)
             0x05, 0x06, 0x07, 0x08, // frame_id (big-endian)
             0x09, 0x0A, // packet_id (big-endian)
             0x0B, 0x0C, // packet_count (big-endian)
             0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x14, // timestamp_us (big-endian)
+            0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, // nonce_sequence (big-endian)
             0x00, 0x04, // payload_len (big-endian)
             0xAA, 0xBB, 0xCC, 0xDD, // payload
         ];

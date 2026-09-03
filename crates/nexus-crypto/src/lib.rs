@@ -44,17 +44,47 @@ pub struct EncodedFrameMetadata {
     pub channel: u32,
     pub frame_id: u32,
     pub codec_config_id: u32,
+    pub timestamp_us: u64,
+    pub keyframe: bool,
 }
 
 impl EncodedFrameMetadata {
-    pub fn aad(self) -> [u8; 16] {
-        let mut aad = [0u8; 16];
+    /// Canonical bytes authenticated with an encoded frame. Timestamp and
+    /// keyframe status are presentation metadata exposed to the decoder, so
+    /// they must be authenticated alongside the stable stream identity.
+    pub fn aad(self) -> [u8; 25] {
+        let mut aad = [0u8; 25];
         aad[..4].copy_from_slice(&self.protocol_version.to_be_bytes());
         aad[4..8].copy_from_slice(&self.channel.to_be_bytes());
         aad[8..12].copy_from_slice(&self.frame_id.to_be_bytes());
-        aad[12..].copy_from_slice(&self.codec_config_id.to_be_bytes());
+        aad[12..16].copy_from_slice(&self.codec_config_id.to_be_bytes());
+        aad[16..24].copy_from_slice(&self.timestamp_us.to_be_bytes());
+        aad[24] = u8::from(self.keyframe);
         aad
     }
+}
+
+/// Reconstructs a directional AEAD nonce from the wire's sender sequence.
+/// Sender allocation remains the responsibility of `NonceSequence`; this
+/// helper lets receivers authenticate reordered frames without mutating local
+/// nonce state.
+pub const fn nonce_from_sequence(domain: u32, sequence: u64) -> [u8; 12] {
+    let domain = domain.to_be_bytes();
+    let sequence = sequence.to_be_bytes();
+    [
+        domain[0],
+        domain[1],
+        domain[2],
+        domain[3],
+        sequence[0],
+        sequence[1],
+        sequence[2],
+        sequence[3],
+        sequence[4],
+        sequence[5],
+        sequence[6],
+        sequence[7],
+    ]
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -130,10 +160,7 @@ impl NonceSequence {
         } else {
             self.next += 1;
         }
-        let mut nonce = [0u8; 12];
-        nonce[..4].copy_from_slice(&self.domain.to_be_bytes());
-        nonce[4..].copy_from_slice(&sequence.to_be_bytes());
-        Ok(nonce)
+        Ok(nonce_from_sequence(self.domain, sequence))
     }
 }
 
@@ -403,6 +430,8 @@ mod tests {
             channel: 2,
             frame_id: 3,
             codec_config_id: 4,
+            timestamp_us: 5,
+            keyframe: true,
         };
         let mut sequence = NonceSequence::new(9);
         let encrypted =

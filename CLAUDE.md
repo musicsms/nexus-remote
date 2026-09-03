@@ -1,9 +1,11 @@
 # Nexus — Agent Rules
 
 Nexus is a greenfield Rust remote-desktop platform (Teleport-inspired
-identity/access plane + custom low-latency media/data plane). The project is
-currently pre-Phase-0: the Cargo workspace and crate/app skeletons exist,
-but almost nothing is implemented yet. Any agent (Claude or otherwise)
+identity/access plane + custom low-latency media/data plane). The project has
+completed the Phase 0 foundation and is implementing the Phase 1 MVP:
+the Windows platform scaffold and core persistence slices exist, while the
+Phase 1 acceptance condition remains unverified—a real Windows host and
+client must control a host through the relay. Any agent (Claude or otherwise)
 working in this repo must follow the rules below.
 
 ## 1. Read before you write
@@ -92,9 +94,9 @@ Spec Section 51 and Section 58 are the canonical lists of decisions that
 need an ADR before heavy implementation — don't copy that list here, it
 will just go stale as ADRs get written; read those sections directly, and
 cross-check against `docs/IMPLEMENTATION_STATUS.md` §3 to see which are
-already resolved (as of this writing: all 24 tracked ADRs — 001–024 — have
-been written; further open items remain only outside this tracked set, per
-Spec Section 58).
+already resolved (as of this writing: all 27 tracked ADRs — 001–027 — have
+been written; any further open items fall outside this tracked set, per Spec
+Section 58).
 
 If your task depends on one of these and no ADR exists yet in `docs/adr/`:
 write a short ADR there first (context, decision, consequences), or — if
@@ -156,8 +158,8 @@ so it stays accurate.
 
 - `docs/Nexus Remote Desktop Platform - Spec.md` — target architecture (read-mostly).
 - `docs/IMPLEMENTATION_STATUS.md` — current build status, and the index of which ADRs exist (update-often).
-- `docs/adr/` — frozen decisions, one file per ADR (24 written so far out of 24 tracked).
+- `docs/adr/` — frozen decisions, one file per ADR (27 written so far out of 27 tracked).
 - `docs/protocol/` — design notes with the reasoning behind those ADRs, organized by area (session establishment, session authorization, connectivity, Windows agent, video pipeline).
 - `crates/` — OS-independent core logic.
 - `apps/` — binaries (`nexusd`, `nexus-relay`, `nexus-agent`, `nexus-desktop-host`, `nexus-client`, `nexus-cli`).
-- `platform/<os>/`, `proto/`, `migrations/`, `deployment/`, `test/*` — not created yet; see status file before assuming they exist.
+- `platform/macos/`, `platform/linux/`, `deployment/`, `test/*` — not created yet; `platform/windows/`, `proto/`, and `migrations/` exist. See the status file before assuming an area is implemented.
